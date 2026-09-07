@@ -22,15 +22,15 @@ Phase 2 — Events
 
 Phase 3 — Bookings
 
-* Создание booking
-* Повторная активная запись по user_id
-* Гость без user_id
-* capacity, SELECT FOR UPDATE, confirmed, waitlist
-* Отмена и FIFO promotion
-* Уведомление после promotion (identity / booked_by / беседа)
-* Добавление игрока другим пользователем
-* Удаление игрока администратором
-* Тесты, в том числе конкурентная запись
+* Создание booking — готово
+* Повторная активная запись по user_id — готово (проверка в Create + частичный unique индекс)
+* Гость без user_id — готово (тест: два гостя с одним именем допустимы)
+* capacity, SELECT FOR UPDATE, confirmed, waitlist — готово
+* Отмена и FIFO promotion — готово（код Cancel + CancelResult.Promoted + тест TestCancelPromotesFIFO)
+* Уведомление после promotion（identity / booked_by / беседа）— готово（интерфейс Notifier, Cancel вызывает NotifyPromotion после commit; тест TestNotifyPromotionNotSilentForGuest. Реализация отправки для VK — адаптер / Phase 4）
+* Добавление игрока другим пользователем — готово (Create с booked_by_user_id; проверка прав — адаптер / Phase 7)
+* Удаление игрока администратором — частично: операция Cancel есть, проверка chat_admins — Phase 7
+* Тесты, в том числе конкурентная запись— готово（create/дубль/гость/отмена/FIFO promotion/уведомление/конкурентная запись; нужен запущенный Postgres）
 
 Phase 4 — VK
 

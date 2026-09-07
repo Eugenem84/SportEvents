@@ -6,10 +6,10 @@ import (
 )
 
 var (
-	ErrNotFound                = errors.New("event not found")
-	ErrChatNotFound            = errors.New("chat not found")
-	ErrInvalid                 = errors.New("invalid event")
-	ErrCapacityBelowConfirmed  = errors.New("capacity below confirmed count")
+	ErrNotFound               = errors.New("event not found")
+	ErrChatNotFound           = errors.New("chat not found")
+	ErrInvalid                = errors.New("invalid event")
+	ErrCapacityBelowConfirmed = errors.New("capacity below confirmed count")
 )
 
 type Event struct {

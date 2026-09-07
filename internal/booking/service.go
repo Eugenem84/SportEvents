@@ -1,0 +1,314 @@
+package booking
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Notifier is called after a booking is promoted from waitlist to
+// confirmed. The domain rule is: a promoted booking — especially a guest
+// without an identity — must not be silently moved to confirmed. The
+// implementation decides whom to notify: the participant (via identity),
+// the booked_by user, or the chat.
+type Notifier interface {
+	NotifyPromotion(ctx context.Context, promoted Booking) error
+}
+
+type Service struct {
+	pool   *pgxpool.Pool
+	notify Notifier
+}
+
+// NewService builds a Booking Service. A notifier may be passed to satisfy
+// the promotion-notification invariant. Without one, promotions are still
+// returned via CancelResult.Promoted for the caller to act on.
+func NewService(pool *pgxpool.Pool, notifiers ...Notifier) *Service {
+	s := &Service{pool: pool}
+	if len(notifiers) > 0 {
+		s.notify = notifiers[0]
+	}
+	return s
+}
+
+// Create records a new participant for an event. It locks the event row so
+// concurrent bookings are serialized, then decides confirmed vs waitlist
+// based on the current confirmed count against capacity. If the user
+// already has an active booking (confirmed or waitlist) for this event,
+// ErrAlreadyBooked is returned.
+func (s *Service) Create(ctx context.Context, in CreateInput) (Booking, error) {
+	if err := validateCreate(in); err != nil {
+		return Booking{}, err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Booking{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var capacity int
+	err = tx.QueryRow(ctx,
+		`SELECT capacity FROM events WHERE id = $1 FOR UPDATE`,
+		in.EventID,
+	).Scan(&capacity)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Booking{}, ErrEventNotFound
+	}
+	if err != nil {
+		return Booking{}, fmt.Errorf("lock event: %w", err)
+	}
+
+	if in.UserID != nil {
+		var exists bool
+		err = tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM bookings
+				WHERE event_id = $1 AND user_id = $2 AND status IN ('confirmed', 'waitlist')
+			)`,
+			in.EventID, *in.UserID,
+		).Scan(&exists)
+		if err != nil {
+			return Booking{}, fmt.Errorf("check existing booking: %w", err)
+		}
+		if exists {
+			return Booking{}, ErrAlreadyBooked
+		}
+	}
+
+	var confirmed int
+	err = tx.QueryRow(ctx,
+		`SELECT count(*)::int FROM bookings WHERE event_id = $1 AND status = 'confirmed'`,
+		in.EventID,
+	).Scan(&confirmed)
+	if err != nil {
+		return Booking{}, fmt.Errorf("count confirmed: %w", err)
+	}
+
+	status := StatusConfirmed
+	if confirmed >= capacity {
+		status = StatusWaitlist
+	}
+
+	var phone *string
+	if in.Phone != "" {
+		phone = &in.Phone
+	}
+
+	const q = `
+		INSERT INTO bookings (event_id, player_name, phone, user_id, booked_by_user_id, status)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at`
+
+	var b Booking
+	var statusStr string
+	err = tx.QueryRow(ctx, q,
+		in.EventID, in.PlayerName, phone, in.UserID, in.BookedByUserID, string(status),
+	).Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID, &statusStr, &b.CreatedAt)
+	if isUniqueViolation(err) {
+		return Booking{}, ErrAlreadyBooked
+	}
+	if isForeignKey(err) {
+		return Booking{}, ErrUserNotFound
+	}
+	if err != nil {
+		return Booking{}, fmt.Errorf("create booking: %w", err)
+	}
+	b.Status = Status(statusStr)
+
+	if err := tx.Commit(ctx); err != nil {
+		return Booking{}, fmt.Errorf("commit: %w", err)
+	}
+	return b, nil
+}
+
+// Cancel marks a booking as cancelled and, if it was confirmed, promotes
+// the first waitlist booking (FIFO by created_at, id) to confirmed. The
+// event row is locked for the duration of the transaction so promotion is
+// consistent with concurrent Create/Cancel calls.
+//
+// After the commit, when a promotion happened, the service calls
+// NotifyPromotion so the "no silent promotion" invariant holds even for
+// guests. If the notifier fails, the cancellation is already committed: the
+// error is returned alongside the result, and a retry will surface
+// ErrNotFound.
+func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return CancelResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var lockedEventID int64
+	err = tx.QueryRow(ctx, `SELECT id FROM events WHERE id = $1 FOR UPDATE`, eventID).Scan(&lockedEventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CancelResult{}, ErrEventNotFound
+	}
+	if err != nil {
+		return CancelResult{}, fmt.Errorf("lock event: %w", err)
+	}
+
+	target, err := scanBooking(tx.QueryRow(ctx, `
+		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+		FROM bookings
+		WHERE id = $1 AND event_id = $2
+		FOR UPDATE`,
+		bookingID, eventID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CancelResult{}, ErrNotFound
+	}
+	if err != nil {
+		return CancelResult{}, fmt.Errorf("lock booking: %w", err)
+	}
+	if target.Status == StatusCancelled {
+		return CancelResult{}, ErrNotActive
+	}
+
+	wasConfirmed := target.Status == StatusConfirmed
+
+	_, err = tx.Exec(ctx, `UPDATE bookings SET status = 'cancelled' WHERE id = $1`, target.ID)
+	if err != nil {
+		return CancelResult{}, fmt.Errorf("cancel booking: %w", err)
+	}
+	target.Status = StatusCancelled
+
+	result := CancelResult{Cancelled: target}
+
+	if wasConfirmed {
+		promoted, err := scanBooking(tx.QueryRow(ctx, `
+			SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+			FROM bookings
+			WHERE event_id = $1 AND status = 'waitlist'
+			ORDER BY created_at ASC, id ASC
+			LIMIT 1
+			FOR UPDATE`,
+			eventID,
+		))
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return CancelResult{}, fmt.Errorf("find waitlist: %w", err)
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE bookings SET status = 'confirmed' WHERE id = $1`, promoted.ID)
+			if err != nil {
+				return CancelResult{}, fmt.Errorf("promote booking: %w", err)
+			}
+			promoted.Status = StatusConfirmed
+			result.Promoted = &promoted
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return CancelResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	if result.Promoted != nil && s.notify != nil {
+		if err := s.notify.NotifyPromotion(ctx, *result.Promoted); err != nil {
+			return result, fmt.Errorf("notify promotion: %w", err)
+		}
+	}
+	return result, nil
+}
+
+// Get returns a booking scoped to an event, mirroring how the Event
+// service scopes an event to a chat.
+func (s *Service) Get(ctx context.Context, eventID, bookingID int64) (Booking, error) {
+	b, err := scanBooking(s.pool.QueryRow(ctx, `
+		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+		FROM bookings
+		WHERE id = $1 AND event_id = $2`,
+		bookingID, eventID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Booking{}, ErrNotFound
+	}
+	if err != nil {
+		return Booking{}, fmt.Errorf("get booking: %w", err)
+	}
+	return b, nil
+}
+
+// ListByEvent returns bookings for an event. If statuses is empty, all
+// statuses are returned. Ordering is created_at, id ascending, which is
+// also the FIFO order used for the waitlist.
+func (s *Service) ListByEvent(ctx context.Context, eventID int64, statuses ...Status) ([]Booking, error) {
+	q := `
+		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+		FROM bookings
+		WHERE event_id = $1`
+	args := []any{eventID}
+	if len(statuses) > 0 {
+		strs := make([]string, len(statuses))
+		for i, st := range statuses {
+			strs[i] = string(st)
+		}
+		q += " AND status = ANY($2)"
+		args = append(args, strs)
+	}
+	q += " ORDER BY created_at ASC, id ASC"
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list bookings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Booking
+	for rows.Next() {
+		b, err := scanBooking(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan booking: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list bookings: %w", err)
+	}
+	if out == nil {
+		out = []Booking{}
+	}
+	return out, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanBooking(row rowScanner) (Booking, error) {
+	var b Booking
+	var statusStr string
+	err := row.Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID, &statusStr, &b.CreatedAt)
+	if err != nil {
+		return Booking{}, err
+	}
+	b.Status = Status(statusStr)
+	return b, nil
+}
+
+func validateCreate(in CreateInput) error {
+	if in.EventID == 0 {
+		return ErrInvalid
+	}
+	if strings.TrimSpace(in.PlayerName) == "" {
+		return ErrInvalid
+	}
+	if in.BookedByUserID == 0 {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func isForeignKey(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
