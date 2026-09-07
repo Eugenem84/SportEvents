@@ -53,7 +53,7 @@ VK → VK Adapter → Go backend (Event / Booking) → PostgreSQL
 
 Статус
 
-Этап 3 (TODO Phase 2): Event Service поверх PostgreSQL. Booking — следующий этап.
+Этапы 1–5 (TODO Phase 1–3): Event Service поверх PostgreSQL и Booking Service(запись, очередь, отмена, FIFO promotion, уведомление)— готово и покрыто интеграционными тестами. Следующий этап — VK Adapter(TODO Phase 4): /vk/callback, кнопки, подключение беседы.
 
 Запуск:
 
@@ -61,22 +61,16 @@ docker compose up --build
 
 Проверка: GET http://localhost:8082/health → ok (пинг БД)
 
-Тесты Event Service (нужен запущенный Postgres):
+Тесты Event и Booking Service (нужен запущенный Postgres):
 
-go test ./internal/event/ -count=1
+go test ./internal/event/ ./internal/booking/ -count=1
 
 Без локального Go — из каталога проекта, с сетью Compose:
 
 docker run --rm --network sportevents_default \
   -e DATABASE_URL=postgres://postgres:postgres@postgres:5432/booking?sslmode=disable \
   -v "$PWD":/src -w /src golang:1.24-alpine \
-  go test ./internal/event/ -count=1
-
-Запуск:
-
-docker compose up --build
-
-Проверка: GET http://localhost:8082/health → ok (пинг БД)
+  go test ./internal/event/ ./internal/booking/ -count=1
 
 Порты на хосте по умолчанию: приложение 8082, Postgres 5434 (внутри сети Compose Postgres слушает 5432). Так меньше конфликтов с другими локальными контейнерами.
 
