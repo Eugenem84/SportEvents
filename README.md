@@ -59,6 +59,9 @@ TODO Phase 4 (VK Adapter) — код готов и покрыт тестами: 
 
 Запуск:
 
+Образ не компилирует Go: бинарь `bin/server` собирается на машине разработчика, а Docker только упаковывает его в Alpine. Так сборка на слабых VPS (1 vCPU / 1 ГБ RAM) вместо часов занимает секунды.
+
+make build
 docker compose up --build
 
 Проверка: GET http://localhost:8082/health → ok (пинг БД)
@@ -76,7 +79,7 @@ docker run --rm --network sportevents_default \
 
 Порты на хосте по умолчанию: приложение 8082, Postgres 5434 (внутри сети Compose Postgres слушает 5432). Так меньше конфликтов с другими локальными контейнерами.
 
-APP_PORT=8080 POSTGRES_PORT=5432 docker compose up --build
+make build && APP_PORT=8080 POSTGRES_PORT=5432 docker compose up --build
 
 Шаблон переменных: `.env.example`. Секреты не коммитятся. Для `go run` с хоста:
 
@@ -102,6 +105,47 @@ VK_SECRET — ключ проверки callback, если его требует
 6. `VK_GROUP_ID` — id сообщества (положительное число из адреса `https://vk.com/club<id>`).
 
 Локально VK не ходит на `localhost`: нужен публичный HTTPS-туннель на порт приложения или деплой на VPS. В docker-compose VK-переменные идут из `.env` через `VK_*` (см. `.env.example`); без них сервис поднимается, но `/vk/callback` отключён.
+
+Деплой на VPS
+
+На слабом VPS (1 vCPU / 1 ГБ RAM) Go-компиляция в контейнере может идти часами или падать по OOM, поэтому код компилируется на машине разработчика, а на сервер кладётся готовый бинарь. Образ собирается без компиляции Go.
+
+make deploy
+
+Что делает `make deploy`:
+
+1. `vps-build` — кросс-компиляция под linux/amd64 в `bin/server`;
+2. `scp bin/server root@<хост>:~/SportEvents/bin/server`;
+3. на VPS: `git pull --ff-only` и
+   `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build`.
+
+Хост/пользователь/каталог переопределяются аргументами (по умолчанию root@ebszsvlknf / ~/SportEvents):
+
+make deploy VPS_HOST=159.194.252.9 VPS_USER=root VPS_DIR=~/SportEvents
+
+Если есть SSH-алиас из `~/.ssh/config`, задайте `VPS_HOST=<алиас>`.
+
+Вручную (без make):
+
+    # с машины разработчика
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/server ./cmd/server
+    scp bin/server root@<хост>:~/SportEvents/bin/server
+
+    # на VPS
+    cd ~/SportEvents && git pull --ff-only
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+Если предыдущая сборка зависла (go build на 1 ГБ RAM), сначала на VPS остановите её и уберите полу-собранные образы:
+
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml down
+    docker image prune -f
+
+Проверка после деплоя:
+
+    curl -i https://sport-events.dev.medovf2h.beget.tech/health
+    curl -i -X POST https://sport-events.dev.medovf2h.beget.tech/vk/callback \
+      -H 'Content-Type: application/json' \
+      -d '{"type":"confirmation"}'
 
 Первая версия
 
