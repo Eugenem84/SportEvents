@@ -58,7 +58,8 @@ func (s *Service) FindOrCreateUserByExternalID(ctx context.Context, platform, ex
 
 	// First contact: create the user and the identity row. Two concurrent
 	// callbacks (retries of the same VK event) may both reach this point;
-	// only one wins the unique index, the loser rolls back and re-reads.
+	// only one wins the unique index, the loser must not keep its own user
+	// row — it rolls back the transaction and returns the winner's user.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return User{}, fmt.Errorf("begin: %w", err)
@@ -74,12 +75,22 @@ func (s *Service) FindOrCreateUserByExternalID(ctx context.Context, platform, ex
 		return User{}, fmt.Errorf("insert user: %w", err)
 	}
 
-	_, err = tx.Exec(ctx,
+	// ON CONFLICT DO NOTHING RETURNING reports who actually owns the
+	// identity: the caller. When another concurrent request inserted it
+	// first, no row comes back; we discard our fresh (and now orphan)
+	// user row via the deferred rollback and re-read the existing user.
+	var identityUserID int64
+	err = tx.QueryRow(ctx,
 		`INSERT INTO user_identities (user_id, platform, external_user_id)
 		 VALUES ($1, $2, $3)
-		 ON CONFLICT (platform, external_user_id) DO NOTHING`,
+		 ON CONFLICT (platform, external_user_id) DO NOTHING
+		 RETURNING user_id`,
 		u.ID, platform, externalUserID,
-	)
+	).Scan(&identityUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		u2, _, err := s.findUserByIdentity(ctx, platform, externalUserID)
+		return u2, err
+	}
 	if err != nil {
 		return User{}, fmt.Errorf("insert identity: %w", err)
 	}
