@@ -32,15 +32,15 @@ Phase 3 — Bookings
 * Удаление игрока администратором — частично: операция Cancel есть, проверка chat_admins — Phase 7
 * Тесты, в том числе конкурентная запись— готово（create/дубль/гость/отмена/FIFO promotion/уведомление/конкурентная запись; нужен запущенный Postgres）
 
-Phase 4 — VK
+Phase 4 — VK — готово
 
-* VK community, token, Events API
-* /vk/callback: confirmation + secret
-* message и callback button
-* from_id, peer_id
-* User identity и ChatChannel
-* Ответ в беседу, keyboard
-* Идемпотентность повторного callback
+* VK community, token, Events API — готово (конфиг + проводка; ручные шаги в README «Настройка VK»)
+* /vk/callback: confirmation + secret — готово
+* message и callback button — готово (message_new, message_event + messages.sendMessageEventAnswer)
+* from_id, peer_id — готово
+* User identity и ChatChannel — готово (идемпотентно, гонки покрыты тестами)
+* Ответ в беседу, keyboard — готово
+* Идемпотентность повторного callback — готово (дедуп по event_id + unique-индексы PostgreSQL)
 
 Phase 5 — Подключение беседы
 

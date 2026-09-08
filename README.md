@@ -53,7 +53,9 @@ VK → VK Adapter → Go backend (Event / Booking) → PostgreSQL
 
 Статус
 
-Этапы 1–5 (TODO Phase 1–3): Event Service поверх PostgreSQL и Booking Service(запись, очередь, отмена, FIFO promotion, уведомление)— готово и покрыто интеграционными тестами. Следующий этап — VK Adapter(TODO Phase 4): /vk/callback, кнопки, подключение беседы.
+TODO Phase 1–3 (Event Service поверх PostgreSQL, Booking Service: запись, очередь, отмена, FIFO promotion, уведомление) — готово и покрыто интеграционными тестами.
+
+TODO Phase 4 (VK Adapter) — код готов и покрыт тестами: POST /vk/callback (confirmation и secret), message_new и callback-кнопки (message_event), from_id → identity, peer_id → ChatChannel, ответ в беседу с keyboard, идемпотентность повторного callback. Осталась только разовая ручная настройка реального сообщества VK (шаги ниже). Следующий этап — TODO Phase 5, подключение беседы.
 
 Запуск:
 
@@ -61,16 +63,16 @@ docker compose up --build
 
 Проверка: GET http://localhost:8082/health → ok (пинг БД)
 
-Тесты Event и Booking Service (нужен запущенный Postgres):
+Тесты (нужен запущенный Postgres для event/booking/chat, vk — без него):
 
-go test ./internal/event/ ./internal/booking/ -count=1
+go test ./internal/event/ ./internal/booking/ ./internal/chat/ ./internal/vk/ -count=1
 
 Без локального Go — из каталога проекта, с сетью Compose:
 
 docker run --rm --network sportevents_default \
   -e DATABASE_URL=postgres://postgres:postgres@postgres:5432/booking?sslmode=disable \
   -v "$PWD":/src -w /src golang:1.24-alpine \
-  go test ./internal/event/ ./internal/booking/ -count=1
+  go test ./internal/event/ ./internal/booking/ ./internal/chat/ ./internal/vk/ -count=1
 
 Порты на хосте по умолчанию: приложение 8082, Postgres 5434 (внутри сети Compose Postgres слушает 5432). Так меньше конфликтов с другими локальными контейнерами.
 
@@ -89,6 +91,17 @@ VK_SECRET=
 VK_SECRET — ключ проверки callback, если его требует актуальная документация VK, отдельно от confirmation-строки.
 
 Параметры VK API сверять с официальной документацией перед интеграцией.
+
+Настройка VK (разово, вручную)
+
+1. Создать сообщество VK (или использовать существующее). В «Управление → Сообщения» включить сообщения и бота.
+2. Получить ключ доступа сообщества с правом `messages` («Управление → Работа с API → Ключи доступа») — это `VK_TOKEN`.
+3. «Управление → Работа с API → Callback API»: указать URL `https://<домен>/vk/callback` (например, через Caddy) и версию API `5.199` — совпадает с `vkAPIVersion` в `internal/vk/client.go`.
+4. Включить типы событий сообщества: `message_new` и `message_event`.
+5. Confirmation-строку, которую VK показывает в этом же разделе, занести в `VK_CONFIRMATION_TOKEN`. Если включён секретный ключ — его значение в `VK_SECRET`.
+6. `VK_GROUP_ID` — id сообщества (положительное число из адреса `https://vk.com/club<id>`).
+
+Локально VK не ходит на `localhost`: нужен публичный HTTPS-туннель на порт приложения или деплой на VPS. В docker-compose VK-переменные идут из `.env` через `VK_*` (см. `.env.example`); без них сервис поднимается, но `/vk/callback` отключён.
 
 Первая версия
 

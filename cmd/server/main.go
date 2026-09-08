@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"os"
 
+	"sportevents.local/internal/chat"
 	"sportevents.local/internal/postgres"
+	"sportevents.local/internal/vk"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -37,10 +39,36 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler(pool))
 
+	if svc, ok := newVKService(pool); ok {
+		mux.HandleFunc("POST /vk/callback", svc.HandleCallback)
+		log.Printf("vk: /vk/callback is up")
+	} else {
+		log.Printf("vk: not configured, /vk/callback is disabled")
+	}
+
 	log.Printf("listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// newVKService wires the VK adapter around the chat store. VK is optional:
+// without a token and confirmation string the service runs without the
+// callback endpoint (VK_* vars may be missing on a development box).
+func newVKService(pool *pgxpool.Pool) (*vk.Service, bool) {
+	confirmation := os.Getenv("VK_CONFIRMATION_TOKEN")
+	token := os.Getenv("VK_TOKEN")
+	if confirmation == "" || token == "" {
+		return nil, false
+	}
+
+	client := vk.NewClient(token, os.Getenv("VK_GROUP_ID"))
+	chats := chat.NewService(pool)
+	return vk.NewService(vk.Config{
+		ConfirmationToken: confirmation,
+		Secret:            os.Getenv("VK_SECRET"),
+		GroupID:           os.Getenv("VK_GROUP_ID"),
+	}, client, chats, chats), true
 }
 
 func healthHandler(pool *pgxpool.Pool) http.HandlerFunc {
