@@ -118,8 +118,8 @@ VK_SECRET — ключ проверки callback, если его требует
 
     # эквивалент с Mac: make deploy-home
 
-Прежний контур на Beget-VPS (sport-events.dev.medovf2h.beget.tech, 159.194.252.9) выведен из
-эксплуатации: сервер признан недоверенным (подозрение на взлом), ничего оттуда не переносилось.
+Прежний контур на Beget-VPS (sport-events.dev.medovf2h.beget.tech, 159.194.252.9) признан
+недоверенным (подозрение на взлом) и удалён 17.09.2026 — ничего оттуда не переносилось.
 Разделы ниже (`make deploy`, `docker-compose.prod.yml`, `Caddyfile`) оставлены как legacy.
 
 Legacy: деплой на Beget-VPS
