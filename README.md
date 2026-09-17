@@ -99,14 +99,30 @@ VK_SECRET — ключ проверки callback, если его требует
 
 1. Создать сообщество VK (или использовать существующее). В «Управление → Сообщения» включить сообщения и бота.
 2. Получить ключ доступа сообщества с правом `messages` («Управление → Работа с API → Ключи доступа») — это `VK_TOKEN`.
-3. «Управление → Работа с API → Callback API»: указать URL `https://<домен>/vk/callback` (например, через Caddy) и версию API `5.199` — совпадает с `vkAPIVersion` в `internal/vk/client.go`.
+3. «Управление → Работа с API → Callback API»: указать URL `https://sportevent.dev.medovf2h.beget.tech/vk/callback` и версию API `5.199` — совпадает с `vkAPIVersion` в `internal/vk/client.go`.
 4. Включить типы событий сообщества: `message_new` и `message_event`.
 5. Confirmation-строку, которую VK показывает в этом же разделе, занести в `VK_CONFIRMATION_TOKEN`. Если включён секретный ключ — его значение в `VK_SECRET`.
 6. `VK_GROUP_ID` — id сообщества (положительное число из адреса `https://vk.com/club<id>`).
 
-Локально VK не ходит на `localhost`: нужен публичный HTTPS-туннель на порт приложения или деплой на VPS. В docker-compose VK-переменные идут из `.env` через `VK_*` (см. `.env.example`); без них сервис поднимается, но `/vk/callback` отключён.
+Локально VK не ходит на `localhost`: нужен публичный HTTPS-туннель на порт приложения или деплой на домашний сервер. В docker-compose VK-переменные идут из `.env` через `VK_*` (см. `.env.example`); без них сервис поднимается, но `/vk/callback` отключён. На домашнем контуре нужны `VK_TOKEN` **и** `VK_CONFIRMATION_TOKEN` (см. DEPLOY.md).
 
-Деплой на VPS
+Деплой (домашний сервер)
+
+Канонический контур — домашний сервер за VPS-шлюзом: https://sportevent.dev.medovf2h.beget.tech
+(Go-процесс + PostgreSQL 16, TLS терминирует общий Caddy дома, порты проекта не публикуются).
+Полный регламент, бэкап и правила «нельзя» — DEPLOY.md.
+
+    # на домашнем сервере (с Mac из домашней сети: ssh home-server)
+    bash /opt/projects/sportevents/deploy.sh   # git pull + go build в контейнере golang + docker compose up -d --build
+    bash /opt/projects/sportevents/smoke.sh    # /health, HTTP->HTTPS, БД, VK, изоляция портов
+
+    # эквивалент с Mac: make deploy-home
+
+Прежний контур на Beget-VPS (sport-events.dev.medovf2h.beget.tech, 159.194.252.9) выведен из
+эксплуатации: сервер признан недоверенным (подозрение на взлом), ничего оттуда не переносилось.
+Разделы ниже (`make deploy`, `docker-compose.prod.yml`, `Caddyfile`) оставлены как legacy.
+
+Legacy: деплой на Beget-VPS
 
 На слабом VPS (1 vCPU / 1 ГБ RAM) Go-компиляция в контейнере может идти часами или падать по OOM, поэтому код компилируется на машине разработчика, а на сервер кладётся готовый бинарь. Образ собирается без компиляции Go.
 
@@ -140,10 +156,10 @@ make deploy VPS_HOST=159.194.252.9 VPS_USER=root VPS_DIR=~/SportEvents
     docker compose -f docker-compose.yml -f docker-compose.prod.yml down
     docker image prune -f
 
-Проверка после деплоя:
+Проверка после деплоя (публичный домен):
 
-    curl -i https://sport-events.dev.medovf2h.beget.tech/health
-    curl -i -X POST https://sport-events.dev.medovf2h.beget.tech/vk/callback \
+    curl -i https://sportevent.dev.medovf2h.beget.tech/health
+    curl -i -X POST https://sportevent.dev.medovf2h.beget.tech/vk/callback \
       -H 'Content-Type: application/json' \
       -d '{"type":"confirmation"}'
 

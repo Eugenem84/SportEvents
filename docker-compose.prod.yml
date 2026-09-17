@@ -1,3 +1,7 @@
+# LEGACY: контур на Beget-VPS (`159.194.252.9`) выведен из эксплуатации, сервер признан
+# недоверенным. Актуальный контур — домашний сервер: compose-файл лежит в
+# home-server-vps/projects/sportevents/compose.yml, регламент — DEPLOY.md.
+#
 # Продакшен-оверрайд для VPS:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 #
