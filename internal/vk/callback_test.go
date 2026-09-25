@@ -1340,3 +1340,82 @@ func TestCallbackSlashHelpShowsCommands(t *testing.T) {
 		}
 	}
 }
+
+// --- Постоянная клавиатура и payload-объект ---
+
+// VK в Bots Long Poll присылает payload объектом, а не строкой (как описано в
+// доке Callback API): обе формы должны разбираться, иначе нажатия кнопок
+// теряются.
+func TestCallbackObjectPayloadMessageNew(t *testing.T) {
+	h := newHarness(t, true)
+
+	envelope := `{"type":"message_new","group_id":12345,"secret":"sekret","object":{"message":{` +
+		`"id":9,"date":0,"peer_id":2000000047,"from_id":555,"text":"","out":0,` +
+		`"payload":{"command":"my"}}}}`
+	code, _ := postJSON(t, h.svc.HandleCallback, envelope)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "нет активных записей") {
+		t.Fatalf("object payload must be understood: %+v", h.msg.sent)
+	}
+}
+
+func TestCallbackObjectPayloadMessageEvent(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 3, Minutes: 19 * 60}}
+
+	envelope := `{"type":"message_event","group_id":12345,"secret":"sekret","event_id":"e2","object":{` +
+		`"user_id":555,"peer_id":2000000047,"event_id":"e2","conversation_message_id":777,` +
+		`"payload":{"command":"slot_remove","weekday":3}}}`
+	code, _ := postJSON(t, h.svc.HandleCallback, envelope)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.sched.removed) != 1 || h.sched.removed[0] != 3 {
+		t.Fatalf("object payload must be understood: %+v", h.sched.removed)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 777 {
+		t.Fatalf("settings must be rewritten in place: %+v", h.msg.edits)
+	}
+}
+
+// Клавиатура, которая остаётся под полем ввода: без inline, без one_time и с
+// callback-кнопками — нажатие не пишет текст в чат.
+func TestPersistentKeyboardShape(t *testing.T) {
+	raw, err := persistentKeyboard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(raw, `"inline"`) {
+		t.Fatalf("persistent keyboard must not be inline: %q", raw)
+	}
+	if strings.Contains(raw, `"one_time"`) {
+		t.Fatalf("persistent keyboard must not be one_time: %q", raw)
+	}
+	if !strings.Contains(raw, `"type":"callback"`) {
+		t.Fatalf("persistent buttons must be callback buttons: %q", raw)
+	}
+	for _, label := range []string{"Игры", "Мои записи", "Создать игру", "Настройки"} {
+		if !strings.Contains(raw, label) {
+			t.Fatalf("keyboard must contain %q: %q", label, raw)
+		}
+	}
+}
+
+// Любой ответ бота без собственной клавиатуры несёт постоянную: иначе кнопки
+// пропадали бы из-под поля ввода после первого же сообщения.
+func TestRepliesCarryPersistentKeyboard(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/my", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	if !strings.Contains(h.msg.sent[0].Keyboard, "Создать игру") {
+		t.Fatalf("reply must carry the persistent keyboard: %q", h.msg.sent[0].Keyboard)
+	}
+}

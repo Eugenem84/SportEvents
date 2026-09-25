@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -25,6 +26,32 @@ type CallbackRequest struct {
 	Object  json.RawMessage `json:"object"`
 }
 
+// payloadField is VK's "payload" field. The Callback API docs describe it as a
+// JSON string, but Bots Long Poll sends an already decoded object, so both
+// forms must parse: a string is used as is, an object is kept as its JSON text
+// for ParseButtonPayload.
+type payloadField string
+
+func (p *payloadField) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	switch {
+	case trimmed == "" || trimmed == "null":
+		*p = ""
+	case strings.HasPrefix(trimmed, `"`):
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*p = payloadField(s)
+	default:
+		*p = payloadField(trimmed)
+	}
+	return nil
+}
+
+// String returns the payload as JSON text.
+func (p payloadField) String() string { return string(p) }
+
 // messageNew is the object.message of a message_new event.
 type messageNew struct {
 	ID     int64  `json:"id"`
@@ -35,7 +62,7 @@ type messageNew struct {
 	Out    int    `json:"out"`
 	// Payload is attached when the message was sent by pressing a button
 	// of the bot keyboard.
-	Payload string `json:"payload"`
+	Payload payloadField `json:"payload"`
 }
 
 type messageNewObject struct {
@@ -47,11 +74,11 @@ type messageNewObject struct {
 // the bot edits that very message (the settings screen), so the chat keeps
 // one live settings message instead of a pile of them.
 type messageEvent struct {
-	UserID                int64  `json:"user_id"`
-	PeerID                int64  `json:"peer_id"`
-	EventID               string `json:"event_id"`
-	Payload               string `json:"payload"`
-	ConversationMessageID int64  `json:"conversation_message_id"`
+	UserID                int64        `json:"user_id"`
+	PeerID                int64        `json:"peer_id"`
+	EventID               string       `json:"event_id"`
+	Payload               payloadField `json:"payload"`
+	ConversationMessageID int64        `json:"conversation_message_id"`
 }
 
 // HandleCallback is the POST /vk/callback endpoint. VK retries events that

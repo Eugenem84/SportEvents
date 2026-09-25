@@ -240,7 +240,7 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 	if err != nil {
 		return fmt.Errorf("find chat: %w", err)
 	}
-	parsed := s.parseCommand(msg.Text, msg.Payload, ch != nil)
+	parsed := s.parseCommand(msg.Text, string(msg.Payload), ch != nil)
 
 	// An unconnected conversation is not a Chat yet: only the connection
 	// request makes sense there, the rest is people talking.
@@ -359,7 +359,7 @@ func (s *Service) handleMessageEvent(ctx context.Context, ev messageEvent) error
 		return err
 	}
 
-	parsed := ParseButtonPayload(ev.Payload)
+	parsed := ParseButtonPayload(ev.Payload.String())
 	return s.handleCommand(ctx, commandCtx{
 		peerID:    ev.PeerID,
 		chat:      *ch,
@@ -420,7 +420,7 @@ func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
 		return s.sendText(ctx, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
 	}
 
-	kb, err := defaultKeyboard()
+	kb, err := persistentKeyboard()
 	if err != nil {
 		return err
 	}
@@ -1033,7 +1033,17 @@ func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, str
 	return b.String(), kb, nil
 }
 
+// sendText replies in the chat. A caller without a keyboard of its own gets
+// the persistent keyboard: the one that stays under the input field, so the
+// buttons never scroll out of reach in a busy chat.
 func (s *Service) sendText(ctx context.Context, peerID int64, text, keyboard string) error {
+	if keyboard == "" {
+		kb, err := persistentKeyboard()
+		if err != nil {
+			return err
+		}
+		keyboard = kb
+	}
 	if _, err := s.messenger.SendMessage(ctx, peerID, text, keyboard); err != nil {
 		return fmt.Errorf("send message: %w", err)
 	}
@@ -1041,7 +1051,7 @@ func (s *Service) sendText(ctx context.Context, peerID int64, text, keyboard str
 }
 
 func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, chatTitle string) error {
-	kb, err := defaultKeyboard()
+	kb, err := persistentKeyboard()
 	if err != nil {
 		return err
 	}
@@ -1059,20 +1069,20 @@ func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, ch
 	return s.sendText(ctx, peerID, text, kb)
 }
 
-// defaultKeyboard is the always-available set of buttons. Admin-only actions
-// are offered to everyone: a member who is not an administrator gets a clear
-// refusal instead of a hidden feature.
-func defaultKeyboard() (string, error) {
+// persistentKeyboard is the keyboard that stays under the chat input instead
+// of scrolling away with a message (VK: no "inline", no one_time). Buttons
+// are callback buttons: VK delivers a press as message_event, so pressing one
+// posts nothing to the chat. Verified against the live community.
+func persistentKeyboard() (string, error) {
 	kb := Keyboard{
-		Inline: true,
 		Buttons: [][]Button{
 			{
-				TextButton("Игры", CommandPayload(cmdGames), ColorPrimary),
-				TextButton("Мои записи", CommandPayload(cmdMyBookings), ColorSecondary),
+				CallbackButton("Игры", CommandPayload(cmdGames), ColorPrimary),
+				CallbackButton("Мои записи", CommandPayload(cmdMyBookings), ColorSecondary),
 			},
 			{
-				TextButton("Создать игру", CommandPayload(cmdCreateGame), ColorPositive),
-				TextButton("Настройки", CommandPayload(cmdSettings), ColorSecondary),
+				CallbackButton("Создать игру", CommandPayload(cmdCreateGame), ColorPositive),
+				CallbackButton("Настройки", CommandPayload(cmdSettings), ColorSecondary),
 			},
 		},
 	}
