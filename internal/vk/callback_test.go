@@ -28,6 +28,7 @@ type fakeMessenger struct {
 	sent     []sentMessage
 	edits    []editedMessage
 	answers  []answeredEvent
+	pinned   []int64
 	userName string
 }
 
@@ -45,9 +46,10 @@ type editedMessage struct {
 }
 
 type answeredEvent struct {
-	UserID  int64
-	PeerID  int64
-	EventID string
+	UserID    int64
+	PeerID    int64
+	EventID   string
+	EventData string
 }
 
 func (f *fakeMessenger) SendMessage(_ context.Context, peerID int64, text, keyboard string) (int64, error) {
@@ -60,8 +62,13 @@ func (f *fakeMessenger) EditMessage(_ context.Context, peerID, messageID int64, 
 	return messageID, nil
 }
 
+func (f *fakeMessenger) PinMessage(_ context.Context, peerID, messageID int64) error {
+	f.pinned = append(f.pinned, messageID)
+	return nil
+}
+
 func (f *fakeMessenger) AnswerMessageEvent(_ context.Context, userID, peerID int64, eventID, eventData string) error {
-	f.answers = append(f.answers, answeredEvent{UserID: userID, PeerID: peerID, EventID: eventID})
+	f.answers = append(f.answers, answeredEvent{UserID: userID, PeerID: peerID, EventID: eventID, EventData: eventData})
 	return nil
 }
 
@@ -156,17 +163,41 @@ func (f *fakeBookingStore) Create(_ context.Context, in booking.CreateInput) (bo
 		return booking.Booking{}, f.createErr
 	}
 	f.created = append(f.created, in)
+
 	status := f.createStatus
 	if status == "" {
 		status = booking.StatusConfirmed
 	}
-	return booking.Booking{
+	b := booking.Booking{
 		ID:         500 + int64(len(f.created)),
 		EventID:    in.EventID,
 		PlayerName: in.PlayerName,
 		UserID:     in.UserID,
 		Status:     status,
-	}, nil
+	}
+	if status == booking.StatusConfirmed {
+		seat := 1 + len(f.confirmed(in.EventID))
+		b.SeatNo = &seat
+	}
+
+	// The fake keeps its own state, so ListByEvent and the reserve position
+	// see what Create just handed out.
+	if f.byEvent == nil {
+		f.byEvent = map[int64][]booking.Booking{}
+	}
+	f.byEvent[in.EventID] = append(f.byEvent[in.EventID], b)
+	return b, nil
+}
+
+// confirmed lists the confirmed bookings the fake already handed out.
+func (f *fakeBookingStore) confirmed(eventID int64) []booking.Booking {
+	var out []booking.Booking
+	for _, b := range f.byEvent[eventID] {
+		if b.Status == booking.StatusConfirmed {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 func (f *fakeBookingStore) Cancel(_ context.Context, eventID, bookingID int64) (booking.CancelResult, error) {
@@ -410,7 +441,7 @@ func TestCallbackUnconnectedChatIgnoresSmallTalk(t *testing.T) {
 func TestCallbackMessageNewStartWelcomes(t *testing.T) {
 	h := newHarness(t, true)
 	payload := `{"type":"message_new","group_id":12345,"secret":"sekret","object":{"message":{` +
-		`"id":1,"date":0,"peer_id":2000000047,"from_id":555,"text":"/start","out":0}}}`
+		`"id":1,"date":0,"peer_id":2000000047,"from_id":555,"text":"/помощь","out":0}}}`
 	code, _ := postJSON(t, h.svc.HandleCallback, payload)
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
@@ -427,7 +458,7 @@ func TestCallbackMessageNewStartWelcomes(t *testing.T) {
 	if !strings.Contains(h.msg.sent[0].Text, "Иван Петров") {
 		t.Fatalf("welcome must mention name: %q", h.msg.sent[0].Text)
 	}
-	if !strings.Contains(h.msg.sent[0].Keyboard, "Игры") {
+	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
 		t.Fatalf("welcome must carry keyboard: %q", h.msg.sent[0].Keyboard)
 	}
 }
@@ -496,7 +527,7 @@ func TestCallbackOwnOutgoingMessageIgnored(t *testing.T) {
 // processed once: one reply, one identity lookup.
 
 const helloEnvelope = `{"type":"message_new","group_id":12345,"secret":"sekret","event_id":"evt-1","object":{"message":{` +
-	`"id":1,"date":0,"peer_id":2000000047,"from_id":555,"text":"/start","out":0}}}`
+	`"id":1,"date":0,"peer_id":2000000047,"from_id":555,"text":"/помощь","out":0}}}`
 
 func TestCallbackRetriedEventProcessedOnce(t *testing.T) {
 	h := newHarness(t, true)
@@ -604,7 +635,7 @@ func TestCallbackConnectCreatesChatAndAdmin(t *testing.T) {
 	if !strings.Contains(h.msg.sent[0].Text, "Волейбол Иваново") {
 		t.Fatalf("reply must mention the chat title: %q", h.msg.sent[0].Text)
 	}
-	if !strings.Contains(h.msg.sent[0].Keyboard, "Игры") {
+	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
 		t.Fatalf("connected chat must get the keyboard: %q", h.msg.sent[0].Keyboard)
 	}
 }
@@ -801,14 +832,14 @@ func TestCallbackGamesListsFreeSlotsAndButtons(t *testing.T) {
 		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
 	got := h.msg.sent[0]
-	if !strings.Contains(got.Text, "завтра в 12:00") {
+	if !strings.Contains(got.Text, "сб, 26.09, 12:00") {
 		t.Fatalf("time not rendered in the chat zone: %q", got.Text)
 	}
 	if !strings.Contains(got.Text, "свободно 1 из 12") || !strings.Contains(got.Text, "в резерве 2") {
 		t.Fatalf("counters: %q", got.Text)
 	}
 	btn := firstButton(t, got.Keyboard)
-	if cmd, eventID := ParsePayload(btn.Action.Payload); cmd != cmdBook || eventID != 7 {
+	if cmd, eventID := ParsePayload(btn.Action.Payload); cmd != cmdAttend || eventID != 7 {
 		t.Fatalf("button: %s/%d", cmd, eventID)
 	}
 }
@@ -857,7 +888,19 @@ func TestCallbackCreateGameDeniedForNonAdmin(t *testing.T) {
 	}
 }
 
-func TestCallbackBookThroughButtonEditsAnnouncement(t *testing.T) {
+// snackbar returns the personal message the presser saw: VK's event_data of
+// the last button answer.
+func snackbar(t *testing.T, h *harness) string {
+	t.Helper()
+	if len(h.msg.answers) == 0 {
+		t.Fatal("the button press was not answered")
+	}
+	return h.msg.answers[len(h.msg.answers)-1].EventData
+}
+
+// Нажатие «Иду»: в чат уходит строчка «номер - имя», лично — всплывашка, а
+// анонс переписывается на месте.
+func TestCallbackAttendPostsSeatLineAndSnackbar(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
 		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
@@ -866,7 +909,7 @@ func TestCallbackBookThroughButtonEditsAnnouncement(t *testing.T) {
 	h.anns.has = true
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		msgEnvelope(2000000047, 555, "Записаться", EventCommandPayload(cmdBook, 7)))
+		eventEnvelope(2000000047, 555, 900, EventCommandPayload(cmdAttend, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -876,15 +919,19 @@ func TestCallbackBookThroughButtonEditsAnnouncement(t *testing.T) {
 	if u := h.books.created[0].UserID; u == nil || *u != h.users.user.ID {
 		t.Fatalf("booking must carry the identity: %+v", h.books.created[0])
 	}
-	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "Вы записаны") {
-		t.Fatalf("reply: %+v", h.msg.sent)
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "1 - Иван Петров" {
+		t.Fatalf("seat line: %+v", h.msg.sent)
+	}
+	if !strings.Contains(snackbar(t, h), "Вы записаны: место 1") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
 	}
 	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 555 {
 		t.Fatalf("announcement must be rewritten in place: %+v", h.msg.edits)
 	}
 }
 
-func TestCallbackBookFullGameGoesToReserve(t *testing.T) {
+// Полная игра: «Иду» отправляет в резерв и говорит об этом лично.
+func TestCallbackAttendFullGameGoesToReserve(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
 		Event:     event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 1},
@@ -894,32 +941,37 @@ func TestCallbackBookFullGameGoesToReserve(t *testing.T) {
 	h.books.createStatus = booking.StatusWaitlist
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		msgEnvelope(2000000047, 555, "В резерв", EventCommandPayload(cmdBook, 7)))
+		eventEnvelope(2000000047, 555, 901, EventCommandPayload(cmdAttend, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
-	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "в резерве") {
-		t.Fatalf("reply: %+v", h.msg.sent)
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "резерв 1 - Иван Петров" {
+		t.Fatalf("reserve line: %+v", h.msg.sent)
+	}
+	if !strings.Contains(snackbar(t, h), "в резерве") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
 	}
 }
 
-// A full game must offer "В резерв" instead of "Записаться" in the roster
-// message, so the button never promises a slot that is already gone.
-func TestCallbackAnnouncementSwitchesButtonWhenFull(t *testing.T) {
+// Анонс: дата с днём недели, номера мест с «свободно» вместо уехавших номеров,
+// счётчик свободных мест и резерв в порядке очереди.
+func TestCallbackAnnouncementShowsSeatsAndReserve(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 2},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 3},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
 	h.anns.has = true
+	seat1, seat3 := 1, 3
 	h.books.byEvent = map[int64][]booking.Booking{7: {
-		{ID: 1, EventID: 7, PlayerName: "Иван", Status: booking.StatusConfirmed},
-		{ID: 2, EventID: 7, PlayerName: "Пётр", Status: booking.StatusConfirmed},
-		{ID: 3, EventID: 7, PlayerName: "Сергей", Status: booking.StatusWaitlist},
+		{ID: 1, EventID: 7, PlayerName: "Иван", SeatNo: &seat1, Status: booking.StatusConfirmed},
+		{ID: 3, EventID: 7, PlayerName: "Сергей", SeatNo: &seat3, Status: booking.StatusConfirmed},
+		{ID: 4, EventID: 7, PlayerName: "Мария", Status: booking.StatusWaitlist},
 	}}
+	h.books.createStatus = booking.StatusWaitlist
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		msgEnvelope(2000000047, 555, "Записаться", EventCommandPayload(cmdBook, 7)))
+		eventEnvelope(2000000047, 555, 902, EventCommandPayload(cmdAttend, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -927,31 +979,43 @@ func TestCallbackAnnouncementSwitchesButtonWhenFull(t *testing.T) {
 		t.Fatalf("announcement must be rewritten: %+v", h.msg.edits)
 	}
 	edit := h.msg.edits[0]
-	if !strings.Contains(edit.Text, "Состав (2/2)") || !strings.Contains(edit.Text, "Резерв (1)") {
-		t.Fatalf("roster: %q", edit.Text)
-	}
-	if !strings.Contains(edit.Keyboard, "В резерв") {
-		t.Fatalf("keyboard must offer the reserve: %q", edit.Keyboard)
+	for _, want := range []string{
+		"суббота, 26 сентября, 12:00",
+		"Состав (2/3)",
+		"1. Иван · 2. свободно · 3. Сергей",
+		"Свободно мест: 1",
+		"Резерв (2): Мария · Иван Петров",
+	} {
+		if !strings.Contains(edit.Text, want) {
+			t.Fatalf("announcement must contain %q:\n%s", want, edit.Text)
+		}
 	}
 }
 
-func TestCallbackSkipCancelsAndReportsPromotion(t *testing.T) {
+// «Не иду» пишет в чат «номер - имя минус» и сообщает, кто поднялся из резерва.
+func TestCallbackSkipPostsMinusLineAndPromotion(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
 		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
 	}}
+	seat := 3
 	h.books.active = []booking.BookingWithEvent{{
-		Booking:       booking.Booking{ID: 55, EventID: 7, Status: booking.StatusConfirmed},
+		Booking: booking.Booking{
+			ID: 55, EventID: 7, PlayerName: "Иван Петров", SeatNo: &seat, Status: booking.StatusConfirmed,
+		},
 		EventTitle:    "Волейбол",
 		EventStartsAt: harnessNow().Add(24 * time.Hour),
 	}}
-	promoted := booking.Booking{ID: 56, EventID: 7, PlayerName: "Пётр", Status: booking.StatusConfirmed}
+	promotedSeat := 3
+	promoted := booking.Booking{
+		ID: 56, EventID: 7, PlayerName: "Пётр", SeatNo: &promotedSeat, Status: booking.StatusConfirmed,
+	}
 	h.books.promote = &promoted
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
 	h.anns.has = true
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		msgEnvelope(2000000047, 555, "Пропускаю", EventCommandPayload(cmdSkip, 7)))
+		eventEnvelope(2000000047, 555, 903, EventCommandPayload(cmdSkip, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -959,28 +1023,38 @@ func TestCallbackSkipCancelsAndReportsPromotion(t *testing.T) {
 		t.Fatalf("cancelled: %+v", h.books.cancelled)
 	}
 	if len(h.msg.sent) != 1 {
-		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+		t.Fatalf("want 1 chat line, got %d", len(h.msg.sent))
 	}
-	if !strings.Contains(h.msg.sent[0].Text, "Место занял Пётр") {
-		t.Fatalf("promotion must be announced: %q", h.msg.sent[0].Text)
+	for _, want := range []string{"3 - Иван Петров минус", "3 - Пётр из резерва"} {
+		if !strings.Contains(h.msg.sent[0].Text, want) {
+			t.Fatalf("chat line must contain %q: %q", want, h.msg.sent[0].Text)
+		}
+	}
+	if !strings.Contains(snackbar(t, h), "Запись отменена") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
 	}
 	if len(h.msg.edits) != 1 {
 		t.Fatalf("announcement must be rewritten: %+v", h.msg.edits)
 	}
 }
 
-func TestCallbackSkipWithoutBooking(t *testing.T) {
+// «Не иду», когда человек не записан: в чат не пишем ничего, отвечаем лично.
+func TestCallbackSkipWithoutBookingStaysSilent(t *testing.T) {
 	h := newHarness(t, true)
+
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		msgEnvelope(2000000047, 555, "Пропускаю", EventCommandPayload(cmdSkip, 7)))
+		eventEnvelope(2000000047, 555, 904, EventCommandPayload(cmdSkip, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
 	if len(h.books.cancelled) != 0 {
 		t.Fatalf("nothing to cancel: %+v", h.books.cancelled)
 	}
-	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "не записаны") {
-		t.Fatalf("reply: %+v", h.msg.sent)
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("the chat must stay silent: %+v", h.msg.sent)
+	}
+	if !strings.Contains(snackbar(t, h), "не записаны") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
 	}
 }
 
@@ -1000,7 +1074,7 @@ func TestCallbackMyBookings(t *testing.T) {
 		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
 	got := h.msg.sent[0]
-	if !strings.Contains(got.Text, "в резерве") || !strings.Contains(got.Text, "завтра в 12:00") {
+	if !strings.Contains(got.Text, "в резерве") || !strings.Contains(got.Text, "сб, 26.09, 12:00") {
 		t.Fatalf("text: %q", got.Text)
 	}
 	btn := firstButton(t, got.Keyboard)
@@ -1267,9 +1341,11 @@ func TestParseCommand(t *testing.T) {
 		{name: "slash cancel", text: "/cancel", connected: true, wantCmd: cmdCancelBooking},
 		{name: "slash settings", text: "/settings", connected: true, wantCmd: cmdSettings},
 		{name: "slash create with args", text: "/create 27.09 19:00", connected: true, wantCmd: cmdCreateGame},
+		{name: "slash start russian opens sign-ups", text: "/старт", connected: true, wantCmd: cmdCreateGame},
+		{name: "slash latin start is not a command", text: "/start", connected: true, wantCmd: ""},
 		{name: "slash connect", text: "/connect", connected: true, wantCmd: cmdConnect},
-		{name: "slash help", text: "/help", connected: true, wantCmd: cmdStart},
-		{name: "slash start", text: "/start", connected: true, wantCmd: cmdStart},
+		{name: "slash help", text: "/помощь", connected: true, wantCmd: cmdStart},
+		{name: "slash latin help", text: "/help", connected: true, wantCmd: cmdStart},
 		{name: "slash russian", text: "/игры", connected: true, wantCmd: cmdGames},
 		{name: "unknown slash", text: "/pizza", connected: true, wantCmd: ""},
 
@@ -1326,7 +1402,7 @@ func TestCallbackSlashCreateWithArguments(t *testing.T) {
 func TestCallbackSlashHelpShowsCommands(t *testing.T) {
 	h := newHarness(t, true)
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/help", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/помощь", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1334,7 +1410,7 @@ func TestCallbackSlashHelpShowsCommands(t *testing.T) {
 		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
 	text := h.msg.sent[0].Text
-	for _, want := range []string{"/games", "/my", "/cancel", "/create", "/settings"} {
+	for _, want := range []string{"/игры", "/мои", "/отмена", "/старт", "/настройки", "/помощь"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help must list %s: %q", want, text)
 		}
@@ -1396,7 +1472,7 @@ func TestPersistentKeyboardShape(t *testing.T) {
 	if !strings.Contains(raw, `"type":"callback"`) {
 		t.Fatalf("persistent buttons must be callback buttons: %q", raw)
 	}
-	for _, label := range []string{"Игры", "Мои записи", "Создать игру", "Настройки"} {
+	for _, label := range []string{"Иду", "Не иду"} {
 		if !strings.Contains(raw, label) {
 			t.Fatalf("keyboard must contain %q: %q", label, raw)
 		}
@@ -1415,7 +1491,7 @@ func TestRepliesCarryPersistentKeyboard(t *testing.T) {
 	if len(h.msg.sent) != 1 {
 		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
-	if !strings.Contains(h.msg.sent[0].Keyboard, "Создать игру") {
+	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
 		t.Fatalf("reply must carry the persistent keyboard: %q", h.msg.sent[0].Keyboard)
 	}
 }

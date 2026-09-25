@@ -78,6 +78,29 @@ func (c *Client) SendMessage(ctx context.Context, peerID int64, text, keyboard s
 	return msgID, nil
 }
 
+// PinMessage pins a message in the conversation (messages.pin), so the game
+// announcement with the roster stays at the top of the chat instead of
+// scrolling away. VK allows this for chat administrators; when it is not
+// allowed the caller logs it and the announcement still works.
+func (c *Client) PinMessage(ctx context.Context, peerID, messageID int64) error {
+	params := url.Values{}
+	params.Set("peer_id", strconv.FormatInt(peerID, 10))
+	params.Set("message_id", strconv.FormatInt(messageID, 10))
+
+	raw, err := c.call(ctx, "messages.pin", params)
+	if err != nil {
+		return err
+	}
+	var ok int
+	if err := json.Unmarshal(raw, &ok); err != nil {
+		return fmt.Errorf("parse messages.pin response: %w", err)
+	}
+	if ok != 1 {
+		return fmt.Errorf("messages.pin: unexpected response %d", ok)
+	}
+	return nil
+}
+
 // EditMessage edits a message the community sent earlier (messages.edit).
 // This is how the game announcement keeps the roster in one message instead
 // of posting a new one on every booking. It returns the edited message id.
