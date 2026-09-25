@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"sportevents.local/internal/booking"
 	"sportevents.local/internal/chat"
 	"sportevents.local/internal/event"
+	"sportevents.local/internal/schedule"
 )
 
 // These tests exercise the callback dispatcher with in-memory fakes for the
@@ -186,6 +188,42 @@ func (f *fakeBookingStore) ListActiveByUser(_ context.Context, userID int64, fro
 	return f.active, nil
 }
 
+type fakeScheduleStore struct {
+	slots    []schedule.Slot
+	setCalls []schedule.Slot
+	removed  []int
+}
+
+func (f *fakeScheduleStore) List(_ context.Context, chatID int64) ([]schedule.Slot, error) {
+	return f.slots, nil
+}
+
+func (f *fakeScheduleStore) Set(_ context.Context, chatID int64, weekday, minutes int) (schedule.Slot, error) {
+	slot := schedule.Slot{ChatID: chatID, Weekday: weekday, Minutes: minutes}
+	f.setCalls = append(f.setCalls, slot)
+
+	for i := range f.slots {
+		if f.slots[i].Weekday == weekday {
+			f.slots[i] = slot
+			return slot, nil
+		}
+	}
+	f.slots = append(f.slots, slot)
+	sort.Slice(f.slots, func(i, j int) bool { return f.slots[i].Weekday < f.slots[j].Weekday })
+	return slot, nil
+}
+
+func (f *fakeScheduleStore) Delete(_ context.Context, chatID int64, weekday int) (bool, error) {
+	f.removed = append(f.removed, weekday)
+	for i := range f.slots {
+		if f.slots[i].Weekday == weekday {
+			f.slots = append(f.slots[:i], f.slots[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 type fakeAnnounceStore struct {
 	saved []announce.Ref
 	ref   announce.Ref
@@ -250,6 +288,7 @@ type harness struct {
 	events *fakeEventStore
 	books  *fakeBookingStore
 	anns   *fakeAnnounceStore
+	sched  *fakeScheduleStore
 }
 
 // harnessNow is the pinned clock: tests assert on "сегодня/завтра 19:00".
@@ -267,6 +306,7 @@ func newHarness(t *testing.T, chatLinked bool) *harness {
 		events: &fakeEventStore{},
 		books:  &fakeBookingStore{},
 		anns:   &fakeAnnounceStore{},
+		sched:  &fakeScheduleStore{},
 	}
 	if chatLinked {
 		h.chats.chat = &chat.Chat{ID: 1, Title: "Волейбол"}
@@ -283,6 +323,7 @@ func newHarness(t *testing.T, chatLinked bool) *harness {
 		Events:    h.events,
 		Bookings:  h.books,
 		Announces: h.anns,
+		Schedule:  h.sched,
 		Now:       harnessNow,
 	})
 	return h
@@ -984,5 +1025,189 @@ func TestParseCreateGame(t *testing.T) {
 		if got.title != tc.wantTitle {
 			t.Fatalf("%s: title got %q want %q", tc.name, got.title, tc.wantTitle)
 		}
+	}
+}
+
+func TestCallbackSlotAddHintWithoutParameters(t *testing.T) {
+	h := newHarness(t, true)
+
+	payload := CommandPayload(cmdSlotAdd)
+	code, _ := postJSON(t, h.svc.HandleCallback, eventEnvelope(2000000047, 555, 777, payload))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "вс 10:00") {
+		t.Fatalf("hint: %+v", h.msg.sent)
+	}
+	if len(h.sched.setCalls) != 0 {
+		t.Fatal("the hint button must not change the schedule")
+	}
+}
+
+// С расписанием «создать игру» не требует даты: берётся ближайший слот.
+func TestCallbackCreateGameUsesSchedule(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.created) != 1 {
+		t.Fatalf("created: %+v", h.events.created)
+	}
+	// Окно теста — пятница 25.09.2026, ближайшее воскресенье 27.09.
+	want := time.Date(2026, 9, 27, 10, 0, 0, 0, defaultLocation).UTC()
+	if got := h.events.created[0].StartsAt; !got.Equal(want) {
+		t.Fatalf("starts_at: %v want %v", got.In(defaultLocation), want.In(defaultLocation))
+	}
+}
+
+// Админ может назвать день недели словами — расписание при этом не нужно.
+func TestCallbackCreateGameByWeekdayWord(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру в среду 19:00", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.created) != 1 {
+		t.Fatalf("created: %+v", h.events.created)
+	}
+	want := time.Date(2026, 9, 30, 19, 0, 0, 0, defaultLocation).UTC()
+	in := h.events.created[0]
+	if !in.StartsAt.Equal(want) {
+		t.Fatalf("starts_at: %v want %v", in.StartsAt.In(defaultLocation), want.In(defaultLocation))
+	}
+	if in.Title != defaultTitle {
+		t.Fatalf("the weekday word must not leak into the title: %q", in.Title)
+	}
+}
+
+// Одно нажатие «Создать игру» — один анонс: повтор не должен создать вторую
+// игру на то же время.
+func TestCallbackCreateGameSkipsExisting(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{
+			ID:       7,
+			Title:    "Волейбол",
+			StartsAt: time.Date(2026, 9, 27, 10, 0, 0, 0, defaultLocation),
+		},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.created) != 0 {
+		t.Fatal("the same game must not be announced twice")
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже создана") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+// --- Phase 6: расписание (настройки) ---
+
+// eventEnvelope is a message_event — a callback button press. cmid is the id
+// of the message the button was pressed on: that is how the settings screen
+// knows which message to rewrite.
+func eventEnvelope(peerID, userID, cmid int64, payload string) string {
+	return fmt.Sprintf(`{"type":"message_event","group_id":12345,"secret":"sekret","event_id":"e1","object":{`+
+		`"user_id":%d,"peer_id":%d,"event_id":"e1","conversation_message_id":%d,"payload":%q}}`,
+		userID, peerID, cmid, payload)
+}
+
+func TestCallbackSettingsScreenForAdmin(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "настройки", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	got := h.msg.sent[0]
+	if !strings.Contains(got.Text, "Сейчас: вс 10:00") {
+		t.Fatalf("current schedule: %q", got.Text)
+	}
+	if !strings.Contains(got.Text, defaultTitle) {
+		t.Fatalf("game name: %q", got.Text)
+	}
+	btn := firstButton(t, got.Keyboard)
+	if btn.Action.Type != "callback" {
+		t.Fatalf("settings buttons must be callback buttons, got %q", btn.Action.Type)
+	}
+	if cmd, _ := ParsePayload(btn.Action.Payload); cmd != cmdSlotRemove {
+		t.Fatalf("first button: %q", btn.Action.Payload)
+	}
+}
+
+func TestCallbackSettingsDeniedForNonAdmin(t *testing.T) {
+	h := newHarness(t, true)
+	h.chats.isAdmin = false
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "настройки", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "администратор") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+	if len(h.sched.setCalls) != 0 {
+		t.Fatal("a non-admin must not change the schedule")
+	}
+}
+
+func TestCallbackSlotAddByText(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "добавить в воскресенье 10:00", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.sched.setCalls) != 1 {
+		t.Fatalf("set: %+v", h.sched.setCalls)
+	}
+	if slot := h.sched.setCalls[0]; slot.Weekday != 0 || slot.Minutes != 600 {
+		t.Fatalf("slot: %+v", slot)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want the settings screen, got %d", len(h.msg.sent))
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Записано: воскресенье в 10:00") {
+		t.Fatalf("note: %q", h.msg.sent[0].Text)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Сейчас: вс 10:00") {
+		t.Fatalf("screen after change: %q", h.msg.sent[0].Text)
+	}
+}
+
+// A callback press carries the id of its message, so removing a weekday
+// rewrites the settings screen in place instead of posting a new one.
+func TestCallbackSlotRemoveEditsSettingsMessage(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 3, Minutes: 19 * 60}}
+
+	payload := SlotCommandPayload(cmdSlotRemove, 3)
+	code, _ := postJSON(t, h.svc.HandleCallback, eventEnvelope(2000000047, 555, 777, payload))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.sched.removed) != 1 || h.sched.removed[0] != 3 {
+		t.Fatalf("removed: %+v", h.sched.removed)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 777 {
+		t.Fatalf("settings must be rewritten in place: %+v", h.msg.edits)
+	}
+	if !strings.Contains(h.msg.edits[0].Text, "Убрал: среда") {
+		t.Fatalf("note: %q", h.msg.edits[0].Text)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("a callback press must not post a message: %+v", h.msg.sent)
 	}
 }

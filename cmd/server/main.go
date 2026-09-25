@@ -11,6 +11,7 @@ import (
 	"sportevents.local/internal/chat"
 	"sportevents.local/internal/event"
 	"sportevents.local/internal/postgres"
+	"sportevents.local/internal/schedule"
 	"sportevents.local/internal/vk"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -82,6 +83,7 @@ func newVKService(pool *pgxpool.Pool) (*vk.Service, bool) {
 		Events:    event.NewService(pool),
 		Bookings:  booking.NewService(pool),
 		Announces: announce.NewService(pool),
+		Schedule:  schedule.NewService(pool),
 	}), true
 }
 

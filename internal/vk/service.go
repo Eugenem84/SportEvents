@@ -16,6 +16,7 @@ import (
 	"sportevents.local/internal/booking"
 	"sportevents.local/internal/chat"
 	"sportevents.local/internal/event"
+	"sportevents.local/internal/schedule"
 )
 
 // Messenger talks to the VK Bot API. *Client implements it.
@@ -84,6 +85,14 @@ type AnnounceStore interface {
 	Get(ctx context.Context, eventID int64, platform string) (announce.Ref, bool, error)
 }
 
+// ScheduleStore holds the regular game times of a chat. The admin sets them
+// once, and "создать игру" then needs no date at all.
+type ScheduleStore interface {
+	List(ctx context.Context, chatID int64) ([]schedule.Slot, error)
+	Set(ctx context.Context, chatID int64, weekday, minutes int) (schedule.Slot, error)
+	Delete(ctx context.Context, chatID int64, weekday int) (bool, error)
+}
+
 // Config carries the community settings for the callback endpoint.
 type Config struct {
 	// ConfirmationToken is the string VK expects back for a
@@ -111,6 +120,7 @@ type Deps struct {
 	Events    EventStore
 	Bookings  BookingStore
 	Announces AnnounceStore
+	Schedule  ScheduleStore
 	// Now returns the current time. Tests pin it, so "tomorrow 19:00" means
 	// something in assertions.
 	Now func() time.Time
@@ -134,6 +144,7 @@ type Service struct {
 	events    EventStore
 	bookings  BookingStore
 	announces AnnounceStore
+	schedule  ScheduleStore
 	now       func() time.Time
 
 	// dedup remembers recently handled VK event ids, so a retry of the same
@@ -165,6 +176,7 @@ func NewService(cfg Config, deps Deps) *Service {
 		events:            deps.Events,
 		bookings:          deps.Bookings,
 		announces:         deps.Announces,
+		schedule:          deps.Schedule,
 		now:               now,
 		dedup:             newEventDedup(callbackDedupTTL),
 		log:               log.Default(),
@@ -183,6 +195,18 @@ const (
 	cmdBook = "book"
 	// cmdSkip is the "Пропускаю" button: it cancels the user's booking.
 	cmdSkip = "skip"
+	// cmdSettings opens the schedule screen of the chat (admins only).
+	cmdSettings = "settings"
+	// cmdSlotAdd and cmdSlotRemove edit one weekday of that schedule:
+	// cmdSlotAdd without parameters only explains the expected input.
+	cmdSlotAdd    = "slot_add"
+	cmdSlotRemove = "slot_remove"
+)
+
+// settingsRefusal and gamesRefusal answer members who are not chat admins.
+const (
+	settingsRefusal = "Настройки расписания может менять только администратор беседы."
+	gamesRefusal    = "Создавать игры может только администратор беседы."
 )
 
 const (
@@ -216,12 +240,12 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 	if err != nil {
 		return fmt.Errorf("find chat: %w", err)
 	}
-	cmd, eventID := s.parseCommand(msg.Text, msg.Payload)
+	parsed := s.parseCommand(msg.Text, msg.Payload)
 
 	// An unconnected conversation is not a Chat yet: the connection
 	// request is the only command that can act on it.
 	if ch == nil {
-		if cmd == cmdConnect {
+		if parsed.cmd == cmdConnect {
 			return s.handleConnect(ctx, msg)
 		}
 		s.log.Printf("vk: message from unconnected peer %d", msg.PeerID)
@@ -236,21 +260,40 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 		peerID:  msg.PeerID,
 		chat:    *ch,
 		user:    user,
-		cmd:     cmd,
-		eventID: eventID,
+		cmd:     parsed.cmd,
+		eventID: parsed.eventID,
+		weekday: parsed.weekday,
+		minutes: parsed.minutes,
+		hasSlot: parsed.hasSlot,
 		text:    msg.Text,
 	})
 }
 
 // commandCtx is everything one command needs: the external peer, the internal
-// Chat and User it belongs to, and the parsed command with its optional event.
+// Chat and User it belongs to, and the parsed command with its parameters.
 type commandCtx struct {
 	peerID  int64
 	chat    chat.Chat
 	user    chat.User
 	cmd     string
 	eventID int64
+	weekday int
+	minutes int
+	hasSlot bool
 	text    string
+	// messageID is the message this interaction must rewrite: callback
+	// buttons carry the id of the message they were pressed on. Zero means
+	// "post a new message".
+	messageID int64
+}
+
+// parsedCommand is a command with the parameters it came with.
+type parsedCommand struct {
+	cmd     string
+	eventID int64
+	weekday int
+	minutes int
+	hasSlot bool
 }
 
 // handleCommand runs one command. Both message_new (typed text and text
@@ -274,6 +317,12 @@ func (s *Service) handleCommand(ctx context.Context, c commandCtx) error {
 		return s.handleMyBookings(ctx, c)
 	case cmdCancelBooking:
 		return s.handleCancel(ctx, c)
+	case cmdSettings:
+		return s.handleSettings(ctx, c)
+	case cmdSlotAdd:
+		return s.handleSlotAdd(ctx, c)
+	case cmdSlotRemove:
+		return s.handleSlotRemove(ctx, c)
 	default:
 		return s.sendText(ctx, c.peerID, "Не понял команду. Напишите «игры» или /start.", "")
 	}
@@ -304,13 +353,15 @@ func (s *Service) handleMessageEvent(ctx context.Context, ev messageEvent) error
 		return err
 	}
 
-	cmd, eventID := ParsePayload(ev.Payload)
+	parsed := ParseButtonPayload(ev.Payload)
 	return s.handleCommand(ctx, commandCtx{
-		peerID:  ev.PeerID,
-		chat:    *ch,
-		user:    user,
-		cmd:     cmd,
-		eventID: eventID,
+		peerID:    ev.PeerID,
+		chat:      *ch,
+		user:      user,
+		cmd:       parsed.Command,
+		eventID:   parsed.EventID,
+		weekday:   parsed.Weekday,
+		messageID: ev.ConversationMessageID,
 	})
 }
 
@@ -419,20 +470,32 @@ func (s *Service) handleGames(ctx context.Context, c commandCtx) error {
 }
 
 // handleCreateGame creates a game and posts the announcement the whole chat
-// signs up under. Only a chat administrator may do it.
+// signs up under. Only a chat administrator may do it. The date comes from
+// the chat schedule unless the admin typed one.
 func (s *Service) handleCreateGame(ctx context.Context, c commandCtx) error {
-	admin, err := s.chats.IsChatAdmin(ctx, c.chat.ID, c.user.ID)
-	if err != nil {
-		return fmt.Errorf("check chat admin: %w", err)
-	}
-	if !admin {
-		return s.sendText(ctx, c.peerID, "Создавать игры может только администратор беседы.", "")
+	ok, err := s.requireAdmin(ctx, c, gamesRefusal)
+	if err != nil || !ok {
+		return err
 	}
 
 	draft := parseCreateGame(c.text, s.now(), s.loc)
+	startsAt, err := s.gameStart(ctx, c.chat.ID, draft)
+	if err != nil {
+		return err
+	}
+
+	// A scheduled game is created by a single press, so a second press must
+	// not announce the same game twice.
+	if existing, ok, err := s.findGameAt(ctx, c.chat.ID, startsAt); err != nil {
+		return err
+	} else if ok {
+		return s.sendText(ctx, c.peerID, fmt.Sprintf(
+			"Игра на %s уже создана — записывайтесь по анонсу выше.", s.formatWhen(existing.StartsAt)), "")
+	}
+
 	ev, err := s.events.Create(ctx, event.CreateInput{
 		ChatID:   c.chat.ID,
-		StartsAt: draft.startsAt,
+		StartsAt: startsAt,
 		Title:    draft.title,
 		Location: draft.location,
 		Capacity: draft.capacity,
@@ -460,6 +523,48 @@ func (s *Service) handleCreateGame(ctx context.Context, c commandCtx) error {
 		return fmt.Errorf("save announcement: %w", err)
 	}
 	return nil
+}
+
+// gameStart decides when the game starts: an explicit date in the text wins,
+// then an explicit weekday, then the chat schedule, and only then the built-in
+// default (tomorrow 19:00, already in draft.startsAt).
+func (s *Service) gameStart(ctx context.Context, chatID int64, draft gameDraft) (time.Time, error) {
+	if draft.dateSet {
+		return draft.startsAt, nil
+	}
+
+	if draft.weekday >= 0 {
+		local := draft.startsAt.In(s.loc)
+		minutes := local.Hour()*60 + local.Minute()
+		if at, ok := schedule.Next(s.now(), []schedule.Slot{{Weekday: draft.weekday, Minutes: minutes}}, s.loc); ok {
+			return at, nil
+		}
+	}
+
+	if s.schedule != nil {
+		slots, err := s.schedule.List(ctx, chatID)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("list schedule: %w", err)
+		}
+		if at, ok := schedule.Next(s.now(), slots, s.loc); ok {
+			return at, nil
+		}
+	}
+	return draft.startsAt, nil
+}
+
+// findGameAt reports whether the chat already has a game starting at t.
+func (s *Service) findGameAt(ctx context.Context, chatID int64, t time.Time) (event.EventSummary, bool, error) {
+	games, err := s.events.ListUpcomingWithCounts(ctx, chatID, s.now().UTC(), gamesLimit)
+	if err != nil {
+		return event.EventSummary{}, false, fmt.Errorf("list games: %w", err)
+	}
+	for _, g := range games {
+		if g.StartsAt.Equal(t) {
+			return g, true, nil
+		}
+	}
+	return event.EventSummary{}, false, nil
 }
 
 // renderAnnouncement renders a game message: who is in the lineup, who is in
@@ -693,12 +798,19 @@ func (s *Service) refreshAnnouncement(ctx context.Context, chatID, peerID, event
 }
 
 // gameDraft is what "создать игру" produces: tomorrow at 19:00, 12 мест,
-// «Волейбол» — adjusted by whatever the administrator typed.
+// «Волейбол» — adjusted by whatever the administrator typed. dateSet, timeSet
+// and weekday say what was actually typed, so the caller can fall back to the
+// chat schedule for the rest.
 type gameDraft struct {
 	startsAt time.Time
 	title    string
 	location string
 	capacity int
+
+	dateSet bool
+	timeSet bool
+	// weekday is the weekday named in the text, or -1 when there is none.
+	weekday int
 }
 
 var (
@@ -723,15 +835,24 @@ var commandWords = []string{
 // The bare number rule means a title with a number in it ("зал 3") is read as
 // the capacity: the documented way to pass it is "… 12 мест".
 func parseCreateGame(text string, now time.Time, loc *time.Location) gameDraft {
-	draft := gameDraft{title: defaultTitle, capacity: defaultCapacity}
+	draft := gameDraft{title: defaultTitle, capacity: defaultCapacity, weekday: -1}
 
 	rest := strings.ToLower(text)
 	day := now.In(loc).AddDate(0, 0, 1)
 	hour, minute := defaultHour, 0
 
+	// День недели словами («создать игру в среду 19:00»): дату посчитает
+	// gameStart, здесь он только снимается с текста, чтобы не попасть в
+	// название игры.
+	if weekday, word, ok := firstWeekdayWord(rest); ok {
+		draft.weekday = weekday
+		rest = strings.Replace(rest, word, " ", 1)
+	}
+
 	if m := timeRE.FindStringSubmatch(rest); m != nil {
 		hour, _ = strconv.Atoi(m[1])
 		minute, _ = strconv.Atoi(m[2])
+		draft.timeSet = true
 		rest = strings.Replace(rest, m[0], " ", 1)
 	}
 	if m := dateRE.FindStringSubmatch(rest); m != nil {
@@ -743,6 +864,7 @@ func parseCreateGame(text string, now time.Time, loc *time.Location) gameDraft {
 		}
 		if dayNum >= 1 && dayNum <= 31 && month >= 1 && month <= 12 {
 			day = time.Date(year, time.Month(month), dayNum, 0, 0, 0, 0, loc)
+			draft.dateSet = true
 		}
 		rest = strings.Replace(rest, m[0], " ", 1)
 	}
@@ -760,6 +882,18 @@ func parseCreateGame(text string, now time.Time, loc *time.Location) gameDraft {
 	return draft
 }
 
+// firstWeekdayWord finds a weekday named in the text and returns it together
+// with the word itself, so the caller can take that word out of the title:
+// «создать игру в среду 19:00» is not a game called «в среду».
+func firstWeekdayWord(text string) (weekday int, word string, ok bool) {
+	for _, field := range strings.Fields(text) {
+		if day, isDay := schedule.ParseWeekday(field); isDay {
+			return day, field, true
+		}
+	}
+	return 0, "", false
+}
+
 // titleOf keeps the words a human typed as the game name and drops the
 // command words around them.
 func titleOf(rest string) string {
@@ -772,6 +906,125 @@ func titleOf(rest string) string {
 		kept = append(kept, f)
 	}
 	return strings.Join(kept, " ")
+}
+
+// handleSettings shows the schedule screen of the chat.
+func (s *Service) handleSettings(ctx context.Context, c commandCtx) error {
+	ok, err := s.requireAdmin(ctx, c, settingsRefusal)
+	if err != nil || !ok {
+		return err
+	}
+	text, kb, err := s.renderSettings(ctx, c.chat)
+	if err != nil {
+		return err
+	}
+	return s.sendText(ctx, c.peerID, text, kb)
+}
+
+// handleSlotAdd records one weekday of the schedule. The weekday and the time
+// come either from a typed message («вс 10:00») or from the settings buttons;
+// without them the bot explains the expected format.
+func (s *Service) handleSlotAdd(ctx context.Context, c commandCtx) error {
+	ok, err := s.requireAdmin(ctx, c, settingsRefusal)
+	if err != nil || !ok {
+		return err
+	}
+	if !c.hasSlot {
+		return s.sendText(ctx, c.peerID, "Пришлите день и время, например: «вс 10:00».", "")
+	}
+
+	slot, err := s.schedule.Set(ctx, c.chat.ID, c.weekday, c.minutes)
+	if err != nil {
+		return fmt.Errorf("set schedule slot: %w", err)
+	}
+	return s.refreshSettings(ctx, c,
+		fmt.Sprintf("Записано: %s в %s", schedule.LongWeekday(slot.Weekday), slot.At()))
+}
+
+// handleSlotRemove drops a weekday from the schedule.
+func (s *Service) handleSlotRemove(ctx context.Context, c commandCtx) error {
+	ok, err := s.requireAdmin(ctx, c, settingsRefusal)
+	if err != nil || !ok {
+		return err
+	}
+
+	removed, err := s.schedule.Delete(ctx, c.chat.ID, c.weekday)
+	if err != nil {
+		return fmt.Errorf("delete schedule slot: %w", err)
+	}
+	note := fmt.Sprintf("Убрал: %s", schedule.LongWeekday(c.weekday))
+	if !removed {
+		note = fmt.Sprintf("%s в расписании и не было", schedule.LongWeekday(c.weekday))
+	}
+	return s.refreshSettings(ctx, c, note)
+}
+
+// requireAdmin sends the refusal to the chat and reports whether the caller
+// may act. Rights are read from chat_admins; the VK API is asked only at
+// connect time.
+func (s *Service) requireAdmin(ctx context.Context, c commandCtx, refusal string) (bool, error) {
+	admin, err := s.chats.IsChatAdmin(ctx, c.chat.ID, c.user.ID)
+	if err != nil {
+		return false, fmt.Errorf("check chat admin: %w", err)
+	}
+	if admin {
+		return true, nil
+	}
+	if err := s.sendText(ctx, c.peerID, refusal, ""); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// refreshSettings rewrites the settings screen after a change: the very
+// message the callback button was pressed on when VK told us its id, and a new
+// message otherwise (a typed command has no message to rewrite).
+func (s *Service) refreshSettings(ctx context.Context, c commandCtx, note string) error {
+	text, kb, err := s.renderSettings(ctx, c.chat)
+	if err != nil {
+		return err
+	}
+	text = note + "\n\n" + text
+
+	if c.messageID != 0 {
+		if _, err := s.messenger.EditMessage(ctx, c.peerID, c.messageID, text, kb); err != nil {
+			return fmt.Errorf("edit settings: %w", err)
+		}
+		return nil
+	}
+	return s.sendText(ctx, c.peerID, text, kb)
+}
+
+// renderSettings renders the schedule screen: what is set now, one button per
+// configured weekday to drop it, and a hint about the input format.
+func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, string, error) {
+	slots, err := s.schedule.List(ctx, ch.ID)
+	if err != nil {
+		return "", "", fmt.Errorf("list schedule: %w", err)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Расписание игр чата «%s»\n", ch.Title)
+	fmt.Fprintf(&b, "Игра: %s, %d мест\n\n", defaultTitle, defaultCapacity)
+	fmt.Fprintf(&b, "Сейчас: %s\n\n", schedule.Describe(slots))
+	b.WriteString("Время указывается в поясе чата. Чтобы добавить или изменить день, пришлите сообщение вида «вс 10:00».")
+
+	rows := make([][]Button, 0, len(slots)+1)
+	for _, slot := range slots {
+		label := fmt.Sprintf("%s %s ✕", schedule.LongWeekday(slot.Weekday), slot.At())
+		rows = append(rows, []Button{
+			CallbackButton(label, SlotCommandPayload(cmdSlotRemove, slot.Weekday), ColorNegative),
+		})
+	}
+	rows = append(rows, []Button{
+		CallbackButton("Добавить день и время", CommandPayload(cmdSlotAdd), ColorSecondary),
+	})
+
+	kb, err := Keyboard{Inline: true, Buttons: rows}.Marshal()
+	if err != nil {
+		return "", "", err
+	}
+	return b.String(), kb, nil
 }
 
 func (s *Service) sendText(ctx context.Context, peerID int64, text, keyboard string) error {
@@ -792,13 +1045,14 @@ func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, ch
 			"• «игры» — ближайшие игры и запись\n"+
 			"• «мои записи» — ваши записи\n"+
 			"• «отмена» — отменить свою запись\n"+
-			"• «создать игру 27.09 19:00 12» — новая игра и анонс в беседу (только администратор)",
+			"• «создать игру» — новая игра и анонс в беседу (дата берётся из расписания)\n"+
+			"• «настройки» — расписание игр: дни недели и время (только администратор)",
 		displayName, chatTitle)
 	return s.sendText(ctx, peerID, text, kb)
 }
 
-// defaultKeyboard is the always-available set of buttons. "Создать игру" is
-// offered to everyone: a member who is not an administrator gets a clear
+// defaultKeyboard is the always-available set of buttons. Admin-only actions
+// are offered to everyone: a member who is not an administrator gets a clear
 // refusal instead of a hidden feature.
 func defaultKeyboard() (string, error) {
 	kb := Keyboard{
@@ -810,44 +1064,104 @@ func defaultKeyboard() (string, error) {
 			},
 			{
 				TextButton("Создать игру", CommandPayload(cmdCreateGame), ColorPositive),
+				TextButton("Настройки", CommandPayload(cmdSettings), ColorSecondary),
 			},
 		},
 	}
 	return kb.Marshal()
 }
 
-// parseCommand maps a message text and/or a button payload to a command and
-// an optional event id. A payload always wins: it carries the button's intent
-// together with the game it belongs to, while the text is only what the user
-// happened to type. Text checks run from the most specific phrase down, so
-// «создать игру» is not mistaken for «игры» and «мои записи» is not mistaken
-// for «записаться».
-func (s *Service) parseCommand(text, payload string) (string, int64) {
-	if cmd, eventID := ParsePayload(payload); cmd != "" {
-		return cmd, eventID
+// parseCommand maps a message text and/or a button payload to a command with
+// its parameters. A payload always wins: it carries the button's intent
+// together with what it applies to. Text is checked from the most specific
+// phrase down, and a message that is *only* a schedule slot («вс 10:00»,
+// «убрать сб») is recognised last, so «создать игру в среду 19:00» stays a
+// game and not a schedule change.
+func (s *Service) parseCommand(text, payload string) parsedCommand {
+	if p := ParseButtonPayload(payload); p.Command != "" {
+		return parsedCommand{cmd: p.Command, eventID: p.EventID, weekday: p.Weekday}
 	}
+
 	t := strings.ToLower(strings.TrimSpace(text))
 	switch {
 	case t == "/start" || t == "start" || t == "начать":
-		return cmdStart, 0
+		return parsedCommand{cmd: cmdStart}
 	case strings.Contains(t, "подключ"):
-		return cmdConnect, 0
+		return parsedCommand{cmd: cmdConnect}
+	case strings.Contains(t, "настройк") || strings.Contains(t, "расписани"):
+		return parsedCommand{cmd: cmdSettings}
 	case strings.Contains(t, "созда"):
-		return cmdCreateGame, 0
+		return parsedCommand{cmd: cmdCreateGame}
 	case strings.Contains(t, "мои запис"):
-		return cmdMyBookings, 0
+		return parsedCommand{cmd: cmdMyBookings}
 	case strings.Contains(t, "пропуск"):
-		return cmdSkip, 0
+		return parsedCommand{cmd: cmdSkip}
 	case strings.Contains(t, "отмен") || strings.Contains(t, "отпис"):
-		return cmdCancelBooking, 0
+		return parsedCommand{cmd: cmdCancelBooking}
 	case strings.Contains(t, "резерв"):
-		return cmdBook, 0
+		return parsedCommand{cmd: cmdBook}
 	case strings.Contains(t, "записат") || strings.Contains(t, "запиши"):
-		return cmdBook, 0
+		return parsedCommand{cmd: cmdBook}
 	case strings.Contains(t, "игр"):
-		return cmdGames, 0
+		return parsedCommand{cmd: cmdGames}
 	}
-	return "", 0
+
+	if slot, ok := parseSlotMessage(t); ok {
+		return slot
+	}
+	return parsedCommand{}
+}
+
+// slotFillers are the words a schedule message may contain besides the
+// weekday and the time: «добавить в среду 19:00», «убрать сб».
+var slotFillers = map[string]bool{
+	"добавить": true, "добавь": true, "поставить": true, "поставь": true,
+	"убрать": true, "убери": true, "удалить": true, "удали": true,
+	"снять": true, "сними": true, "задай": true,
+	"в": true, "на": true, "по": true, "время": true,
+	"игру": true, "игра": true, "игры": true, "расписание": true, "расписания": true,
+}
+
+// parseSlotMessage reads a message that talks about the schedule only:
+// «вс 10:00» adds a weekday, «убрать сб» removes one. Anything else (an
+// unknown word) is left to the other commands.
+func parseSlotMessage(text string) (parsedCommand, bool) {
+	weekday, minutes := 0, 0
+	hasWeekday, hasTime, remove := false, false, false
+
+	for _, word := range strings.Fields(text) {
+		word = strings.Trim(word, ".,")
+		switch {
+		case word == "" || slotFillers[word]:
+			continue
+		case weekdayWordsForRemove[word]:
+			remove = true
+			continue
+		}
+		if day, ok := schedule.ParseWeekday(word); ok {
+			weekday, hasWeekday = day, true
+			continue
+		}
+		if at, ok := schedule.ParseTime(word); ok {
+			minutes, hasTime = at, true
+			continue
+		}
+		return parsedCommand{}, false
+	}
+
+	switch {
+	case hasWeekday && hasTime:
+		return parsedCommand{cmd: cmdSlotAdd, weekday: weekday, minutes: minutes, hasSlot: true}, true
+	case hasWeekday && remove:
+		return parsedCommand{cmd: cmdSlotRemove, weekday: weekday}, true
+	}
+	return parsedCommand{}, false
+}
+
+// weekdayWordsForRemove are the verbs that turn a slot message into a
+// removal.
+var weekdayWordsForRemove = map[string]bool{
+	"убрать": true, "убери": true, "удалить": true, "удали": true, "снять": true, "сними": true,
 }
 
 const (
