@@ -489,3 +489,140 @@ func mustBookUser(t *testing.T, svc *booking.Service, ctx context.Context, event
 	}
 	return b
 }
+
+// --- Номера мест ---
+
+func TestCreateAssignsLowestFreeSeat(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	eventID := insertEvent(t, ctx, pool, chatID, 3)
+	admin := insertUser(t, ctx, pool, "Admin")
+
+	for i, want := range []int{1, 2, 3} {
+		b := mustCreate(t, svc, ctx, eventID, admin, fmt.Sprintf("Гость %d", i))
+		if b.SeatNo == nil || *b.SeatNo != want {
+			t.Fatalf("booking %d: seat %v, want %d", i, b.SeatNo, want)
+		}
+	}
+
+	extra := mustCreate(t, svc, ctx, eventID, admin, "Гость 4")
+	if extra.Status != booking.StatusWaitlist {
+		t.Fatalf("status: %v", extra.Status)
+	}
+	if extra.SeatNo != nil {
+		t.Fatalf("a booking in reserve must have no seat, got %v", *extra.SeatNo)
+	}
+}
+
+// Освободившееся место не сдвигает нумерацию: следующий записавшийся занимает
+// именно освободившийся номер.
+func TestFreedSeatIsReusedByNextBooking(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	eventID := insertEvent(t, ctx, pool, chatID, 3)
+	admin := insertUser(t, ctx, pool, "Admin")
+
+	_ = mustCreate(t, svc, ctx, eventID, admin, "Первый")       // место 1
+	second := mustCreate(t, svc, ctx, eventID, admin, "Второй") // место 2
+	third := mustCreate(t, svc, ctx, eventID, admin, "Третий")  // место 3
+	if third.SeatNo == nil || *third.SeatNo != 3 {
+		t.Fatalf("third seat: %v", third.SeatNo)
+	}
+
+	if _, err := svc.Cancel(ctx, eventID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	next := mustCreate(t, svc, ctx, eventID, admin, "Четвёртый")
+	if next.SeatNo == nil || *next.SeatNo != 2 {
+		t.Fatalf("the freed seat 2 must be reused, got %v", next.SeatNo)
+	}
+}
+
+// Поднявшийся из резерва занимает именно освободившееся место.
+func TestPromotionTakesFreedSeat(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	eventID := insertEvent(t, ctx, pool, chatID, 2)
+	admin := insertUser(t, ctx, pool, "Admin")
+
+	first := mustCreate(t, svc, ctx, eventID, admin, "Первый") // место 1
+	_ = mustCreate(t, svc, ctx, eventID, admin, "Второй")      // место 2
+	queued := mustCreate(t, svc, ctx, eventID, admin, "Резерв")
+
+	res, err := svc.Cancel(ctx, eventID, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Promoted == nil {
+		t.Fatal("want a promotion")
+	}
+	if res.Promoted.ID != queued.ID {
+		t.Fatalf("promoted: want %d, got %d", queued.ID, res.Promoted.ID)
+	}
+	if res.Promoted.SeatNo == nil || *res.Promoted.SeatNo != 1 {
+		t.Fatalf("promoted seat: want 1, got %v", res.Promoted.SeatNo)
+	}
+
+	stored, err := svc.Get(ctx, eventID, queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != booking.StatusConfirmed || stored.SeatNo == nil || *stored.SeatNo != 1 {
+		t.Fatalf("stored booking: %+v", stored)
+	}
+}
+
+// Одно место — один человек, и номер у резерва никогда не появляется: проверяем
+// на параллельной записи, где гонки реальны.
+func TestConcurrentBookingsHaveUniqueSeats(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	eventID := insertEvent(t, ctx, pool, chatID, 4)
+	admin := insertUser(t, ctx, pool, "Admin")
+	const total = 8
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seats := map[int]bool{}
+	confirmed := 0
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			b, err := svc.Create(ctx, booking.CreateInput{
+				EventID:        eventID,
+				PlayerName:     fmt.Sprintf("Игрок %d", i),
+				BookedByUserID: admin,
+			})
+			if err != nil {
+				t.Errorf("create %d: %v", i, err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case b.Status == booking.StatusConfirmed && b.SeatNo == nil:
+				t.Errorf("confirmed booking without a seat: %+v", b)
+			case b.Status == booking.StatusWaitlist && b.SeatNo != nil:
+				t.Errorf("reserve booking must have no seat: %+v", b)
+			case b.Status == booking.StatusConfirmed:
+				confirmed++
+				if seats[*b.SeatNo] {
+					t.Errorf("seat %d taken twice", *b.SeatNo)
+				}
+				seats[*b.SeatNo] = true
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if confirmed != 4 {
+		t.Fatalf("confirmed: want 4, got %d", confirmed)
+	}
+	for seat := 1; seat <= 4; seat++ {
+		if !seats[seat] {
+			t.Fatalf("seat %d must be taken, got %v", seat, seats)
+		}
+	}
+}

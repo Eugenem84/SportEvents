@@ -25,7 +25,10 @@ const (
 )
 
 // Booking is a single person's participation record for an Event.
-// UserID is nil for a guest without a messenger identity.
+// UserID is nil for a guest without a messenger identity. SeatNo is the seat
+// in the lineup: it is assigned when the booking is confirmed, freed on
+// cancellation and taken by the next confirmed booking, so the numbering in
+// the announcement never shifts.
 type Booking struct {
 	ID             int64
 	EventID        int64
@@ -33,6 +36,7 @@ type Booking struct {
 	Phone          *string
 	UserID         *int64
 	BookedByUserID int64
+	SeatNo         *int
 	Status         Status
 	CreatedAt      time.Time
 }

@@ -96,21 +96,36 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Booking, error) {
 		status = StatusWaitlist
 	}
 
+	// Подтверждённая запись получает наименьший свободный номер места. Строку
+	// события мы уже держим под FOR UPDATE, поэтому номер не отберут параллельно.
+	var seat *int
+	if status == StatusConfirmed {
+		seat, err = freeSeat(ctx, tx, in.EventID, capacity)
+		if err != nil {
+			return Booking{}, err
+		}
+		if seat == nil {
+			// Мест нет, хотя confirmed < capacity: данные разошлись. Отправляем
+			// в резерв, а не создаём вторую запись на то же место.
+			status = StatusWaitlist
+		}
+	}
+
 	var phone *string
 	if in.Phone != "" {
 		phone = &in.Phone
 	}
 
 	const q = `
-		INSERT INTO bookings (event_id, player_name, phone, user_id, booked_by_user_id, status)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at`
+		INSERT INTO bookings (event_id, player_name, phone, user_id, booked_by_user_id, seat_no, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, event_id, player_name, phone, user_id, booked_by_user_id, seat_no, status, created_at`
 
 	var b Booking
 	var statusStr string
 	err = tx.QueryRow(ctx, q,
-		in.EventID, in.PlayerName, phone, in.UserID, in.BookedByUserID, string(status),
-	).Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID, &statusStr, &b.CreatedAt)
+		in.EventID, in.PlayerName, phone, in.UserID, in.BookedByUserID, seat, string(status),
+	).Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID, &b.SeatNo, &statusStr, &b.CreatedAt)
 	if isUniqueViolation(err) {
 		return Booking{}, ErrAlreadyBooked
 	}
@@ -145,8 +160,8 @@ func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelR
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var lockedEventID int64
-	err = tx.QueryRow(ctx, `SELECT id FROM events WHERE id = $1 FOR UPDATE`, eventID).Scan(&lockedEventID)
+	var capacity int
+	err = tx.QueryRow(ctx, `SELECT capacity FROM events WHERE id = $1 FOR UPDATE`, eventID).Scan(&capacity)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CancelResult{}, ErrEventNotFound
 	}
@@ -155,7 +170,7 @@ func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelR
 	}
 
 	target, err := scanBooking(tx.QueryRow(ctx, `
-		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, seat_no, status, created_at
 		FROM bookings
 		WHERE id = $1 AND event_id = $2
 		FOR UPDATE`,
@@ -183,7 +198,7 @@ func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelR
 
 	if wasConfirmed {
 		promoted, err := scanBooking(tx.QueryRow(ctx, `
-			SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+			SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, seat_no, status, created_at
 			FROM bookings
 			WHERE event_id = $1 AND status = 'waitlist'
 			ORDER BY created_at ASC, id ASC
@@ -195,11 +210,25 @@ func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelR
 			return CancelResult{}, fmt.Errorf("find waitlist: %w", err)
 		}
 		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE bookings SET status = 'confirmed' WHERE id = $1`, promoted.ID)
+			// Освободившееся место отдаём именно с этим номером, чтобы нумерация
+			// в анонсе не сдвигалась. Если у отменённой записи номера не было
+			// (данные до миграции), берём наименьший свободный.
+			seat := target.SeatNo
+			if seat == nil {
+				seat, err = freeSeat(ctx, tx, eventID, capacity)
+				if err != nil {
+					return CancelResult{}, err
+				}
+			}
+			_, err = tx.Exec(ctx,
+				`UPDATE bookings SET status = 'confirmed', seat_no = $2 WHERE id = $1`,
+				promoted.ID, seat,
+			)
 			if err != nil {
 				return CancelResult{}, fmt.Errorf("promote booking: %w", err)
 			}
 			promoted.Status = StatusConfirmed
+			promoted.SeatNo = seat
 			result.Promoted = &promoted
 		}
 	}
@@ -220,7 +249,7 @@ func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelR
 // service scopes an event to a chat.
 func (s *Service) Get(ctx context.Context, eventID, bookingID int64) (Booking, error) {
 	b, err := scanBooking(s.pool.QueryRow(ctx, `
-		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, seat_no, status, created_at
 		FROM bookings
 		WHERE id = $1 AND event_id = $2`,
 		bookingID, eventID,
@@ -239,7 +268,7 @@ func (s *Service) Get(ctx context.Context, eventID, bookingID int64) (Booking, e
 // also the FIFO order used for the waitlist.
 func (s *Service) ListByEvent(ctx context.Context, eventID int64, statuses ...Status) ([]Booking, error) {
 	q := `
-		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, status, created_at
+		SELECT id, event_id, player_name, phone, user_id, booked_by_user_id, seat_no, status, created_at
 		FROM bookings
 		WHERE event_id = $1`
 	args := []any{eventID}
@@ -283,7 +312,7 @@ func (s *Service) ListByEvent(ctx context.Context, eventID int64, statuses ...St
 func (s *Service) ListActiveByUser(ctx context.Context, userID int64, from time.Time) ([]BookingWithEvent, error) {
 	const q = `
 		SELECT b.id, b.event_id, b.player_name, b.phone, b.user_id, b.booked_by_user_id,
-		       b.status, b.created_at,
+		       b.seat_no, b.status, b.created_at,
 		       e.title, e.starts_at, e.location, e.capacity
 		FROM bookings b
 		JOIN events e ON e.id = b.event_id
@@ -304,7 +333,7 @@ func (s *Service) ListActiveByUser(ctx context.Context, userID int64, from time.
 		var statusStr string
 		if err := rows.Scan(
 			&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID,
-			&statusStr, &b.CreatedAt,
+			&b.SeatNo, &statusStr, &b.CreatedAt,
 			&b.EventTitle, &b.EventStartsAt, &b.EventLocation, &b.EventCapacity,
 		); err != nil {
 			return nil, fmt.Errorf("scan user booking: %w", err)
@@ -328,12 +357,39 @@ type rowScanner interface {
 func scanBooking(row rowScanner) (Booking, error) {
 	var b Booking
 	var statusStr string
-	err := row.Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID, &statusStr, &b.CreatedAt)
+	err := row.Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID,
+		&b.SeatNo, &statusStr, &b.CreatedAt)
 	if err != nil {
 		return Booking{}, err
 	}
 	b.Status = Status(statusStr)
 	return b, nil
+}
+
+// freeSeat returns the lowest free seat of an event, or nil when every seat is
+// taken. The caller holds the event row lock, so nothing can take the number
+// in between.
+func freeSeat(ctx context.Context, tx pgx.Tx, eventID int64, capacity int) (*int, error) {
+	var seat int
+	err := tx.QueryRow(ctx, `
+		SELECT seat
+		FROM generate_series(1, $2::int) AS seat
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM bookings b
+			WHERE b.event_id = $1 AND b.status = 'confirmed' AND b.seat_no = seat
+		)
+		ORDER BY seat
+		LIMIT 1`,
+		eventID, capacity,
+	).Scan(&seat)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("free seat: %w", err)
+	}
+	return &seat, nil
 }
 
 func validateCreate(in CreateInput) error {
