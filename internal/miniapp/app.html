@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<!--
+  Приложение SportEvents (маршрут GET <Base>/): то, что человек видит, открыв
+  мини-приложение из беседы. Показывает игры беседы, состав с местами и
+  аватарками, и даёт записаться или отписаться.
+
+  Страница ничего не знает сама: она спрашивает состояние у <Base>/api/state и
+  перерисовывается после каждого действия. Подпись параметров запуска проверяет
+  сервер (см. internal/miniapp), клиент лишь передаёт их в запросе.
+
+  Диагностическая страница с логами переехала на <Base>/debug/.
+
+  VK Bridge подключён локально, без CDN: static/vk-bridge.min.js —
+  @vkontakte/vk-bridge 2.15.0, MIT,
+  https://unpkg.com/@vkontakte/vk-bridge@2.15.0/dist/browser.min.js
+  sha256 0cdf89612cf18f12d5f39be5e5ea0aad6d1760ddb3964f31effb251d679d8178
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>SportEvents — игры чата</title>
+<style>
+:root {
+  --bg: #19191a; --card: #232324; --card-2: #2c2d2e; --text: #e1e3e6;
+  --muted: #818c99; --accent: #3f8ae0; --ok: #4bb34b; --bad: #e64646; --warn: #e8a02c;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 0 12px calc(24px + env(safe-area-inset-bottom));
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text); -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+a { color: var(--accent); text-decoration: none; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+
+/* шапка: кто я и в какой беседе */
+.top {
+  position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px;
+  padding: calc(10px + env(safe-area-inset-top)) 0 10px; background: var(--bg);
+}
+.top-text { flex: 1; min-width: 0; }
+.top-text .who-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.icon {
+  border: 0; background: var(--card-2); color: var(--muted); width: 34px; height: 34px;
+  border-radius: 50%; font-size: 17px; line-height: 1; cursor: pointer; flex: 0 0 auto;
+}
+.icon:active { background: var(--card); }
+
+/* карточки */
+.card { background: var(--card); border-radius: 14px; padding: 12px; margin-bottom: 10px; }
+.card h2 { font-size: 16px; margin: 0; font-weight: 600; }
+.card.notice { color: var(--muted); }
+.card.warn { color: var(--warn); }
+.g-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.g-when { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); margin: 14px 0 4px;
+}
+.pill {
+  font-size: 12px; padding: 3px 8px; border-radius: 999px;
+  background: var(--card-2); color: var(--muted); white-space: nowrap;
+}
+.pill.ok { color: var(--ok); }
+.pill.warn { color: var(--warn); }
+.bar { height: 4px; border-radius: 2px; background: var(--card-2); overflow: hidden; margin: 12px 0 2px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.bar.full > i { background: var(--warn); }
+
+/* состав: номер, аватарка, имя */
+.roster { margin-top: 4px; }
+.who { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+.seat {
+  flex: 0 0 auto; min-width: 24px; height: 24px; border-radius: 8px; background: var(--card-2);
+  color: var(--muted); display: grid; place-items: center; font-size: 12px; font-weight: 600;
+}
+.who.me .seat { background: var(--accent); color: #fff; }
+.who.me .nm { font-weight: 600; }
+.nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.av {
+  flex: 0 0 34px; width: 34px; height: 34px; border-radius: 50%; overflow: hidden;
+  display: grid; place-items: center; font-size: 13px; font-weight: 600; color: #fff;
+  background: var(--card-2);
+}
+.av img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* действия */
+.status-chip { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-size: 13.5px; }
+.actions { display: flex; gap: 8px; margin-top: 10px; }
+.btn {
+  flex: 1; border: 0; border-radius: 10px; padding: 11px 14px; font: inherit; font-weight: 600;
+  color: #fff; background: var(--accent); cursor: pointer;
+}
+.btn:active { opacity: .85; }
+.btn[disabled] { opacity: .5; }
+.btn.bad { background: transparent; color: var(--bad); box-shadow: inset 0 0 0 1.5px var(--bad); }
+
+/* подвал */
+.foot { display: flex; justify-content: space-between; gap: 8px; padding: 4px 2px 0; }
+
+/* заглушки на время загрузки */
+.sk { border-radius: 6px; background: var(--card-2); height: 14px; margin: 8px 0; }
+.sk.sk-1 { width: 55%; }
+.sk.sk-2 { width: 85%; }
+
+/* всплывашка про результат действия */
+.toast {
+  position: fixed; left: 12px; right: 12px; bottom: calc(16px + env(safe-area-inset-bottom));
+  background: var(--card-2); color: var(--text); padding: 12px 14px; border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .35); transform: translateY(160%);
+  transition: transform .22s ease; z-index: 10; font-size: 14px;
+}
+.toast.show { transform: translateY(0); }
+</style>
+</head>
+<body>
+<div class="top">
+  <span class="av" id="meAvatar">·</span>
+  <div class="top-text">
+    <div class="who-name" id="meName">SportEvents</div>
+    <div class="muted small" id="chatTitle">мини-приложение</div>
+  </div>
+  <button class="icon" id="refresh" type="button" aria-label="Обновить">⟳</button>
+</div>
+
+<main id="screen">
+  <div class="card"><div class="sk sk-1"></div><div class="sk sk-2"></div></div>
+  <div class="card"><div class="sk sk-1"></div><div class="sk sk-2"></div></div>
+</main>
+
+<footer class="foot">
+  <span class="muted small">SportEvents · игры чата</span>
+  <a class="muted small" href="{{.Base}}/debug/">диагностика запуска</a>
+</footer>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script src="{{.Base}}/static/vk-bridge.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // База монтирования: страница лежит в <Base>/, оттуда же и API.
+  var BASE = location.pathname.replace(/\/(index\.html)?$/, '');
+  var TOAST_MS = 3500;
+
+  var screen = document.getElementById('screen');
+  var toastBox = document.getElementById('toast');
+  var toastTimer = 0;
+  var busy = false;
+
+  // api зовёт наш же сервер и пересылает ему параметры запуска: подпись (sign)
+  // проверяет сервер, страница её не трогает.
+  function api(path, options) {
+    return fetch(BASE + '/api/' + path + location.search, options).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        if (!res.ok) {
+          throw new Error(body && body.error ? body.error : 'Ошибка ' + res.status);
+        }
+        return body;
+      });
+    });
+  }
+
+  function load() {
+    return api('state').then(render, function (err) { renderError(err); });
+  }
+
+  function action(path, eventID, btn) {
+    if (busy) { return; }
+    busy = true;
+    btn.disabled = true;
+    api(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event_id: eventID })
+    }).then(function (out) {
+      toast(resultText(path, out));
+      return load();
+    }).catch(function (err) {
+      toast((err && err.message) || 'Не получилось');
+    }).then(function () {
+      busy = false;
+      btn.disabled = false;
+    });
+  }
+
+  function resultText(path, out) {
+    if (path === 'skip') {
+      return out.promoted ? 'Вы отписались · в состав вошёл ' + out.promoted : 'Вы отписались';
+    }
+    if (out.status === 'waitlist') {
+      return out.place ? 'Вы в резерве (' + out.place + '-й)' : 'Вы в резерве';
+    }
+    return out.seat_no ? 'Вы записаны: место ' + out.seat_no : 'Вы записаны';
+  }
+
+  function toast(text) {
+    toastBox.textContent = text;
+    toastBox.classList.add('show');
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(function () { toastBox.classList.remove('show'); }, TOAST_MS);
+  }
+
+  function render(s) {
+    document.getElementById('chatTitle').textContent = s.chat ? s.chat.title : 'мини-приложение';
+    if (s.me && s.me.name) {
+      document.getElementById('meName').textContent = s.me.name;
+    }
+
+    screen.innerHTML = '';
+    if (s.notice) {
+      screen.appendChild(card('notice', s.notice));
+    }
+    if (s.sign_checked === false) {
+      screen.appendChild(card('warn', 'Подпись параметров запуска не проверяется: на сервере не задан защищённый ключ приложения (VK_APP_SECRET). Для разработки это допустимо, для боевого контура — нет.'));
+    }
+    var games = s.games || [];
+    if (!games.length) {
+      if (!s.notice) {
+        screen.appendChild(card('notice', 'Открытых игр пока нет. Как только администратор объявит игру, она появится здесь.'));
+      }
+      return;
+    }
+    games.forEach(function (g) { screen.appendChild(gameCard(g)); });
+  }
+
+  function renderError(err) {
+    screen.innerHTML = '';
+    var box = card('notice', (err && err.message) || 'Не удалось загрузить');
+    var row = document.createElement('div');
+    row.className = 'actions';
+    var again = button('Повторить', '', function () {
+      again.disabled = true;
+      load();
+    });
+    row.appendChild(again);
+    box.appendChild(row);
+    screen.appendChild(box);
+  }
+
+  function card(kind, text) {
+    var box = document.createElement('section');
+    box.className = 'card' + (kind ? ' ' + kind : '');
+    box.textContent = text;
+    return box;
+  }
+
+  function label(text) {
+    var box = document.createElement('div');
+    box.className = 'label';
+    box.textContent = text;
+    return box;
+  }
+
+  function button(labelText, kind, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn' + (kind ? ' ' + kind : '');
+    b.textContent = labelText;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  // gameCard — одна игра: когда, сколько мест, кто записан и что делать.
+  // Своих кнопок у анонса в чате нет, а здесь есть: запись и отписка.
+  function gameCard(g) {
+    var box = document.createElement('section');
+    box.className = 'card';
+
+    var head = document.createElement('div');
+    head.className = 'g-head';
+    var title = document.createElement('h2');
+    title.textContent = g.title;
+    head.appendChild(title);
+    head.appendChild(freePill(g));
+    box.appendChild(head);
+
+    var when = document.createElement('div');
+    when.className = 'g-when';
+    when.textContent = g.when_full + (g.location ? ' · ' + g.location : '');
+    box.appendChild(when);
+
+    var bar = document.createElement('div');
+    bar.className = 'bar' + (g.free === 0 ? ' full' : '');
+    var fill = document.createElement('i');
+    fill.style.width = (g.capacity ? Math.round((g.confirmed / g.capacity) * 100) : 0) + '%';
+    bar.appendChild(fill);
+    box.appendChild(bar);
+
+    var lineup = g.lineup || [];
+    if (lineup.length) {
+      box.appendChild(roster(lineup, false));
+    } else {
+      box.appendChild(card('notice', 'Пока никто не записан'));
+    }
+
+    var reserve = g.reserve || [];
+    if (reserve.length) {
+      box.appendChild(label('Резерв'));
+      box.appendChild(roster(reserve, true));
+    }
+
+    if (g.mine) {
+      var chip = document.createElement('div');
+      chip.className = 'status-chip';
+      chip.textContent = g.mine.status === 'confirmed'
+        ? '✓ Вы записаны, место ' + g.mine.seat
+        : '⌛ Вы в резерве (' + g.mine.place + '-й)';
+      box.appendChild(chip);
+    }
+
+    var btn;
+    if (g.mine) {
+      btn = button('Отписаться', 'bad', function () { action('skip', g.id, btn); });
+    } else {
+      btn = button(g.free > 0 ? 'Записаться' : 'Встать в резерв', '', function () { action('attend', g.id, btn); });
+    }
+    var row = document.createElement('div');
+    row.className = 'actions';
+    row.appendChild(btn);
+    box.appendChild(row);
+    return box;
+  }
+
+  function freePill(g) {
+    var p = document.createElement('span');
+    if (g.free > 0) {
+      p.className = 'pill ok';
+      p.textContent = 'свободно ' + g.free + ' из ' + g.capacity;
+      return p;
+    }
+    p.className = 'pill warn';
+    p.textContent = g.waitlist > 0 ? 'мест нет · резерв ' + g.waitlist : 'мест нет';
+    return p;
+  }
+
+  // roster — состав: номер места, аватарка, имя. Номера те же, что в беседе:
+  // свободный номер не сдвигает остальные.
+  function roster(list, reserve) {
+    var box = document.createElement('div');
+    box.className = 'roster';
+    list.forEach(function (p, i) {
+      var row = document.createElement('div');
+      row.className = 'who' + (p.me ? ' me' : '');
+
+      var seat = document.createElement('span');
+      seat.className = 'seat';
+      seat.textContent = reserve ? i + 1 : (p.seat || '·');
+      row.appendChild(seat);
+      row.appendChild(avatar(p.name, p.photo));
+
+      var nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = p.me ? p.name + ' · вы' : p.name;
+      row.appendChild(nm);
+      box.appendChild(row);
+    });
+    return box;
+  }
+
+  // avatar показывает фотографию, а без неё — инициалы на цвете, посчитанном
+  // от имени: гостю без профиля тоже достаётся «лицо».
+  function avatar(name, photo) {
+    var box = document.createElement('span');
+    box.className = 'av';
+    if (photo) {
+      var img = document.createElement('img');
+      img.src = photo;
+      img.alt = '';
+      img.loading = 'lazy';
+      box.appendChild(img);
+      return box;
+    }
+    box.textContent = initials(name);
+    box.style.background = colorFor(name || '?');
+    return box;
+  }
+
+  function initials(name) {
+    var parts = String(name || '').trim().split(/\s+/);
+    var out = (parts[0] || '?').charAt(0);
+    if (parts[1]) { out += parts[1].charAt(0); }
+    return out.toUpperCase();
+  }
+
+  function colorFor(name) {
+    var hash = 0;
+    for (var i = 0; i < name.length; i++) {
+      hash = (hash * 31 + name.charCodeAt(i)) % 360;
+    }
+    return 'hsl(' + hash + ', 32%, 34%)';
+  }
+
+  // --- ВКонтакте: тема, профиль, возвращение к экрану ---
+
+  // Цвета двух тем ВКонтакте: приложение должно выглядеть как часть клиента,
+  // а не как чужой сайт внутри него.
+  var SCHEMES = {
+    space_gray: { bg: '#19191a', card: '#232324', card2: '#2c2d2e', text: '#e1e3e6', muted: '#818c99' },
+    bright: { bg: '#edeef0', card: '#ffffff', card2: '#f0f1f3', text: '#000000', muted: '#818c99' }
+  };
+
+  // applyTheme берёт цвета из VKWebAppUpdateConfig: сначала схему целиком,
+  // затем отдельные цвета, если VK их прислал.
+  function applyTheme(data) {
+    var root = document.documentElement;
+    var scheme = SCHEMES[data.scheme];
+    if (scheme) {
+      root.style.colorScheme = data.scheme === 'bright' ? 'light' : 'dark';
+      root.style.setProperty('--bg', scheme.bg);
+      root.style.setProperty('--card', scheme.card);
+      root.style.setProperty('--card-2', scheme.card2);
+      root.style.setProperty('--text', scheme.text);
+      root.style.setProperty('--muted', scheme.muted);
+    }
+    if (data.backgroundColor) { root.style.setProperty('--bg', data.backgroundColor); }
+    if (data.textColor) { root.style.setProperty('--text', data.textColor); }
+    if (data.subheadColor) { root.style.setProperty('--muted', data.subheadColor); }
+    if (data.buttonBackgroundColor) { root.style.setProperty('--accent', data.buttonBackgroundColor); }
+  }
+
+  function setMePhoto(url) {
+    var box = document.getElementById('meAvatar');
+    box.textContent = '';
+    box.style.background = 'transparent';
+    var img = document.createElement('img');
+    img.src = url;
+    img.alt = '';
+    box.appendChild(img);
+  }
+
+  // bridge не обязателен: страница работает и вне ВКонтакте (тогда профиль и
+  // тема остаются по умолчанию, а запись всё равно проверяется по sign).
+  function bridge() {
+    var vk = window.vkBridge;
+    if (!vk) { return; }
+
+    try {
+      vk.send('VKWebAppInit', {}).catch(function () {});
+      vk.subscribe(function (event) {
+        var detail = event.detail || {};
+        if (detail.type === 'VKWebAppViewRestore') { load(); }
+        if (detail.type === 'VKWebAppUpdateConfig') { applyTheme(detail.data || {}); }
+      });
+      vk.send('VKWebAppGetUserInfo', {}).then(function (u) {
+        if (!u) { return; }
+        var name = ((u.first_name || '') + ' ' + (u.last_name || '')).trim();
+        if (name) { document.getElementById('meName').textContent = name; }
+        if (u.photo_100) { setMePhoto(u.photo_100); }
+      }).catch(function () {});
+    } catch (e) {
+      // Вне ВКонтакте bridge может бросить синхронно — это не повод гасить экран.
+    }
+  }
+
+  document.getElementById('refresh').addEventListener('click', function () { load(); });
+
+  bridge();
+  load();
+})();
+</script>
+</body>
+</html>

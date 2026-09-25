@@ -230,6 +230,45 @@ func (c *Client) GetUserName(ctx context.Context, userID int64) (string, error) 
 	return name, nil
 }
 
+// UserPhotos returns the photo_100 URL of each VK user id, keyed by id. The
+// roster of the mini app shows avatars next to names; a person without a photo
+// is simply absent from the map, and the app draws initials instead.
+//
+// One users.get call takes up to 1000 ids, which is far more than a lineup of
+// one game, so the callers pass the ids of a single roster.
+func (c *Client) UserPhotos(ctx context.Context, userIDs []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(userIDs))
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	ids := make([]string, 0, len(userIDs))
+	for _, id := range userIDs {
+		ids = append(ids, strconv.FormatInt(id, 10))
+	}
+	params := url.Values{}
+	params.Set("user_ids", strings.Join(ids, ","))
+	params.Set("fields", "photo_100")
+
+	raw, err := c.call(ctx, "users.get", params)
+	if err != nil {
+		return nil, err
+	}
+	var users []struct {
+		ID       int64  `json:"id"`
+		Photo100 string `json:"photo_100"`
+	}
+	if err := json.Unmarshal(raw, &users); err != nil {
+		return nil, fmt.Errorf("parse users.get response: %w", err)
+	}
+	for _, u := range users {
+		if u.Photo100 != "" {
+			out[u.ID] = u.Photo100
+		}
+	}
+	return out, nil
+}
+
 // vkFlag is a VK boolean flag. Depending on the method and API version VK
 // returns these either as JSON booleans (the messages.getConversationMembers
 // example in the docs uses "is_admin": true) or as 0/1 integers, so both

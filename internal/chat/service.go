@@ -102,6 +102,42 @@ func (s *Service) FindOrCreateUserByExternalID(ctx context.Context, platform, ex
 	return u, nil
 }
 
+// IdentitiesByUsers maps internal user ids to their external ids on one
+// platform. The mini app needs VK user ids to load avatars for the lineup:
+// bookings keep the internal user, and only user_identities knows the VK id
+// behind it. Users without an identity on that platform are absent from the
+// map, and the app falls back to initials for them.
+func (s *Service) IdentitiesByUsers(ctx context.Context, platform string, userIDs []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(userIDs))
+	if len(userIDs) == 0 {
+		return out, nil
+	}
+
+	const q = `
+		SELECT user_id, external_user_id
+		FROM user_identities
+		WHERE platform = $1 AND user_id = ANY($2)`
+
+	rows, err := s.pool.Query(ctx, q, platform, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("identities by users: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var userID int64
+		var externalID string
+		if err := rows.Scan(&userID, &externalID); err != nil {
+			return nil, fmt.Errorf("scan identity: %w", err)
+		}
+		out[userID] = externalID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("identities by users: %w", err)
+	}
+	return out, nil
+}
+
 // Connect binds an external conversation to an internal Chat, creating the
 // Chat, its ChatChannel and the first ChatAdmin in one transaction. It is
 // idempotent: connecting an already connected conversation returns the

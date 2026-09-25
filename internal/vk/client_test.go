@@ -533,6 +533,52 @@ func TestOpenAppButtonMarshal(t *testing.T) {
 	}
 }
 
+// Аватарки состава: users.get с полем photo_100. Человек без фотографии в
+// ответе просто отсутствует — приложение нарисует инициалы.
+func TestUserPhotos(t *testing.T) {
+	var sent url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+		}
+		sent = r.Form
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"response":[{"id":42,"photo_100":"https://sun.example/42.jpg"},{"id":43,"photo_100":""}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	photos, err := c.UserPhotos(context.Background(), []int64{42, 43})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sent.Get("user_ids"); got != "42,43" {
+		t.Errorf("user_ids: %q", got)
+	}
+	if got := sent.Get("fields"); got != "photo_100" {
+		t.Errorf("fields: %q", got)
+	}
+	if photos[42] != "https://sun.example/42.jpg" {
+		t.Errorf("photos: %+v", photos)
+	}
+	if _, ok := photos[43]; ok {
+		t.Errorf("a user without a photo must be absent: %+v", photos)
+	}
+}
+
+// Пустой список не стоит похода в VK.
+func TestUserPhotosEmptyList(t *testing.T) {
+	c := NewClient("tok", "123")
+
+	photos, err := c.UserPhotos(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(photos) != 0 {
+		t.Fatalf("photos: %+v", photos)
+	}
+}
+
 func TestKeyboardMarshal(t *testing.T) {
 	kb := Keyboard{
 		Inline: true,

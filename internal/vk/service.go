@@ -1169,6 +1169,92 @@ func (s *Service) cancelLine(ctx context.Context, b booking.BookingWithEvent) (s
 	return fmt.Sprintf("%s - пропускает", b.PlayerName), nil
 }
 
+// BookInChat signs a user up for a game on behalf of the mini app and shows the
+// booking in the chat: the «N - Имя» line (or «резерв N - Имя») and the
+// rewritten announcement are exactly what the «Иду» button produces, so the two
+// entry points cannot drift apart. user is resolved by the caller from the
+// launch parameters of the app.
+//
+// A repeated call is not an error: the ordinary "Иду" already booked, and the
+// app may simply be retried — the existing booking comes back.
+func (s *Service) BookInChat(ctx context.Context, peerID, chatID, eventID int64, user chat.User) (booking.Booking, error) {
+	if existing, booked, err := s.findActiveBooking(ctx, user.ID, eventID); err != nil {
+		return booking.Booking{}, err
+	} else if booked {
+		return existing.Booking, nil
+	}
+
+	b, err := s.bookings.Create(ctx, booking.CreateInput{
+		EventID:        eventID,
+		PlayerName:     user.DisplayName,
+		UserID:         &user.ID,
+		BookedByUserID: user.ID,
+	})
+	if err != nil {
+		return booking.Booking{}, fmt.Errorf("create booking: %w", err)
+	}
+
+	line := ""
+	if b.Status == booking.StatusWaitlist {
+		position, err := s.waitlistPosition(ctx, eventID, b.ID)
+		if err != nil {
+			return b, err
+		}
+		line = fmt.Sprintf("резерв %d - %s", position, b.PlayerName)
+	} else {
+		seat := 0
+		if b.SeatNo != nil {
+			seat = *b.SeatNo
+		}
+		line = fmt.Sprintf("%d - %s", seat, b.PlayerName)
+	}
+
+	// Правка анонса идёт до строки в чат: клавиатуру под полем ввода беседа
+	// берёт у последнего сообщения бота (см. handleAttend).
+	s.refreshAnnouncementLogged(ctx, chatID, peerID, eventID)
+	if err := s.sendText(ctx, chatID, peerID, line, ""); err != nil {
+		return b, err
+	}
+	return b, nil
+}
+
+// CancelInChat cancels the user's booking in a game on behalf of the mini app
+// and shows it in the chat: the «N - Имя минус» line, the member promoted from
+// the reserve (a promotion is never silent, ARCHITECTURE §16) and the rewritten
+// announcement. booking.ErrNotFound means there was nothing to cancel.
+func (s *Service) CancelInChat(ctx context.Context, peerID, chatID, eventID, userID int64) (booking.CancelResult, error) {
+	me, booked, err := s.findActiveBooking(ctx, userID, eventID)
+	if err != nil {
+		return booking.CancelResult{}, err
+	}
+	if !booked {
+		return booking.CancelResult{}, booking.ErrNotFound
+	}
+
+	res, err := s.bookings.Cancel(ctx, eventID, me.ID)
+	if err != nil {
+		return booking.CancelResult{}, fmt.Errorf("cancel booking: %w", err)
+	}
+
+	line, err := s.cancelLine(ctx, me)
+	if err != nil {
+		return booking.CancelResult{}, err
+	}
+	if res.Promoted != nil {
+		seat := 0
+		if res.Promoted.SeatNo != nil {
+			seat = *res.Promoted.SeatNo
+		}
+		line += fmt.Sprintf("\n%d - %s из резерва", seat, res.Promoted.PlayerName)
+	}
+
+	s.refreshAnnouncementLogged(ctx, chatID, peerID, eventID)
+	if err := s.sendText(ctx, chatID, peerID, line, ""); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
 // findActiveBooking returns the caller's active booking for the event in the
 // payload. Without an event id a single active booking is used.
 func (s *Service) findActiveBooking(ctx context.Context, userID, eventID int64) (booking.BookingWithEvent, bool, error) {

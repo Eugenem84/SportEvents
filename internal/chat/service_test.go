@@ -432,6 +432,42 @@ func countChatsWithTitle(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 	return n
 }
 
+// Аватарки в мини-приложении строятся от VK-идентификаторов: у записи есть
+// только внутренний пользователь, и мостик между ними — user_identities.
+func TestIdentitiesByUsers(t *testing.T) {
+	ctx, svc, pool := setup(t)
+
+	external := uniqueExt(t, "vk")
+	linked, err := svc.FindOrCreateUserByExternalID(ctx, chat.PlatformVK, external, "Евгений")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest := insertUser(t, ctx, pool, "Гость без профиля")
+
+	got, err := svc.IdentitiesByUsers(ctx, chat.PlatformVK, []int64{linked.ID, guest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[linked.ID] != external {
+		t.Fatalf("identity: %+v", got)
+	}
+	if _, ok := got[guest]; ok {
+		t.Fatalf("a user without an identity must be absent: %+v", got)
+	}
+}
+
+func TestIdentitiesByUsersEmptyInput(t *testing.T) {
+	ctx, svc, _ := setup(t)
+
+	got, err := svc.IdentitiesByUsers(ctx, chat.PlatformVK, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want an empty map, got %+v", got)
+	}
+}
+
 func countAdmins(t *testing.T, ctx context.Context, pool *pgxpool.Pool, chatID int64) int64 {
 	t.Helper()
 	var n int64

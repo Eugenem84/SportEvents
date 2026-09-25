@@ -22,7 +22,7 @@
 ## Секреты
 
 - `/opt/projects/sportevents/.env` — `DB_NAME`, `DB_USER`, `DB_PASSWORD`,
-  `VK_GROUP_ID`, `VK_APP_ID`, `VK_TOKEN`, `VK_CONFIRMATION_TOKEN`, `VK_SECRET`: права `600`, в git не попадает.
+  `VK_GROUP_ID`, `VK_APP_ID`, `VK_APP_SECRET`, `VK_TOKEN`, `VK_CONFIRMATION_TOKEN`, `VK_SECRET`: права `600`, в git не попадает.
 - В git — только `projects/sportevents/.env.example` (без значений).
 - Никогда не печатать содержимое `.env`, токены и пароли в логах и отчётах.
 

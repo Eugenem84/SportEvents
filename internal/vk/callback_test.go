@@ -1657,6 +1657,107 @@ func TestCallbackAppCommandWithoutAppIDExplains(t *testing.T) {
 	}
 }
 
+// --- запись из мини-приложения ---
+
+// Запись, сделанная в приложении, идёт тем же путём, что и кнопкой «Иду»:
+// строка в чат и анонс, переписанный на месте. Приложение только просит
+// адаптер записать, поэтому вход в чате и в WebView не расходятся.
+func TestBookInChatPostsSeatLineAndRewritesAnnouncement(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
+	h.anns.has = true
+
+	user := chat.User{ID: 42, DisplayName: "Евгений Мёдов"}
+	b, err := h.svc.BookInChat(context.Background(), 2000000047, 1, 7, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Status != booking.StatusConfirmed || b.SeatNo == nil || *b.SeatNo != 1 {
+		t.Fatalf("booking: %+v", b)
+	}
+	if len(h.books.created) != 1 {
+		t.Fatalf("created: %+v", h.books.created)
+	}
+	if uid := h.books.created[0].UserID; uid == nil || *uid != user.ID {
+		t.Fatalf("booking must carry the user: %+v", h.books.created[0])
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "1 - Евгений Мёдов" {
+		t.Fatalf("seat line: %+v", h.msg.sent)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 555 {
+		t.Fatalf("announcement must be rewritten in place: %+v", h.msg.edits)
+	}
+}
+
+// Повторный вызов не создаёт вторую запись: приложение могло отправить запрос
+// дважды, и «уже записан» — нормальный ответ.
+func TestBookInChatIsIdempotent(t *testing.T) {
+	h := newHarness(t, true)
+	uid := int64(42)
+	h.books.active = []booking.BookingWithEvent{{
+		Booking: booking.Booking{ID: 5, EventID: 7, UserID: &uid, Status: booking.StatusConfirmed},
+	}}
+
+	b, err := h.svc.BookInChat(context.Background(), 2000000047, 1, 7, chat.User{ID: uid, DisplayName: "Евгений Мёдов"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != 5 {
+		t.Fatalf("the existing booking must come back: %+v", b)
+	}
+	if len(h.books.created) != 0 || len(h.msg.sent) != 0 {
+		t.Fatalf("nothing must be created or posted: %+v / %+v", h.books.created, h.msg.sent)
+	}
+}
+
+// Отписка из приложения: строка «номер - имя минус» и поднятый из резерва.
+func TestCancelInChatPostsMinusLineAndPromotion(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
+	h.anns.has = true
+
+	uid := int64(42)
+	seat := 2
+	h.books.active = []booking.BookingWithEvent{{
+		Booking: booking.Booking{ID: 5, EventID: 7, PlayerName: "Евгений Мёдов", UserID: &uid, SeatNo: &seat, Status: booking.StatusConfirmed},
+	}}
+	promotedSeat := 1
+	h.books.promote = &booking.Booking{ID: 9, EventID: 7, PlayerName: "Пётр", SeatNo: &promotedSeat, Status: booking.StatusConfirmed}
+
+	if _, err := h.svc.CancelInChat(context.Background(), 2000000047, 1, 7, uid); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.books.cancelled) != 1 || h.books.cancelled[0] != 5 {
+		t.Fatalf("cancelled: %+v", h.books.cancelled)
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "2 - Евгений Мёдов минус\n1 - Пётр из резерва" {
+		t.Fatalf("line: %+v", h.msg.sent)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 555 {
+		t.Fatalf("announcement must be rewritten: %+v", h.msg.edits)
+	}
+}
+
+// Отписываться не от чего: приложение получает booking.ErrNotFound и говорит
+// человеку, что записи нет.
+func TestCancelInChatWithoutBooking(t *testing.T) {
+	h := newHarness(t, true)
+
+	_, err := h.svc.CancelInChat(context.Background(), 2000000047, 1, 7, 42)
+	if !errors.Is(err, booking.ErrNotFound) {
+		t.Fatalf("err: %v, want booking.ErrNotFound", err)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("nothing must be posted: %+v", h.msg.sent)
+	}
+}
+
 // --- Phase 6: id сообщения анонса ---
 
 // Своих кнопок у анонса нет: id его сообщения бот узнаёт из самой отправки — в
