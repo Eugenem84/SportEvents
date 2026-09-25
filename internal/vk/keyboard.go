@@ -53,10 +53,35 @@ func CommandPayload(command string) string {
 // game: the command plus the internal event id. The label of such a button
 // carries no state, so the same "Записаться" can appear under every game.
 func EventCommandPayload(command string, eventID int64) string {
+	return Payload{Command: command, EventID: eventID}.Marshal()
+}
+
+// SlotCommandPayload is the payload of a settings button: the command plus
+// the weekday it applies to. The weekday is always written out (воскресенье
+// is 0), so a payload cannot lose it.
+func SlotCommandPayload(command string, weekday int) string {
 	raw, err := json.Marshal(struct {
 		Command string `json:"command"`
-		EventID int64  `json:"event_id,omitempty"`
-	}{command, eventID})
+		Weekday int    `json:"weekday"`
+	}{command, weekday})
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// Payload is what a button carries: a command plus its parameters. VK hands
+// it back as a string, both for text buttons (message_new) and for callback
+// buttons (message_event).
+type Payload struct {
+	Command string `json:"command"`
+	EventID int64  `json:"event_id,omitempty"`
+	Weekday int    `json:"weekday,omitempty"`
+}
+
+// Marshal renders the payload for a button.
+func (p Payload) Marshal() string {
+	raw, err := json.Marshal(p)
 	if err != nil {
 		return "{}"
 	}
@@ -71,16 +96,31 @@ func PayloadCommand(payload string) string {
 }
 
 // ParsePayload reads the command and the optional event id out of a VK
-// payload string. An empty or unparseable payload yields zero values.
+// payload string.
 func ParsePayload(payload string) (command string, eventID int64) {
-	var p struct {
-		Command string `json:"command"`
-		EventID int64  `json:"event_id"`
-	}
-	if err := json.Unmarshal([]byte(payload), &p); err != nil {
-		return "", 0
-	}
+	p := ParseButtonPayload(payload)
 	return p.Command, p.EventID
+}
+
+// ParseButtonPayload decodes a payload; an empty or broken payload yields a
+// zero Payload.
+func ParseButtonPayload(payload string) Payload {
+	var p Payload
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		return Payload{}
+	}
+	return p
+}
+
+// CallbackButton builds an inline button whose press VK delivers as
+// message_event: nothing is posted to the chat, and VK tells us which message
+// was pressed — that is how the settings screen rewrites itself in place.
+// It requires the message_event event type to be enabled for the community.
+func CallbackButton(label, payload string, color ButtonColor) Button {
+	return Button{
+		Action: ButtonAction{Type: "callback", Label: label, Payload: payload},
+		Color:  color,
+	}
 }
 
 // Marshal returns the keyboard as the JSON string VK expects in the

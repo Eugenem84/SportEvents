@@ -43,11 +43,15 @@ type messageNewObject struct {
 }
 
 // messageEvent is the object of a message_event (callback button press).
+// ConversationMessageID is the id of the message whose button was pressed:
+// the bot edits that very message (the settings screen), so the chat keeps
+// one live settings message instead of a pile of them.
 type messageEvent struct {
-	UserID  int64  `json:"user_id"`
-	PeerID  int64  `json:"peer_id"`
-	EventID string `json:"event_id"`
-	Payload string `json:"payload"`
+	UserID                int64  `json:"user_id"`
+	PeerID                int64  `json:"peer_id"`
+	EventID               string `json:"event_id"`
+	Payload               string `json:"payload"`
+	ConversationMessageID int64  `json:"conversation_message_id"`
 }
 
 // HandleCallback is the POST /vk/callback endpoint. VK retries events that
