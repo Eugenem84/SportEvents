@@ -168,6 +168,70 @@ func TestSetCapacity(t *testing.T) {
 	}
 }
 
+// Администратор переносит игру: дата, время, место, название и вместимость
+// меняются вместе — они живут в одном анонсе.
+func TestUpdateEvent(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "Волейбол")
+	ev := mustCreate(t, svc, ctx, event.CreateInput{
+		ChatID:   chatID,
+		StartsAt: time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC),
+		Title:    "Волейбол",
+		Capacity: 12,
+	})
+
+	moved := time.Date(2026, 9, 28, 19, 30, 0, 0, time.UTC)
+	got, err := svc.Update(ctx, event.UpdateInput{
+		ChatID:   chatID,
+		EventID:  ev.ID,
+		Title:    "Волейбол на траве",
+		Location: "СК «Спартак»",
+		StartsAt: moved,
+		Capacity: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "Волейбол на траве" || got.Location != "СК «Спартак»" ||
+		!got.StartsAt.Equal(moved) || got.Capacity != 8 {
+		t.Fatalf("updated: %+v", got)
+	}
+
+	userID := insertUser(t, ctx, pool, "Иван")
+	insertConfirmed(t, ctx, pool, ev.ID, userID, userID)
+	user2 := insertUser(t, ctx, pool, "Пётр")
+	insertConfirmed(t, ctx, pool, ev.ID, user2, user2)
+
+	// Ниже состава опускать нельзя: у этих людей уже есть места.
+	if _, err := svc.Update(ctx, event.UpdateInput{
+		ChatID: chatID, EventID: ev.ID, Title: "Волейбол", StartsAt: moved, Capacity: 1,
+	}); !errors.Is(err, event.ErrCapacityBelowConfirmed) {
+		t.Fatalf("want ErrCapacityBelowConfirmed, got %v", err)
+	}
+
+	// Пустое название и чужая беседа отсекаются до базы.
+	if _, err := svc.Update(ctx, event.UpdateInput{
+		ChatID: chatID, EventID: ev.ID, Title: "   ", StartsAt: moved, Capacity: 8,
+	}); !errors.Is(err, event.ErrInvalid) {
+		t.Fatalf("want ErrInvalid, got %v", err)
+	}
+	if _, err := svc.Update(ctx, event.UpdateInput{
+		ChatID: chatID + 9999, EventID: ev.ID, Title: "Волейбол", StartsAt: moved, Capacity: 8,
+	}); !errors.Is(err, event.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for another chat, got %v", err)
+	}
+
+	// Отменённая игра не редактируется: её анонс больше ничего не предлагает.
+	if _, err := svc.Cancel(ctx, chatID, ev.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Update(ctx, event.UpdateInput{
+		ChatID: chatID, EventID: ev.ID, Title: "Волейбол", StartsAt: moved, Capacity: 8,
+	}); !errors.Is(err, event.ErrAlreadyCancelled) {
+		t.Fatalf("want ErrAlreadyCancelled, got %v", err)
+	}
+}
+
 // Отмена игры: статус меняется, игра пропадает из предстоящих, а повторная
 // отмена честно сообщает, что игра уже отменена.
 func TestCancelEvent(t *testing.T) {

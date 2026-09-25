@@ -184,48 +184,21 @@ func (s *Service) ListUpcomingWithCounts(ctx context.Context, chatID int64, from
 }
 
 func (s *Service) SetCapacity(ctx context.Context, chatID, eventID int64, capacity int) error {
-	if capacity < 1 {
-		return ErrInvalid
-	}
-
-	tx, err := s.pool.Begin(ctx)
+	// The narrow form of Update, kept for the bot, which changes only the
+	// capacity (the rest of the announcement stays as it was).
+	ev, err := s.Get(ctx, chatID, eventID)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	var lockedID int64
-	err = tx.QueryRow(ctx,
-		`SELECT id FROM events WHERE id = $1 AND chat_id = $2 FOR UPDATE`,
-		eventID, chatID,
-	).Scan(&lockedID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return fmt.Errorf("lock event: %w", err)
-	}
-
-	var confirmed int
-	err = tx.QueryRow(ctx,
-		`SELECT count(*)::int FROM bookings WHERE event_id = $1 AND status = 'confirmed'`,
-		eventID,
-	).Scan(&confirmed)
-	if err != nil {
-		return fmt.Errorf("count confirmed: %w", err)
-	}
-	if capacity < confirmed {
-		return ErrCapacityBelowConfirmed
-	}
-
-	_, err = tx.Exec(ctx, `UPDATE events SET capacity = $1 WHERE id = $2`, capacity, eventID)
-	if err != nil {
-		return fmt.Errorf("update capacity: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-	return nil
+	_, err = s.Update(ctx, UpdateInput{
+		ChatID:   chatID,
+		EventID:  eventID,
+		Title:    ev.Title,
+		Location: ev.Location,
+		StartsAt: ev.StartsAt,
+		Capacity: capacity,
+	})
+	return err
 }
 
 func validateCreate(in CreateInput) error {
@@ -242,6 +215,75 @@ func validateCreate(in CreateInput) error {
 		return ErrInvalid
 	}
 	return nil
+}
+
+// Update applies an administrator's changes to a game and returns the result as
+// it is stored now: the announcement in the chat is rewritten from it. The
+// capacity may not drop below the confirmed lineup — those people already have
+// seats (ARCHITECTURE §9) — and a called-off game is not editable: its
+// announcement no longer offers anything.
+func (s *Service) Update(ctx context.Context, in UpdateInput) (Event, error) {
+	if in.ChatID == 0 || in.EventID == 0 {
+		return Event{}, ErrInvalid
+	}
+	if in.StartsAt.IsZero() {
+		return Event{}, ErrInvalid
+	}
+	if strings.TrimSpace(in.Title) == "" {
+		return Event{}, ErrInvalid
+	}
+	if in.Capacity < 1 {
+		return Event{}, ErrInvalid
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Event{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status Status
+	err = tx.QueryRow(ctx,
+		`SELECT status FROM events WHERE id = $1 AND chat_id = $2 FOR UPDATE`,
+		in.EventID, in.ChatID,
+	).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Event{}, ErrNotFound
+	}
+	if err != nil {
+		return Event{}, fmt.Errorf("lock event: %w", err)
+	}
+	if status == StatusCancelled {
+		return Event{}, ErrAlreadyCancelled
+	}
+
+	var confirmed int
+	err = tx.QueryRow(ctx,
+		`SELECT count(*)::int FROM bookings WHERE event_id = $1 AND status = 'confirmed'`,
+		in.EventID,
+	).Scan(&confirmed)
+	if err != nil {
+		return Event{}, fmt.Errorf("count confirmed: %w", err)
+	}
+	if in.Capacity < confirmed {
+		return Event{}, ErrCapacityBelowConfirmed
+	}
+
+	var e Event
+	err = tx.QueryRow(ctx,
+		`UPDATE events SET title = $1, location = $2, starts_at = $3, capacity = $4
+		 WHERE id = $5 AND chat_id = $6
+		 RETURNING id, chat_id, starts_at, title, location, capacity, status, created_at`,
+		in.Title, in.Location, in.StartsAt, in.Capacity, in.EventID, in.ChatID,
+	).Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.Status, &e.CreatedAt)
+	if err != nil {
+		return Event{}, fmt.Errorf("update event: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Event{}, fmt.Errorf("commit: %w", err)
+	}
+	return e, nil
 }
 
 func isForeignKey(err error) bool {

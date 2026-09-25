@@ -79,6 +79,7 @@ func main() {
 		Identities: chats,
 		Events:     event.NewService(pool),
 		Bookings:   booking.NewService(pool),
+		Schedule:   schedule.NewService(pool),
 		Names:      names,
 		Photos:     photos,
 		Chat:       chatSync,

@@ -143,9 +143,32 @@ type fakeEventStore struct {
 	games   []event.EventSummary
 	created []event.CreateInput
 	getErr  error
+	// updates lists the edits Update accepted.
+	updates   []event.UpdateInput
+	updateErr error
 	// cancelled lists the games Cancel was called on with success.
 	cancelled []int64
 	cancelErr error
+}
+
+// Update stores the changes the way the domain does and hides an edited game from
+// Get's old snapshot — tests read the result of the call itself.
+func (f *fakeEventStore) Update(_ context.Context, in event.UpdateInput) (event.Event, error) {
+	if f.updateErr != nil {
+		return event.Event{}, f.updateErr
+	}
+	f.updates = append(f.updates, in)
+	for i := range f.games {
+		if f.games[i].ID != in.EventID {
+			continue
+		}
+		f.games[i].StartsAt = in.StartsAt
+		f.games[i].Title = in.Title
+		f.games[i].Location = in.Location
+		f.games[i].Capacity = in.Capacity
+		return f.games[i].Event, nil
+	}
+	return event.Event{}, event.ErrNotFound
 }
 
 func (f *fakeEventStore) Create(_ context.Context, in event.CreateInput) (event.Event, error) {
@@ -213,6 +236,7 @@ type fakeBookingStore struct {
 	promote      *booking.Booking
 	createErr    error
 	createStatus booking.Status
+	cancelErr    error
 }
 
 func (f *fakeBookingStore) Create(_ context.Context, in booking.CreateInput) (booking.Booking, error) {
@@ -258,10 +282,25 @@ func (f *fakeBookingStore) confirmed(eventID int64) []booking.Booking {
 }
 
 func (f *fakeBookingStore) Cancel(_ context.Context, eventID, bookingID int64) (booking.CancelResult, error) {
-	f.cancelled = append(f.cancelled, bookingID)
-	res := booking.CancelResult{
-		Cancelled: booking.Booking{ID: bookingID, EventID: eventID, Status: booking.StatusCancelled},
+	if f.cancelErr != nil {
+		return booking.CancelResult{}, f.cancelErr
 	}
+	f.cancelled = append(f.cancelled, bookingID)
+
+	// Как настоящий Cancel: отменённая запись возвращается с именем и местом —
+	// по ним адаптер строит строку в беседе.
+	target := booking.Booking{ID: bookingID, EventID: eventID, Status: booking.StatusCancelled}
+	for i := range f.byEvent[eventID] {
+		if f.byEvent[eventID][i].ID != bookingID {
+			continue
+		}
+		target = f.byEvent[eventID][i]
+		target.Status = booking.StatusCancelled
+		f.byEvent[eventID][i].Status = booking.StatusCancelled
+		break
+	}
+
+	res := booking.CancelResult{Cancelled: target}
 	if f.promote != nil {
 		res.Promoted = f.promote
 	}
@@ -1755,6 +1794,225 @@ func TestCancelInChatWithoutBooking(t *testing.T) {
 	}
 	if len(h.msg.sent) != 0 {
 		t.Fatalf("nothing must be posted: %+v", h.msg.sent)
+	}
+}
+
+// --- админские действия из мини-приложения ---
+
+// «Создать игру» из приложения идёт тем же путём, что «/старт»: анонс в беседу
+// и клавиатура записи под полем ввода.
+func TestStartGameInChatCreatesAndAnnounces(t *testing.T) {
+	h := newHarness(t, true)
+
+	start := harnessNow().Add(24 * time.Hour)
+	ev, err := h.svc.StartGameInChat(context.Background(), 2000000047, 7, event.CreateInput{
+		ChatID: 1, StartsAt: start, Title: "Волейбол", Location: "СК «Спартак»", Capacity: 12,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.ID == 0 {
+		t.Fatal("the game must be created")
+	}
+	if len(h.events.created) != 1 || h.events.created[0].Location != "СК «Спартак»" {
+		t.Fatalf("created: %+v", h.events.created)
+	}
+
+	// [0] — анонс, [1] — строка об открытии записи с клавиатурой «Иду» / «Не иду»:
+	// клавиатуру беседы держит последнее сообщение бота.
+	if len(h.msg.sent) != 2 {
+		t.Fatalf("want the announcement and the note, got %+v", h.msg.sent)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Волейбол") || !strings.Contains(h.msg.sent[0].Text, "СК «Спартак»") {
+		t.Errorf("announcement: %q", h.msg.sent[0].Text)
+	}
+	if !strings.Contains(h.msg.sent[1].Text, "Запись открыта") {
+		t.Errorf("note: %q", h.msg.sent[1].Text)
+	}
+	if !strings.Contains(h.msg.sent[1].Keyboard, "open_app") {
+		t.Errorf("the sign-up keyboard must come last: %q", h.msg.sent[1].Keyboard)
+	}
+}
+
+// Игра на то же время не создаётся второй раз: повторное «Создать» правит ту,
+// что уже есть.
+func TestStartGameInChatUpdatesTheGameAtTheSameTime(t *testing.T) {
+	h := newHarness(t, true)
+	start := harnessNow().Add(24 * time.Hour)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: start, Capacity: 12, Status: event.StatusScheduled},
+	}}
+
+	got, err := h.svc.StartGameInChat(context.Background(), 2000000047, 7, event.CreateInput{
+		ChatID: 1, StartsAt: start, Title: "Волейбол на траве", Capacity: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != 7 {
+		t.Fatalf("the existing game must be reused: %+v", got)
+	}
+	if len(h.events.created) != 0 {
+		t.Fatalf("a second game must not appear: %+v", h.events.created)
+	}
+	if len(h.events.updates) != 1 || h.events.updates[0].Capacity != 8 {
+		t.Fatalf("updates: %+v", h.events.updates)
+	}
+	if !strings.Contains(got.Title, "на траве") {
+		t.Fatalf("title: %q", got.Title)
+	}
+}
+
+// Правка игры: анонс переписывается на месте, а строки в чат не добавляется —
+// беседа не должна превращаться в поток «игру перенесли».
+func TestUpdateGameInChatRewritesAnnouncement(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
+	h.anns.has = true
+
+	moved := harnessNow().Add(48 * time.Hour)
+	updated, err := h.svc.UpdateGameInChat(context.Background(), 2000000047, 7, event.UpdateInput{
+		ChatID: 1, EventID: 7, Title: "Волейбол на траве", Location: "СК «Спартак»",
+		StartsAt: moved, Capacity: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Title != "Волейбол на траве" || updated.Location != "СК «Спартак»" || updated.Capacity != 8 {
+		t.Fatalf("updated: %+v", updated)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 555 {
+		t.Fatalf("the announcement must be rewritten in place: %+v", h.msg.edits)
+	}
+	if !strings.Contains(h.msg.edits[0].Text, "Волейбол на траве") ||
+		!strings.Contains(h.msg.edits[0].Text, "Место: СК «Спартак»") {
+		t.Fatalf("announcement text: %q", h.msg.edits[0].Text)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("an edit must not post a chat line: %+v", h.msg.sent)
+	}
+}
+
+// Администратор вычёркивает человека: строка с местом, подъём из резерва и
+// правка анонса. Строка отличается от своей отписки — видно, что снял админ.
+func TestRemoveBookingInChatPostsLineAndPromotion(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
+	h.anns.has = true
+
+	seat1, seat2 := 1, 2
+	h.books.byEvent = map[int64][]booking.Booking{
+		7: {
+			{ID: 5, EventID: 7, PlayerName: "Иван", SeatNo: &seat2, Status: booking.StatusConfirmed},
+			{ID: 6, EventID: 7, PlayerName: "Пётр", Status: booking.StatusWaitlist},
+		},
+	}
+	h.books.promote = &booking.Booking{ID: 6, EventID: 7, PlayerName: "Пётр", SeatNo: &seat1, Status: booking.StatusConfirmed}
+
+	res, err := h.svc.RemoveBookingInChat(context.Background(), 2000000047, 1, 7, 7, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.books.cancelled) != 1 || h.books.cancelled[0] != 5 {
+		t.Fatalf("cancelled: %+v", h.books.cancelled)
+	}
+	want := "2 - Иван минус (снято администратором)\n1 - Пётр из резерва"
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != want {
+		t.Fatalf("line: %+v, want %q", h.msg.sent, want)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 555 {
+		t.Fatalf("the announcement must be rewritten: %+v", h.msg.edits)
+	}
+	if res.Promoted == nil || res.Promoted.PlayerName != "Пётр" {
+		t.Fatalf("promotion: %+v", res.Promoted)
+	}
+}
+
+// Из резерва человека тоже можно снять: у такой записи нет номера места.
+func TestRemoveBookingInChatFromReserve(t *testing.T) {
+	h := newHarness(t, true)
+	h.books.byEvent = map[int64][]booking.Booking{
+		7: {{ID: 6, EventID: 7, PlayerName: "Пётр", Status: booking.StatusWaitlist}},
+	}
+
+	if _, err := h.svc.RemoveBookingInChat(context.Background(), 2000000047, 1, 7, 7, 6); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "Пётр минус из резерва (снято администратором)" {
+		t.Fatalf("line: %+v", h.msg.sent)
+	}
+}
+
+// Отмена игры из приложения: записи снимаются, анонс становится отменённым.
+func TestCancelGameInChatDropsBookingsAndButtons(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
+	h.anns.has = true
+	h.books.byEvent = map[int64][]booking.Booking{
+		7: {{ID: 5, EventID: 7, PlayerName: "Иван", Status: booking.StatusConfirmed}},
+	}
+
+	cancelled, err := h.svc.CancelGameInChat(context.Background(), 2000000047, 1, 7, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != event.StatusCancelled {
+		t.Fatalf("status: %q", cancelled.Status)
+	}
+	if len(h.books.cancelledAll) != 1 || h.books.cancelledAll[0] != 7 {
+		t.Fatalf("bookings must be dropped: %+v", h.books.cancelledAll)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "отменена") {
+		t.Fatalf("chat line: %+v", h.msg.sent)
+	}
+	if len(h.msg.edits) != 1 {
+		t.Fatalf("the announcement must turn cancelled: %+v", h.msg.edits)
+	}
+
+	// Повторная отмена честно сообщает, что игра уже отменена.
+	if _, err := h.svc.CancelGameInChat(context.Background(), 2000000047, 1, 7, 7); !errors.Is(err, event.ErrAlreadyCancelled) {
+		t.Fatalf("want ErrAlreadyCancelled, got %v", err)
+	}
+}
+
+// Не администратор не может ни создать игру, ни перенести её, ни отменить, ни
+// снять человека — и до беседы при отказе ничего не доходит.
+func TestAdminActionsAreRefusedToNonAdmins(t *testing.T) {
+	h := newHarness(t, true)
+	h.chats.isAdmin = false
+
+	start := harnessNow().Add(24 * time.Hour)
+	if _, err := h.svc.StartGameInChat(context.Background(), 2000000047, 555, event.CreateInput{
+		ChatID: 1, StartsAt: start, Title: "Волейбол", Capacity: 12,
+	}); !errors.Is(err, chat.ErrNotAdmin) {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := h.svc.UpdateGameInChat(context.Background(), 2000000047, 555, event.UpdateInput{
+		ChatID: 1, EventID: 7, Title: "Волейбол", StartsAt: start, Capacity: 12,
+	}); !errors.Is(err, chat.ErrNotAdmin) {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := h.svc.CancelGameInChat(context.Background(), 2000000047, 1, 555, 7); !errors.Is(err, chat.ErrNotAdmin) {
+		t.Fatalf("cancel: %v", err)
+	}
+	if _, err := h.svc.RemoveBookingInChat(context.Background(), 2000000047, 1, 555, 7, 5); !errors.Is(err, chat.ErrNotAdmin) {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if len(h.events.created) != 0 || len(h.events.updates) != 0 || len(h.events.cancelled) != 0 {
+		t.Fatalf("games changed: %+v %+v %+v", h.events.created, h.events.updates, h.events.cancelled)
+	}
+	if len(h.books.cancelled) != 0 || len(h.books.cancelledAll) != 0 || len(h.msg.sent) != 0 {
+		t.Fatalf("bookings or messages: %+v %+v %+v", h.books.cancelled, h.books.cancelledAll, h.msg.sent)
 	}
 }
 

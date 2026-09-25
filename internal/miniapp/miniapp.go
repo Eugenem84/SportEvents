@@ -35,6 +35,7 @@ import (
 	"sportevents.local/internal/booking"
 	"sportevents.local/internal/chat"
 	"sportevents.local/internal/event"
+	"sportevents.local/internal/schedule"
 )
 
 // assets holds the pages and the VK Bridge bundle. The bundle is kept in the
@@ -56,14 +57,27 @@ const gamesLimit = 10
 // the person: better a generic lineup entry than a failed sign-up.
 const defaultPlayerName = "Участник"
 
+// The defaults the create form is pre-filled with: the same ones the bot uses
+// for «/старт» without arguments.
+const (
+	defaultTitle    = "Волейбол"
+	defaultCapacity = 12
+	defaultHour     = 19
+)
+
 // defaultLocation is Moscow time: V1 assumes one city per chat (ARCHITECTURE
 // §7), and a fixed offset keeps the app working without tzdata. The bot uses
 // the same zone, so both tell the same time.
 var defaultLocation = time.FixedZone("MSK", 3*60*60)
 
-// ChatStore resolves the conversation the app was launched from.
+// ChatStore resolves the conversation the app was launched from and its
+// administrators.
 type ChatStore interface {
 	FindByChannel(ctx context.Context, platform, externalChatID string) (*chat.Chat, error)
+	// IsChatAdmin reports whether the person may change the games of the chat.
+	// The app shows the admin controls from this answer, and the VK adapter
+	// checks it again for every change — the flag in the browser is not a right.
+	IsChatAdmin(ctx context.Context, chatID, userID int64) (bool, error)
 }
 
 // UserStore resolves the VK id of the person who opened the app to an internal
@@ -90,6 +104,12 @@ type BookingStore interface {
 	ListByEvent(ctx context.Context, eventID int64, statuses ...booking.Status) ([]booking.Booking, error)
 }
 
+// ScheduleStore holds the regular game times of a chat: the create form offers
+// them as quick picks, the same way «/старт» takes the nearest one.
+type ScheduleStore interface {
+	List(ctx context.Context, chatID int64) ([]schedule.Slot, error)
+}
+
 // NameSource resolves the display name of a VK user.
 type NameSource interface {
 	GetUserName(ctx context.Context, userID int64) (string, error)
@@ -100,12 +120,21 @@ type PhotoSource interface {
 	UserPhotos(ctx context.Context, userIDs []int64) (map[int64]string, error)
 }
 
-// ChatSyncer shows a booking made in the app to the conversation: the line in
-// the chat and the rewritten announcement. *vk.Service implements it, so the
-// app and the «Иду» button take the same path.
+// ChatSyncer shows a booking made in the app to the conversation and performs
+// the changes an administrator makes: the line in the chat, the rewritten
+// announcement and the rights check all live behind it, so the app and the bot
+// take the same path. *vk.Service implements it.
 type ChatSyncer interface {
 	BookInChat(ctx context.Context, peerID, chatID, eventID int64, user chat.User) (booking.Booking, error)
 	CancelInChat(ctx context.Context, peerID, chatID, eventID, userID int64) (booking.CancelResult, error)
+	// StartGameInChat creates a game and opens its sign-up in the chat.
+	StartGameInChat(ctx context.Context, peerID, userID int64, in event.CreateInput) (event.Event, error)
+	// UpdateGameInChat applies an administrator's changes and rewrites the announcement.
+	UpdateGameInChat(ctx context.Context, peerID, userID int64, in event.UpdateInput) (event.Event, error)
+	// CancelGameInChat calls a game off and drops its bookings.
+	CancelGameInChat(ctx context.Context, peerID, chatID, userID, eventID int64) (event.Event, error)
+	// RemoveBookingInChat takes a participant out of a game.
+	RemoveBookingInChat(ctx context.Context, peerID, chatID, userID, eventID, bookingID int64) (booking.CancelResult, error)
 }
 
 // Config carries the settings of the mini app.
@@ -138,6 +167,7 @@ type Deps struct {
 	Identities IdentityStore
 	Events     EventStore
 	Bookings   BookingStore
+	Schedule   ScheduleStore
 	Names      NameSource
 	Photos     PhotoSource
 	Chat       ChatSyncer
@@ -211,6 +241,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.bookingAction(w, r, true)
 	case path == h.base+"/api/skip":
 		h.bookingAction(w, r, false)
+	case path == h.base+"/api/game":
+		h.apiGameCreate(w, r)
+	case path == h.base+"/api/game/edit":
+		h.apiGameEdit(w, r)
+	case path == h.base+"/api/game/cancel":
+		h.apiGameCancel(w, r)
+	case path == h.base+"/api/remove":
+		h.apiRemoveBooking(w, r)
 	case strings.HasPrefix(path, h.base+"/static/"):
 		h.serveStatic(w, r)
 	default:
@@ -307,9 +345,15 @@ func (h *handler) launchParams(w http.ResponseWriter, r *http.Request) (launchPa
 	return lp, true
 }
 
-// signMatches reproduces the VK algorithm: the launch parameters (all but sign)
-// sorted by name and joined as key=value pairs, signed with the protected key of
-// the app — HMAC-SHA256, base64.
+// signMatches reproduces the VK algorithm: only the launch parameters with the
+// vk_ prefix take part, sorted by name and joined as key=value pairs with the
+// values in URL encoding, signed with the protected key of the app — HMAC-SHA256
+// in URL-safe base64. Our own parameters (the conversation in the launch hash,
+// for instance) are not signed and must not enter the string: the check would
+// never pass again.
+//
+// Проверено на примере из документации VK: параметры и подпись оттуда дают
+// ровно эту строку (см. signMatchesOfficialExample в тестах пакета).
 func signMatches(q url.Values, secret string) bool {
 	got := q.Get("sign")
 	if got == "" || secret == "" {
@@ -318,24 +362,27 @@ func signMatches(q url.Values, secret string) bool {
 
 	keys := make([]string, 0, len(q))
 	for k := range q {
-		if k != "sign" {
+		if strings.HasPrefix(k, "vk_") {
 			keys = append(keys, k)
 		}
+	}
+	if len(keys) == 0 {
+		return false
 	}
 	sort.Strings(keys)
 	pairs := make([]string, 0, len(keys))
 	for _, k := range keys {
-		pairs = append(pairs, k+"="+q.Get(k))
+		pairs = append(pairs, k+"="+encodeURIComponent(q.Get(k)))
 	}
 
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(strings.Join(pairs, "&")))
 	want := mac.Sum(nil)
 
-	// VK sends padded standard base64; the unpadded and URL-safe alphabets are
-	// accepted as well, так подпись переживает любую передачу.
+	// VK sends the signature as URL-safe base64 without padding; the padded and
+	// the standard alphabets are accepted too, so the comparison is on bytes.
 	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
+		base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding,
 	} {
 		raw, err := enc.DecodeString(got)
 		if err != nil {
@@ -346,6 +393,27 @@ func signMatches(q url.Values, secret string) bool {
 		}
 	}
 	return false
+}
+
+// encodeURIComponent escapes a value the way the JavaScript reference
+// implementation of the launch-parameter signature does: everything outside the
+// unreserved set A-Za-z0-9-_.!~*'() is percent-encoded byte by byte.
+func encodeURIComponent(s string) string {
+	const unreserved = "-_.!~*'()"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			b.WriteByte(c)
+		case strings.IndexByte(unreserved, c) >= 0:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 // errNoChatContext, errNotConnected and errNoUser describe an app opened where
@@ -418,10 +486,34 @@ type state struct {
 	Me     *userView  `json:"me,omitempty"`
 	Games  []gameView `json:"games"`
 	Notice string     `json:"notice,omitempty"`
+	// Admin says whether the person may change the games: the app draws the
+	// create form and the per-game controls from it. Every change is checked
+	// again on its way to the chat — the flag is only the interface.
+	Admin bool `json:"admin"`
+	// NextGame and Schedule pre-fill the create form; they come to administrators
+	// only, because nobody else creates games.
+	NextGame *nextGameView `json:"next_game,omitempty"`
+	Schedule []slotView    `json:"schedule,omitempty"`
 	// SignChecked says whether the launch parameters were verified at all, and
 	// SignValid that the verification passed. The app warns when the check is off.
 	SignChecked bool `json:"sign_checked"`
 	SignValid   bool `json:"sign_valid"`
+}
+
+// nextGameView is what the create form is pre-filled with: the nearest regular
+// slot of the chat (the one «/старт» would take) and the bot's defaults.
+type nextGameView struct {
+	Date     string `json:"date"` // 2006-01-02
+	Time     string `json:"time"` // 15:04
+	Title    string `json:"title"`
+	Capacity int    `json:"capacity"`
+}
+
+// slotView is one regular game time of the chat: the form offers them as quick
+// picks instead of making the administrator type the same time week after week.
+type slotView struct {
+	Weekday string `json:"weekday"` // «вс»
+	Time    string `json:"time"`    // «10:00»
 }
 
 type chatView struct {
@@ -432,13 +524,20 @@ type userView struct {
 	Name  string `json:"name"`
 	Photo string `json:"photo,omitempty"`
 	Me    bool   `json:"me,omitempty"`
+	// BookingID lets an administrator take the person out of the game.
+	BookingID int64 `json:"booking_id,omitempty"`
 }
 
 type gameView struct {
-	ID        int64      `json:"id"`
-	Title     string     `json:"title"`
-	Location  string     `json:"location,omitempty"`
-	StartsAt  string     `json:"starts_at"`
+	ID       int64  `json:"id"`
+	Title    string `json:"title"`
+	Location string `json:"location,omitempty"`
+	StartsAt string `json:"starts_at"`
+	// Date and Time are the same moment in the chat's timezone: the edit form
+	// fills its date and time inputs from them, so the phone's zone never
+	// shifts the game.
+	Date      string     `json:"date"`
+	Time      string     `json:"time"`
 	When      string     `json:"when"`
 	WhenFull  string     `json:"when_full"`
 	Capacity  int        `json:"capacity"`
@@ -457,6 +556,8 @@ type seatView struct {
 	Name  string `json:"name"`
 	Photo string `json:"photo,omitempty"`
 	Me    bool   `json:"me,omitempty"`
+	// BookingID lets an administrator take the person out of the game.
+	BookingID int64 `json:"booking_id,omitempty"`
 }
 
 // mineView is the state of the person who opened the app in one game.
@@ -490,6 +591,17 @@ func (h *handler) state(ctx context.Context, lp launchParams) (state, error) {
 	resp.Chat = &chatView{Title: ch.Title}
 	resp.Me = &userView{Name: me.DisplayName}
 
+	// Права администратора: приложение рисует по ним формы, но каждое изменение
+	// всё равно проверяется ещё раз на пути в беседу (см. adminLaunch).
+	admin, err := h.deps.Chats.IsChatAdmin(ctx, ch.ID, me.ID)
+	if err != nil {
+		return resp, fmt.Errorf("check chat admin: %w", err)
+	}
+	resp.Admin = admin
+	if admin {
+		h.fillAdminForm(ctx, ch.ID, &resp)
+	}
+
 	games, err := h.deps.Events.ListUpcomingWithCounts(ctx, ch.ID, h.now().UTC(), gamesLimit)
 	if err != nil {
 		return resp, fmt.Errorf("list games: %w", err)
@@ -522,6 +634,38 @@ func (h *handler) state(ctx context.Context, lp launchParams) (state, error) {
 		resp.Games = append(resp.Games, h.gameView(g, lineups[i], me.ID, photos))
 	}
 	return resp, nil
+}
+
+// fillAdminForm adds what the create form needs: the nearest regular slot of the
+// chat (the one «/старт» would take) and the bot's defaults for the title and the
+// capacity. A chat without a schedule gets tomorrow at 19:00 — the same fallback
+// the bot has.
+func (h *handler) fillAdminForm(ctx context.Context, chatID int64, resp *state) {
+	next := nextGameView{Title: defaultTitle, Capacity: defaultCapacity}
+
+	day := h.now().In(h.loc).AddDate(0, 0, 1)
+	hour, minute := defaultHour, 0
+
+	if h.deps.Schedule != nil {
+		slots, err := h.deps.Schedule.List(ctx, chatID)
+		if err != nil {
+			h.log.Printf("miniapp: list schedule: %v", err)
+		}
+		for _, slot := range slots {
+			resp.Schedule = append(resp.Schedule, slotView{
+				Weekday: weekdaysShort[slot.Weekday%7],
+				Time:    slot.At(),
+			})
+		}
+		if chosen, ok := schedule.Next(h.now(), slots, h.loc); ok {
+			local := chosen.In(h.loc)
+			day, hour, minute = local, local.Hour(), local.Minute()
+		}
+	}
+
+	next.Date = time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, h.loc).Format("2006-01-02")
+	next.Time = fmt.Sprintf("%02d:%02d", hour, minute)
+	resp.NextGame = &next
 }
 
 // photos resolves avatars of internal users: first their VK ids
@@ -584,6 +728,8 @@ func (h *handler) gameView(g event.EventSummary, booked []booking.Booking, meID 
 		Title:     g.Title,
 		Location:  g.Location,
 		StartsAt:  g.StartsAt.UTC().Format(time.RFC3339),
+		Date:      local.Format("2006-01-02"),
+		Time:      local.Format("15:04"),
 		When:      shortWhen(local),
 		WhenFull:  fullWhen(local),
 		Capacity:  g.Capacity,
@@ -601,10 +747,11 @@ func (h *handler) gameView(g event.EventSummary, booked []booking.Booking, meID 
 		case booking.StatusConfirmed:
 			seat := seatOf(b)
 			v.Lineup = append(v.Lineup, seatView{
-				Seat:  seat,
-				Name:  b.PlayerName,
-				Photo: photoOf(b.UserID, photos),
-				Me:    mine,
+				Seat:      seat,
+				Name:      b.PlayerName,
+				Photo:     photoOf(b.UserID, photos),
+				Me:        mine,
+				BookingID: b.ID,
 			})
 			if mine {
 				v.Mine = &mineView{Status: string(booking.StatusConfirmed), Seat: seat}
@@ -612,9 +759,10 @@ func (h *handler) gameView(g event.EventSummary, booked []booking.Booking, meID 
 		case booking.StatusWaitlist:
 			place++
 			v.Reserve = append(v.Reserve, userView{
-				Name:  b.PlayerName,
-				Photo: photoOf(b.UserID, photos),
-				Me:    mine,
+				Name:      b.PlayerName,
+				Photo:     photoOf(b.UserID, photos),
+				Me:        mine,
+				BookingID: b.ID,
 			})
 			if mine {
 				v.Mine = &mineView{Status: string(booking.StatusWaitlist), Place: place}
@@ -735,6 +883,245 @@ func (h *handler) reservePlace(ctx context.Context, eventID, bookingID int64) in
 		}
 	}
 	return 0
+}
+
+// --- админские действия ---
+
+// adminLaunch authenticates a request and checks that the person administers the
+// chat: every action that changes a game goes through it, and the VK adapter
+// checks the rights again on its side.
+func (h *handler) adminLaunch(w http.ResponseWriter, r *http.Request) (launchParams, chat.Chat, chat.User, bool) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "нужен POST")
+		return launchParams{}, chat.Chat{}, chat.User{}, false
+	}
+	lp, ok := h.launchParams(w, r)
+	if !ok {
+		return launchParams{}, chat.Chat{}, chat.User{}, false
+	}
+	// Без бота менять игры негде: строку в чат и анонс делает его адаптер.
+	if h.deps.Chat == nil {
+		writeError(w, http.StatusConflict, "бот не настроен на сервере: менять игры из приложения нельзя")
+		return launchParams{}, chat.Chat{}, chat.User{}, false
+	}
+
+	ctx := r.Context()
+	ch, me, err := h.resolve(ctx, lp)
+	if err != nil {
+		h.writeResolveError(w, err)
+		return launchParams{}, chat.Chat{}, chat.User{}, false
+	}
+
+	admin, err := h.deps.Chats.IsChatAdmin(ctx, ch.ID, me.ID)
+	if err != nil {
+		h.writeServerError(w, err)
+		return launchParams{}, chat.Chat{}, chat.User{}, false
+	}
+	if !admin {
+		h.log.Printf("miniapp: admin action refused: chat=%d user=%d", ch.ID, me.ID)
+		writeError(w, http.StatusForbidden, "это может делать только администратор беседы")
+		return launchParams{}, chat.Chat{}, chat.User{}, false
+	}
+	if h.appSecret == "" {
+		// Подпись не проверяется: в разработке допустимо, но в логе остаётся.
+		h.log.Printf("miniapp: admin action without sign check: chat=%d user=%d", ch.ID, me.ID)
+	}
+	return lp, ch, me, true
+}
+
+// gameForm is what the create and edit forms post: the date and the time as the
+// input fields give them, the rest as text.
+type gameForm struct {
+	EventID  int64  `json:"event_id"`
+	Title    string `json:"title"`
+	Date     string `json:"date"` // 2006-01-02
+	Time     string `json:"time"` // 15:04
+	Location string `json:"location"`
+	Capacity int    `json:"capacity"`
+}
+
+// startsAt reads the date and the time in the chat's timezone: a phone may be in
+// any zone, while the game time belongs to the chat.
+func (h *handler) startsAt(f gameForm) (time.Time, error) {
+	date := strings.TrimSpace(f.Date)
+	clock := strings.TrimSpace(f.Time)
+	if clock == "" {
+		clock = fmt.Sprintf("%02d:00", defaultHour)
+	}
+	at, err := time.ParseInLocation("2006-01-02 15:04", date+" "+clock, h.loc)
+	if err != nil {
+		return time.Time{}, errors.New("не понял дату и время: нужны 2026-09-27 и 19:00")
+	}
+	return at, nil
+}
+
+func (h *handler) titleOr(title string) string {
+	if strings.TrimSpace(title) == "" {
+		return defaultTitle
+	}
+	return strings.TrimSpace(title)
+}
+
+func capacityOr(capacity int) int {
+	if capacity < 1 {
+		return defaultCapacity
+	}
+	return capacity
+}
+
+// decodeForm reads the JSON body of an admin form.
+func decodeForm(w http.ResponseWriter, r *http.Request, form any) bool {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(form); err != nil {
+		writeError(w, http.StatusBadRequest, "не понял запрос")
+		return false
+	}
+	return true
+}
+
+// writeAdminError turns the domain and adapter errors of an admin action into
+// answers the app can show as is.
+func (h *handler) writeAdminError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, chat.ErrNotAdmin):
+		writeError(w, http.StatusForbidden, "это может делать только администратор беседы")
+	case errors.Is(err, event.ErrCapacityBelowConfirmed):
+		writeError(w, http.StatusConflict, "меньше мест, чем уже занято, поставить нельзя — снимите кого-нибудь")
+	case errors.Is(err, event.ErrAlreadyCancelled):
+		writeError(w, http.StatusConflict, "игра уже отменена")
+	case errors.Is(err, event.ErrNotFound):
+		writeError(w, http.StatusNotFound, "игра не найдена")
+	case errors.Is(err, booking.ErrNotFound), errors.Is(err, booking.ErrNotActive):
+		writeError(w, http.StatusConflict, "такой записи уже нет")
+	default:
+		h.writeServerError(w, err)
+	}
+}
+
+// apiGameCreate starts a game: the announcement goes to the chat and the sign-up
+// keyboard appears under the input — the same as «/старт».
+func (h *handler) apiGameCreate(w http.ResponseWriter, r *http.Request) {
+	lp, ch, me, ok := h.adminLaunch(w, r)
+	if !ok {
+		return
+	}
+	var form gameForm
+	if !decodeForm(w, r, &form) {
+		return
+	}
+	at, err := h.startsAt(form)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ev, err := h.deps.Chat.StartGameInChat(r.Context(), lp.peerID(), me.ID, event.CreateInput{
+		ChatID:   ch.ID,
+		StartsAt: at,
+		Title:    h.titleOr(form.Title),
+		Location: strings.TrimSpace(form.Location),
+		Capacity: capacityOr(form.Capacity),
+	})
+	if err != nil {
+		h.writeAdminError(w, err)
+		return
+	}
+	h.log.Printf("miniapp: game %d started by user %d (%s)", ev.ID, me.ID, at.Format(time.RFC3339))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "event_id": ev.ID, "when": fullWhen(ev.StartsAt.In(h.loc)),
+	})
+}
+
+// apiGameEdit moves or re-arranges a game.
+func (h *handler) apiGameEdit(w http.ResponseWriter, r *http.Request) {
+	lp, ch, me, ok := h.adminLaunch(w, r)
+	if !ok {
+		return
+	}
+	var form gameForm
+	if !decodeForm(w, r, &form) {
+		return
+	}
+	if form.EventID <= 0 {
+		writeError(w, http.StatusBadRequest, "не понятно, какую игру менять")
+		return
+	}
+	at, err := h.startsAt(form)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	updated, err := h.deps.Chat.UpdateGameInChat(r.Context(), lp.peerID(), me.ID, event.UpdateInput{
+		ChatID:   ch.ID,
+		EventID:  form.EventID,
+		StartsAt: at,
+		Title:    h.titleOr(form.Title),
+		Location: strings.TrimSpace(form.Location),
+		Capacity: capacityOr(form.Capacity),
+	})
+	if err != nil {
+		h.writeAdminError(w, err)
+		return
+	}
+	h.log.Printf("miniapp: game %d edited by user %d (%s)", updated.ID, me.ID, at.Format(time.RFC3339))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "event_id": updated.ID, "when": fullWhen(updated.StartsAt.In(h.loc)),
+	})
+}
+
+// apiGameCancel calls a game off and drops its bookings.
+func (h *handler) apiGameCancel(w http.ResponseWriter, r *http.Request) {
+	lp, ch, me, ok := h.adminLaunch(w, r)
+	if !ok {
+		return
+	}
+	eventID, err := eventIDFrom(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "не понятно, какую игру отменять")
+		return
+	}
+
+	cancelled, err := h.deps.Chat.CancelGameInChat(r.Context(), lp.peerID(), ch.ID, me.ID, eventID)
+	if err != nil {
+		h.writeAdminError(w, err)
+		return
+	}
+	h.log.Printf("miniapp: game %d cancelled by user %d", cancelled.ID, me.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "event_id": cancelled.ID})
+}
+
+// apiRemoveBooking takes a participant out of a game: the chat sees whose seat it
+// was and who came up from the reserve.
+func (h *handler) apiRemoveBooking(w http.ResponseWriter, r *http.Request) {
+	lp, ch, me, ok := h.adminLaunch(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		EventID   int64 `json:"event_id"`
+		BookingID int64 `json:"booking_id"`
+	}
+	if !decodeForm(w, r, &body) {
+		return
+	}
+	if body.EventID <= 0 || body.BookingID <= 0 {
+		writeError(w, http.StatusBadRequest, "не понятно, кого снимать")
+		return
+	}
+
+	res, err := h.deps.Chat.RemoveBookingInChat(r.Context(), lp.peerID(), ch.ID, me.ID, body.EventID, body.BookingID)
+	if err != nil {
+		h.writeAdminError(w, err)
+		return
+	}
+	h.log.Printf("miniapp: booking %d removed from game %d by user %d", body.BookingID, body.EventID, me.ID)
+
+	out := map[string]any{"ok": true}
+	if res.Promoted != nil {
+		out["promoted"] = fmt.Sprintf("%d - %s", seatOf(*res.Promoted), res.Promoted.PlayerName)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // eventIDFrom reads the game an action belongs to: the app posts it as JSON, but

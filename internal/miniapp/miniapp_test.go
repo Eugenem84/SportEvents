@@ -17,6 +17,7 @@ import (
 	"sportevents.local/internal/chat"
 	"sportevents.local/internal/event"
 	"sportevents.local/internal/miniapp"
+	"sportevents.local/internal/schedule"
 )
 
 // These tests exercise both pages of the mini app without VK and without
@@ -28,6 +29,8 @@ import (
 
 type fakeChats struct {
 	chat *chat.Chat
+	// admin is what IsChatAdmin answers: the admin tests flip it.
+	admin bool
 }
 
 func (f *fakeChats) FindByChannel(_ context.Context, platform, externalChatID string) (*chat.Chat, error) {
@@ -35,6 +38,10 @@ func (f *fakeChats) FindByChannel(_ context.Context, platform, externalChatID st
 		return nil, nil
 	}
 	return f.chat, nil
+}
+
+func (f *fakeChats) IsChatAdmin(_ context.Context, chatID, userID int64) (bool, error) {
+	return f.admin, nil
 }
 
 func (f *fakeChats) FindOrCreateUserByExternalID(_ context.Context, platform, externalUserID, displayName string) (chat.User, error) {
@@ -117,6 +124,21 @@ type fakeSyncer struct {
 	bookRes   booking.Booking
 	cancel    booking.CancelResult
 	cancelErr error
+
+	// Админские действия: что просили и что адаптер ответил.
+	adminUser     int64
+	started       []event.CreateInput
+	startRes      event.Event
+	startErr      error
+	edited        []event.UpdateInput
+	editRes       event.Event
+	editErr       error
+	cancelled     []int64
+	cancelGameRes event.Event
+	cancelGameErr error
+	removed       [][2]int64
+	removeRes     booking.CancelResult
+	removeErr     error
 }
 
 func (f *fakeSyncer) BookInChat(_ context.Context, peerID, chatID, eventID int64, user chat.User) (booking.Booking, error) {
@@ -130,6 +152,67 @@ func (f *fakeSyncer) CancelInChat(_ context.Context, peerID, chatID, eventID, us
 	return f.cancel, f.cancelErr
 }
 
+func (f *fakeSyncer) StartGameInChat(_ context.Context, peerID, userID int64, in event.CreateInput) (event.Event, error) {
+	f.peerID, f.adminUser = peerID, userID
+	f.started = append(f.started, in)
+	if f.startErr != nil {
+		return event.Event{}, f.startErr
+	}
+	if f.startRes.ID != 0 {
+		return f.startRes, nil
+	}
+	return event.Event{
+		ID: 100, ChatID: in.ChatID, StartsAt: in.StartsAt, Title: in.Title,
+		Location: in.Location, Capacity: in.Capacity, Status: event.StatusScheduled,
+	}, nil
+}
+
+func (f *fakeSyncer) UpdateGameInChat(_ context.Context, peerID, userID int64, in event.UpdateInput) (event.Event, error) {
+	f.peerID, f.adminUser = peerID, userID
+	f.edited = append(f.edited, in)
+	if f.editErr != nil {
+		return event.Event{}, f.editErr
+	}
+	if f.editRes.ID != 0 {
+		return f.editRes, nil
+	}
+	return event.Event{
+		ID: in.EventID, ChatID: in.ChatID, StartsAt: in.StartsAt, Title: in.Title,
+		Location: in.Location, Capacity: in.Capacity, Status: event.StatusScheduled,
+	}, nil
+}
+
+func (f *fakeSyncer) CancelGameInChat(_ context.Context, peerID, chatID, userID, eventID int64) (event.Event, error) {
+	f.peerID, f.chatID, f.adminUser = peerID, chatID, userID
+	f.cancelled = append(f.cancelled, eventID)
+	if f.cancelGameErr != nil {
+		return event.Event{}, f.cancelGameErr
+	}
+	if f.cancelGameRes.ID != 0 {
+		return f.cancelGameRes, nil
+	}
+	return event.Event{ID: eventID, ChatID: chatID, Status: event.StatusCancelled}, nil
+}
+
+func (f *fakeSyncer) RemoveBookingInChat(_ context.Context, peerID, chatID, userID, eventID, bookingID int64) (booking.CancelResult, error) {
+	f.peerID, f.chatID, f.adminUser = peerID, chatID, userID
+	f.removed = append(f.removed, [2]int64{eventID, bookingID})
+	if f.removeErr != nil {
+		return booking.CancelResult{}, f.removeErr
+	}
+	return f.removeRes, nil
+}
+
+// fakeSchedule is the regular game times of a chat.
+type fakeSchedule struct {
+	slots []schedule.Slot
+	err   error
+}
+
+func (f *fakeSchedule) List(_ context.Context, chatID int64) ([]schedule.Slot, error) {
+	return f.slots, f.err
+}
+
 // --- harness ---
 
 type harness struct {
@@ -137,6 +220,7 @@ type harness struct {
 	chats    *fakeChats
 	events   *fakeEvents
 	bookings *fakeBookings
+	schedule *fakeSchedule
 	names    *fakeNames
 	photos   *fakePhotos
 	sync     *fakeSyncer
@@ -156,9 +240,10 @@ func newHarness(t *testing.T, chatLinked bool) *harness {
 func newHarnessWithSecret(t *testing.T, chatLinked bool, appSecret string) *harness {
 	t.Helper()
 	h := &harness{
-		chats:    &fakeChats{},
+		chats:    &fakeChats{admin: true},
 		events:   &fakeEvents{byID: map[int64]event.Event{}},
 		bookings: &fakeBookings{byEvent: map[int64][]booking.Booking{}},
+		schedule: &fakeSchedule{},
 		names:    &fakeNames{name: "Евгений Мёдов"},
 		photos:   &fakePhotos{photos: map[int64]string{}},
 		sync:     &fakeSyncer{},
@@ -179,6 +264,7 @@ func newHarnessWithSecret(t *testing.T, chatLinked bool, appSecret string) *harn
 		Identities: h.chats,
 		Events:     h.events,
 		Bookings:   h.bookings,
+		Schedule:   h.schedule,
 		Names:      h.names,
 		Photos:     h.photos,
 		Chat:       h.sync,
@@ -258,6 +344,10 @@ func TestAppPageIsServed(t *testing.T) {
 		"api('state')",                 // страница знает, куда спрашивать состояние
 		"/app/debug/",                  // и где теперь живёт диагностика
 		"Записаться",                   // кнопку записи рисует скрипт
+		"Создать игру",                 // админская форма создания
+		"Отменить игру",                // и отмена игры
+		"game/edit",                    // правка игры
+		"remove",                       // снятие участника
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page does not contain %q", want)
@@ -726,6 +816,255 @@ func TestBookingNeedsPostAndGameID(t *testing.T) {
 	}
 	if code, _ := do(t, h.app, http.MethodPost, "/app/api/attend?vk_user_id=42&vk_chat_id=47", `{}`); code != http.StatusBadRequest {
 		t.Errorf("without event_id: status %d, want 400", code)
+	}
+}
+
+// --- админские действия ---
+
+// Администратор видит формы: флаг, предзаполнение из расписания и id записей,
+// чтобы человека можно было снять.
+func TestStateGivesTheAdminWhatTheFormsNeed(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.schedule.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
+
+	code, body := do(t, h.app, http.MethodGet, "/app/api/state?vk_user_id=42&vk_chat_id=47", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+
+	var got struct {
+		Admin bool `json:"admin"`
+		Games []struct {
+			Lineup []struct {
+				BookingID int64 `json:"booking_id"`
+			} `json:"lineup"`
+		} `json:"games"`
+		NextGame *struct {
+			Date     string `json:"date"`
+			Time     string `json:"time"`
+			Title    string `json:"title"`
+			Capacity int    `json:"capacity"`
+		} `json:"next_game"`
+		Schedule []struct {
+			Weekday string `json:"weekday"`
+			Time    string `json:"time"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("state json: %v (%q)", err, body)
+	}
+
+	if !got.Admin {
+		t.Fatal("the administrator must see the admin flag")
+	}
+	// Расписание чата (вс 10:00) задаёт предзаполнение: ближайшее воскресенье.
+	if got.NextGame == nil {
+		t.Fatal("next_game must come to an administrator")
+	}
+	if got.NextGame.Date != "2026-09-27" || got.NextGame.Time != "10:00" {
+		t.Fatalf("next_game: %+v", got.NextGame)
+	}
+	if got.NextGame.Title != "Волейбол" || got.NextGame.Capacity != 12 {
+		t.Fatalf("defaults: %+v", got.NextGame)
+	}
+	if len(got.Schedule) != 1 || got.Schedule[0].Weekday != "вс" || got.Schedule[0].Time != "10:00" {
+		t.Fatalf("schedule: %+v", got.Schedule)
+	}
+	if len(got.Games) != 1 || len(got.Games[0].Lineup) == 0 || got.Games[0].Lineup[0].BookingID == 0 {
+		t.Fatalf("booking ids are needed to remove someone: %+v", got.Games)
+	}
+}
+
+// Обычный участник не получает ни флага, ни предзаполнения форм.
+func TestStateHidesAdminPayloadFromParticipants(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.chats.admin = false
+
+	code, body := do(t, h.app, http.MethodGet, "/app/api/state?vk_user_id=42&vk_chat_id=47", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if strings.Contains(body, `"admin":true`) {
+		t.Fatalf("participant must not be admin: %s", body)
+	}
+	if strings.Contains(body, "next_game") {
+		t.Fatalf("no create form for a participant: %s", body)
+	}
+}
+
+// «Создать игру» из приложения: дата и время читаются в зоне беседы, пустые
+// название и вместимость берут умолчания бота.
+func TestAdminCreatesGameFromTheApp(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/game?vk_user_id=42&vk_chat_id=47",
+		`{"date":"2026-09-27","time":"19:00","location":"СК «Спартак»"}`)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if len(h.sync.started) != 1 {
+		t.Fatalf("the adapter must be asked to start the game: %+v", h.sync.started)
+	}
+
+	in := h.sync.started[0]
+	if in.ChatID != 1 {
+		t.Errorf("chat: %d", in.ChatID)
+	}
+	want := time.Date(2026, 9, 27, 19, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	if !in.StartsAt.Equal(want) {
+		t.Errorf("starts_at: %s, want %s (зона беседы, не телефона)", in.StartsAt, want)
+	}
+	if in.Title != "Волейбол" || in.Capacity != 12 {
+		t.Errorf("defaults: %+v", in)
+	}
+	if in.Location != "СК «Спартак»" {
+		t.Errorf("location: %q", in.Location)
+	}
+	if h.sync.peerID != 2000000047 || h.sync.adminUser != 7 {
+		t.Errorf("peer/user: %d/%d", h.sync.peerID, h.sync.adminUser)
+	}
+	if !strings.Contains(body, `"ok":true`) || !strings.Contains(body, "27 сентября, 19:00") {
+		t.Errorf("answer: %s", body)
+	}
+}
+
+// Правка игры: то, что администратор задал в форме, доходит до адаптера.
+func TestAdminEditsGameFromTheApp(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/game/edit?vk_user_id=42&vk_chat_id=47",
+		`{"event_id":7,"date":"2026-09-28","time":"19:30","title":"Волейбол на траве","location":"СК «Спартак»","capacity":8}`)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if len(h.sync.edited) != 1 {
+		t.Fatalf("edited: %+v", h.sync.edited)
+	}
+
+	in := h.sync.edited[0]
+	if in.EventID != 7 || in.ChatID != 1 || in.Title != "Волейбол на траве" || in.Capacity != 8 {
+		t.Fatalf("update input: %+v", in)
+	}
+	want := time.Date(2026, 9, 28, 19, 30, 0, 0, time.FixedZone("MSK", 3*60*60))
+	if !in.StartsAt.Equal(want) {
+		t.Errorf("starts_at: %s, want %s", in.StartsAt, want)
+	}
+}
+
+// Кривая дата — 400, и до адаптера дело не доходит.
+func TestAdminFormRefusesBadDate(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/game?vk_user_id=42&vk_chat_id=47",
+		`{"date":"27 сентября","time":"19:00"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if len(h.sync.started) != 0 {
+		t.Fatalf("nothing must be created: %+v", h.sync.started)
+	}
+}
+
+// Отмена игры и снятие человека из приложения.
+func TestAdminCancelsGameAndRemovesParticipant(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/game/cancel?vk_user_id=42&vk_chat_id=47", `{"event_id":7}`)
+	if code != http.StatusOK {
+		t.Fatalf("cancel: status %d (%s)", code, body)
+	}
+	if len(h.sync.cancelled) != 1 || h.sync.cancelled[0] != 7 {
+		t.Fatalf("cancelled: %+v", h.sync.cancelled)
+	}
+
+	seat := 1
+	h.sync.removeRes = booking.CancelResult{
+		Cancelled: booking.Booking{ID: 100, EventID: 7, PlayerName: "Пётр", SeatNo: &seat, Status: booking.StatusCancelled},
+		Promoted:  &booking.Booking{ID: 102, EventID: 7, PlayerName: "Иван", SeatNo: &seat, Status: booking.StatusConfirmed},
+	}
+	code, body = do(t, h.app, http.MethodPost, "/app/api/remove?vk_user_id=42&vk_chat_id=47", `{"event_id":7,"booking_id":100}`)
+	if code != http.StatusOK {
+		t.Fatalf("remove: status %d (%s)", code, body)
+	}
+	if len(h.sync.removed) != 1 || h.sync.removed[0] != [2]int64{7, 100} {
+		t.Fatalf("removed: %+v", h.sync.removed)
+	}
+	if !strings.Contains(body, "1 - Иван") {
+		t.Errorf("the promotion must be visible: %s", body)
+	}
+}
+
+// Участник не может ни создать игру, ни отменить её, ни снять человека: 403 на
+// все ручки, и адаптер не трогают.
+func TestAdminEndpointsAreRefusedToParticipants(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.chats.admin = false
+
+	cases := []struct{ name, target, body string }{
+		{"create", "/app/api/game", `{"date":"2026-09-27","time":"19:00"}`},
+		{"edit", "/app/api/game/edit", `{"event_id":7,"date":"2026-09-27","time":"19:00"}`},
+		{"cancel", "/app/api/game/cancel", `{"event_id":7}`},
+		{"remove", "/app/api/remove", `{"event_id":7,"booking_id":100}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, body := do(t, h.app, http.MethodPost, tc.target+"?vk_user_id=42&vk_chat_id=47", tc.body)
+			if code != http.StatusForbidden {
+				t.Fatalf("status: %d (%s)", code, body)
+			}
+			if !strings.Contains(body, "администратор") {
+				t.Errorf("answer: %s", body)
+			}
+		})
+	}
+
+	if len(h.sync.started)+len(h.sync.edited)+len(h.sync.cancelled)+len(h.sync.removed) != 0 {
+		t.Fatalf("nothing must reach the adapter: %+v", h.sync)
+	}
+	if !strings.Contains(h.logs.String(), "admin action refused") {
+		t.Errorf("the refusal must be logged: %q", h.logs.String())
+	}
+}
+
+// Пока защищённый ключ не задан, админское действие разрешено, но след в логе
+// остаётся: видно, что подпись не проверялась.
+func TestAdminActionWithoutKeyIsLogged(t *testing.T) {
+	h := newHarness(t, true)
+
+	if code, body := do(t, h.app, http.MethodPost, "/app/api/game?vk_user_id=42&vk_chat_id=47",
+		`{"date":"2026-09-27","time":"19:00"}`); code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if !strings.Contains(h.logs.String(), "without sign check") {
+		t.Fatalf("log: %q", h.logs.String())
+	}
+}
+
+// С настроенным ключом подпись проверяется, и это же действие проходит по
+// официальной подписи из документации VK: наш собственный параметр (беседа в
+// хеше) в подпись не входит.
+func TestAdminActionWithKeyIsNotFlagged(t *testing.T) {
+	h := newHarnessWithSecret(t, true, "wvl68m4dR1UpLrVRli")
+
+	const signed = "vk_user_id=494075&vk_app_id=6736218&vk_is_app_user=1" +
+		"&vk_are_notifications_enabled=1&vk_language=ru&vk_access_token_settings=" +
+		"&vk_platform=android&hash=peer%3D2000000047" +
+		"&sign=htQFduJpLxz7ribXRZpDFUH-XEUhC9rBPTJkjUFEkRA"
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/game?"+signed, `{"date":"2026-09-27","time":"19:00"}`)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if len(h.sync.started) != 1 {
+		t.Fatalf("started: %+v", h.sync.started)
+	}
+	if strings.Contains(h.logs.String(), "without sign check") {
+		t.Fatalf("the sign was verified, nothing to flag: %q", h.logs.String())
 	}
 }
 

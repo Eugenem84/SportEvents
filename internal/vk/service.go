@@ -73,11 +73,14 @@ type UserStore interface {
 }
 
 // EventStore is the event side of the bot: creating games, listing them with
-// their counters, and calling a game off.
+// their counters, editing them and calling a game off.
 type EventStore interface {
 	Create(ctx context.Context, in event.CreateInput) (event.Event, error)
 	Get(ctx context.Context, chatID, eventID int64) (event.Event, error)
 	ListUpcomingWithCounts(ctx context.Context, chatID int64, from time.Time, limit int) ([]event.EventSummary, error)
+	// Update applies an administrator's changes to a game: title, place, start
+	// and capacity go together (see event.UpdateInput).
+	Update(ctx context.Context, in event.UpdateInput) (event.Event, error)
 	// Cancel calls a game off; ErrAlreadyCancelled means it was off already.
 	Cancel(ctx context.Context, chatID, eventID int64) (event.Event, error)
 }
@@ -586,7 +589,7 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 		if posted {
 			return s.sendText(ctx, c.chat.ID, c.peerID, note, "")
 		}
-		return s.announceGame(ctx, c, existing.Event, note)
+		return s.announceGame(ctx, c.chat.ID, c.peerID, existing.Event, note)
 	}
 
 	ev, err := s.events.Create(ctx, event.CreateInput{
@@ -599,7 +602,7 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 	if err != nil {
 		return fmt.Errorf("create event: %w", err)
 	}
-	return s.announceGame(ctx, c, ev, "")
+	return s.announceGame(ctx, c.chat.ID, c.peerID, ev, "")
 }
 
 // handleCancelGame calls a whole game off (admins only): the game stops taking
@@ -621,35 +624,22 @@ func (s *Service) handleCancelGame(ctx context.Context, c *commandCtx) error {
 		return s.noGameToCancel(ctx, c)
 	}
 
-	cancelled, err := s.events.Cancel(ctx, c.chat.ID, ev.ID)
-	switch {
-	case errors.Is(err, event.ErrAlreadyCancelled):
-		if c.vkEventID != "" {
-			return s.notify(ctx, c, "Игра уже отменена")
+	// Сам разбор и сообщение в беседу — в CancelGameInChat: то же самое делает
+	// мини-приложение, и пути расходиться не должны.
+	if _, err := s.CancelGameInChat(ctx, c.peerID, c.chat.ID, c.user.ID, ev.ID); err != nil {
+		switch {
+		case errors.Is(err, event.ErrAlreadyCancelled):
+			if c.vkEventID != "" {
+				return s.notify(ctx, c, "Игра уже отменена")
+			}
+			return s.sendText(ctx, c.chat.ID, c.peerID,
+				fmt.Sprintf("Игра на %s уже отменена.", s.formatWhenShort(ev.StartsAt)), "")
+		case errors.Is(err, chat.ErrNotAdmin):
+			// Права уже проверены requireAdmin выше: сюда не попадаем.
+			return nil
+		default:
+			return err
 		}
-		return s.sendText(ctx, c.chat.ID, c.peerID,
-			fmt.Sprintf("Игра на %s уже отменена.", s.formatWhenShort(ev.StartsAt)), "")
-	case err != nil:
-		return fmt.Errorf("cancel event: %w", err)
-	}
-
-	// Снимаем все записи: игра не состоится, «записанным» на неё оставаться
-	// нельзя. Из резерва при этом никто не поднимается — поднимать некуда.
-	removed, err := s.bookings.CancelAllForEvent(ctx, cancelled.ID)
-	if err != nil {
-		return fmt.Errorf("cancel bookings: %w", err)
-	}
-
-	line := fmt.Sprintf("❌ Игра на %s отменена.", s.formatWhenShort(cancelled.StartsAt))
-	switch {
-	case removed == 1:
-		line += " Снял одну запись."
-	case removed > 1:
-		line += fmt.Sprintf(" Снял записи: %d.", removed)
-	}
-	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, cancelled.ID)
-	if err := s.sendText(ctx, c.chat.ID, c.peerID, line, ""); err != nil {
-		return err
 	}
 	return s.notify(ctx, c, "Игра отменена")
 }
@@ -728,7 +718,7 @@ func (s *Service) noGameToCancel(ctx context.Context, c *commandCtx) error {
 // conversation messages.send names conversation_message_id right away (the
 // message is sent with peer_ids), so the roster is rewritten in place from the
 // first booking on — the announcement needs no button of its own for that.
-func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Event, note string) error {
+func (s *Service) announceGame(ctx context.Context, chatID, peerID int64, ev event.Event, note string) error {
 	confirmed, waitlist, err := s.roster(ctx, ev)
 	if err != nil {
 		return err
@@ -738,14 +728,14 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 	if err != nil {
 		return err
 	}
-	msgID, err := s.messenger.SendMessage(ctx, c.peerID, text, kb)
+	msgID, err := s.messenger.SendMessage(ctx, peerID, text, kb)
 	if err != nil {
 		return fmt.Errorf("send announcement: %w", err)
 	}
 	if msgID == 0 {
 		// Запасной путь: VK не назвал id при отправке — читаем id последнего
 		// сообщения беседы, ведь только что отправленный анонс и есть последнее.
-		last, err := s.messenger.LastOwnConversationMessageID(ctx, c.peerID)
+		last, err := s.messenger.LastOwnConversationMessageID(ctx, peerID)
 		switch {
 		case err != nil:
 			s.log.Printf("vk: cannot read the announcement id of game %d: %v", ev.ID, err)
@@ -756,7 +746,7 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 	if err := s.announces.Save(ctx, announce.Ref{
 		EventID:        ev.ID,
 		Platform:       chat.PlatformVK,
-		ExternalChatID: strconv.FormatInt(c.peerID, 10),
+		ExternalChatID: strconv.FormatInt(peerID, 10),
 		MessageID:      msgID,
 	}); err != nil {
 		return fmt.Errorf("save announcement: %w", err)
@@ -766,18 +756,18 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 	// перепиской. VK разрешает это владельцу беседы; сообществу, которое в
 	// беседе лишь администратор, он отвечает 925 — тогда закрепляет
 	// администратор вручную, а бот продолжает обновлять то же сообщение.
-	s.pinAnnouncement(ctx, c.peerID, ev.ID, msgID)
+	s.pinAnnouncement(ctx, peerID, ev.ID, msgID)
 
 	// Открытие записи — это и повод показать кнопки «Иду» / «Не иду» под полем
 	// ввода: клавиатуру беседы держит последнее сообщение бота.
 	if note == "" {
 		note = fmt.Sprintf("Запись открыта: %s.", s.formatWhenFull(ev.StartsAt))
 	}
-	signUp, err := s.signUpKeyboard(c.peerID)
+	signUp, err := s.signUpKeyboard(peerID)
 	if err != nil {
 		return err
 	}
-	return s.sendText(ctx, c.chat.ID, c.peerID, note, signUp)
+	return s.sendText(ctx, chatID, peerID, note, signUp)
 }
 
 // roster returns the lineup and the reserve of a game. Для отменённой игры
@@ -1253,6 +1243,158 @@ func (s *Service) CancelInChat(ctx context.Context, peerID, chatID, eventID, use
 		return res, err
 	}
 	return res, nil
+}
+
+// requireChatAdmin is the rights check of the actions the mini app performs on
+// behalf of an administrator. The bot goes through requireAdmin, which also
+// posts the refusal to the chat; here the answer goes to the app, so a plain
+// error is enough.
+func (s *Service) requireChatAdmin(ctx context.Context, chatID, userID int64) error {
+	admin, err := s.chats.IsChatAdmin(ctx, chatID, userID)
+	if err != nil {
+		return fmt.Errorf("check chat admin: %w", err)
+	}
+	if !admin {
+		return chat.ErrNotAdmin
+	}
+	return nil
+}
+
+// StartGameInChat creates a game on behalf of the mini app and opens its sign-up:
+// the announcement goes to the chat, is pinned when VK allows it, and the sign-up
+// keyboard appears under the input — the same path «/старт» takes, so the two
+// entry points cannot drift apart. Only a chat administrator may do it.
+//
+// A game already starting at that exact time is not duplicated: it is updated
+// with what the administrator just set (the chat should keep one announcement).
+func (s *Service) StartGameInChat(ctx context.Context, peerID, userID int64, in event.CreateInput) (event.Event, error) {
+	if err := s.requireChatAdmin(ctx, in.ChatID, userID); err != nil {
+		return event.Event{}, err
+	}
+
+	existing, found, err := s.findGameAt(ctx, in.ChatID, in.StartsAt)
+	if err != nil {
+		return event.Event{}, err
+	}
+	if found {
+		return s.applyGameUpdate(ctx, peerID, event.UpdateInput{
+			ChatID:   in.ChatID,
+			EventID:  existing.ID,
+			Title:    in.Title,
+			Location: in.Location,
+			StartsAt: in.StartsAt,
+			Capacity: in.Capacity,
+		})
+	}
+
+	ev, err := s.events.Create(ctx, in)
+	if err != nil {
+		return event.Event{}, fmt.Errorf("create event: %w", err)
+	}
+	if err := s.announceGame(ctx, in.ChatID, peerID, ev, ""); err != nil {
+		return ev, err
+	}
+	return ev, nil
+}
+
+// UpdateGameInChat applies an administrator's changes to a game on behalf of the
+// mini app and rewrites the announcement: the time, the place and the roster in
+// it are what the chat reads. Only a chat administrator may do it.
+func (s *Service) UpdateGameInChat(ctx context.Context, peerID, userID int64, in event.UpdateInput) (event.Event, error) {
+	if err := s.requireChatAdmin(ctx, in.ChatID, userID); err != nil {
+		return event.Event{}, err
+	}
+	return s.applyGameUpdate(ctx, peerID, in)
+}
+
+// applyGameUpdate stores the changes and shows them to the chat. The announcement
+// carries the roster, so it is always rewritten after an edit — но строку в чат
+// правка не добавляет: беседа не должна превращаться в поток «игру перенесли».
+func (s *Service) applyGameUpdate(ctx context.Context, peerID int64, in event.UpdateInput) (event.Event, error) {
+	updated, err := s.events.Update(ctx, in)
+	if err != nil {
+		return event.Event{}, err
+	}
+	s.refreshAnnouncementLogged(ctx, in.ChatID, peerID, updated.ID)
+	return updated, nil
+}
+
+// CancelGameInChat calls a game off on behalf of the mini app: the game stops
+// taking bookings, nobody stays «записанным» for a game that will not happen, and
+// the announcement turns into the cancelled form. Only a chat administrator may
+// do it. event.ErrAlreadyCancelled means the game was off already.
+func (s *Service) CancelGameInChat(ctx context.Context, peerID, chatID, userID, eventID int64) (event.Event, error) {
+	if err := s.requireChatAdmin(ctx, chatID, userID); err != nil {
+		return event.Event{}, err
+	}
+
+	cancelled, err := s.events.Cancel(ctx, chatID, eventID)
+	if err != nil {
+		if errors.Is(err, event.ErrAlreadyCancelled) {
+			return event.Event{}, err
+		}
+		return event.Event{}, fmt.Errorf("cancel event: %w", err)
+	}
+
+	// Снимаем все записи: игра не состоится, «записанным» на неё оставаться
+	// нельзя. Из резерва при этом никто не поднимается — поднимать некуда.
+	removed, err := s.bookings.CancelAllForEvent(ctx, cancelled.ID)
+	if err != nil {
+		return event.Event{}, fmt.Errorf("cancel bookings: %w", err)
+	}
+
+	line := fmt.Sprintf("❌ Игра на %s отменена.", s.formatWhenShort(cancelled.StartsAt))
+	switch {
+	case removed == 1:
+		line += " Снял одну запись."
+	case removed > 1:
+		line += fmt.Sprintf(" Снял записи: %d.", removed)
+	}
+	s.refreshAnnouncementLogged(ctx, chatID, peerID, cancelled.ID)
+	if err := s.sendText(ctx, chatID, peerID, line, ""); err != nil {
+		return cancelled, err
+	}
+	return cancelled, nil
+}
+
+// RemoveBookingInChat takes a participant out of a game on behalf of an
+// administrator and tells the chat: whose seat it was, who came up from the
+// reserve, and the rewritten announcement. Both a lineup seat and a place in the
+// reserve can be taken away. booking.ErrNotFound means there is no such booking.
+func (s *Service) RemoveBookingInChat(ctx context.Context, peerID, chatID, userID, eventID, bookingID int64) (booking.CancelResult, error) {
+	if err := s.requireChatAdmin(ctx, chatID, userID); err != nil {
+		return booking.CancelResult{}, err
+	}
+
+	res, err := s.bookings.Cancel(ctx, eventID, bookingID)
+	if err != nil {
+		return booking.CancelResult{}, fmt.Errorf("cancel booking: %w", err)
+	}
+
+	line := removalLine(res.Cancelled)
+	if res.Promoted != nil {
+		seat := 0
+		if res.Promoted.SeatNo != nil {
+			seat = *res.Promoted.SeatNo
+		}
+		line += fmt.Sprintf("\n%d - %s из резерва", seat, res.Promoted.PlayerName)
+	}
+
+	s.refreshAnnouncementLogged(ctx, chatID, peerID, eventID)
+	if err := s.sendText(ctx, chatID, peerID, line, ""); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// removalLine is what the chat sees when an administrator takes someone out. The
+// wording keeps the «минус» the chat already knows and adds that it was not the
+// person's own decision; a booking without a seat number was in the reserve.
+func removalLine(b booking.Booking) string {
+	if b.SeatNo != nil {
+		return fmt.Sprintf("%d - %s минус (снято администратором)", *b.SeatNo, b.PlayerName)
+	}
+	return fmt.Sprintf("%s минус из резерва (снято администратором)", b.PlayerName)
 }
 
 // findActiveBooking returns the caller's active booking for the event in the

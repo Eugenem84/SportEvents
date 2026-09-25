@@ -100,6 +100,31 @@ a { color: var(--accent); text-decoration: none; }
 .btn[disabled] { opacity: .5; }
 .btn.bad { background: transparent; color: var(--bad); box-shadow: inset 0 0 0 1.5px var(--bad); }
 
+/* формы администратора */
+.grid { margin-top: 12px; }
+.cols { display: flex; gap: 8px; }
+.cols > * { flex: 1; min-width: 0; }
+.field { display: block; margin-bottom: 8px; }
+.field > span { display: block; margin-bottom: 4px; }
+input {
+  font: inherit; color: var(--text); background: var(--card-2); width: 100%;
+  border: 1px solid transparent; border-radius: 8px; padding: 9px 10px;
+}
+input:focus { border-color: var(--accent); outline: none; }
+.picks { display: flex; flex-wrap: wrap; }
+.chip {
+  font: inherit; font-size: 13px; color: var(--text); background: var(--card-2);
+  border: 0; border-radius: 999px; padding: 6px 12px; margin: 6px 6px 0 0; cursor: pointer;
+}
+.btn.ghost { background: var(--card-2); color: var(--text); font-weight: 500; }
+.edit-holder { margin-top: 4px; }
+/* «×» рядом с человеком: снять с игры (только администратору) */
+.x {
+  flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; border: 0;
+  background: transparent; color: var(--muted); font-size: 14px; line-height: 1; cursor: pointer;
+}
+.x:active { background: var(--card-2); color: var(--bad); }
+
 /* подвал */
 .foot { display: flex; justify-content: space-between; gap: 8px; padding: 4px 2px 0; }
 
@@ -238,7 +263,10 @@ a { color: var(--accent); text-decoration: none; }
       }
       return;
     }
-    games.forEach(function (g) { screen.appendChild(gameCard(g)); });
+    games.forEach(function (g) { screen.appendChild(gameCard(g, s.admin)); });
+    if (s.admin) {
+      screen.appendChild(createCard(s));
+    }
   }
 
   function renderError(err) {
@@ -280,7 +308,7 @@ a { color: var(--accent); text-decoration: none; }
 
   // gameCard — одна игра: когда, сколько мест, кто записан и что делать.
   // Своих кнопок у анонса в чате нет, а здесь есть: запись и отписка.
-  function gameCard(g) {
+  function gameCard(g, admin) {
     var box = document.createElement('section');
     box.className = 'card';
 
@@ -306,7 +334,7 @@ a { color: var(--accent); text-decoration: none; }
 
     var lineup = g.lineup || [];
     if (lineup.length) {
-      box.appendChild(roster(lineup, false));
+      box.appendChild(roster(lineup, false, admin, g.id));
     } else {
       box.appendChild(card('notice', 'Пока никто не записан'));
     }
@@ -314,7 +342,7 @@ a { color: var(--accent); text-decoration: none; }
     var reserve = g.reserve || [];
     if (reserve.length) {
       box.appendChild(label('Резерв'));
-      box.appendChild(roster(reserve, true));
+      box.appendChild(roster(reserve, true, admin, g.id));
     }
 
     if (g.mine) {
@@ -336,6 +364,10 @@ a { color: var(--accent); text-decoration: none; }
     row.className = 'actions';
     row.appendChild(btn);
     box.appendChild(row);
+
+    if (admin) {
+      box.appendChild(adminGameControls(g));
+    }
     return box;
   }
 
@@ -352,8 +384,9 @@ a { color: var(--accent); text-decoration: none; }
   }
 
   // roster — состав: номер места, аватарка, имя. Номера те же, что в беседе:
-  // свободный номер не сдвигает остальные.
-  function roster(list, reserve) {
+  // свободный номер не сдвигает остальные. Администратору рядом с человеком
+  // видна «×» — снять с игры.
+  function roster(list, reserve, admin, eventID) {
     var box = document.createElement('div');
     box.className = 'roster';
     list.forEach(function (p, i) {
@@ -370,9 +403,30 @@ a { color: var(--accent); text-decoration: none; }
       nm.className = 'nm';
       nm.textContent = p.me ? p.name + ' · вы' : p.name;
       row.appendChild(nm);
+
+      if (admin && p.booking_id) {
+        row.appendChild(removeButton(p, eventID));
+      }
       box.appendChild(row);
     });
     return box;
+  }
+
+  // removeButton снимает человека с игры: строка в чат и правка анонса — дело
+  // адаптера, приложение только просит.
+  function removeButton(person, eventID) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'x';
+    btn.title = 'Снять с игры';
+    btn.textContent = '✕';
+    btn.addEventListener('click', function () {
+      if (!window.confirm('Снять «' + person.name + '» с игры?')) {
+        return;
+      }
+      post('remove', { event_id: eventID, booking_id: person.booking_id }, btn, 'Снято с игры');
+    });
+    return btn;
   }
 
   // avatar показывает фотографию, а без неё — инициалы на цвете, посчитанном
@@ -406,6 +460,197 @@ a { color: var(--accent); text-decoration: none; }
       hash = (hash * 31 + name.charCodeAt(i)) % 360;
     }
     return 'hsl(' + hash + ', 32%, 34%)';
+  }
+
+  // --- админские формы ---
+
+  // post отправляет действие администратора и перерисовывает экран: состояние
+  // приложения живёт на сервере, поэтому после успеха просто перечитываем его.
+  function post(path, body, btn, okText) {
+    if (busy) { return; }
+    busy = true;
+    if (btn) { btn.disabled = true; }
+    api(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (out) {
+      toast(resultMessage(out, okText));
+      return load();
+    }).catch(function (err) {
+      toast((err && err.message) || 'Не получилось');
+    }).then(function () {
+      busy = false;
+      if (btn) { btn.disabled = false; }
+    });
+  }
+
+  // resultMessage собирает понятный ответ: что сделали, когда игра и кто вошёл
+  // в состав из резерва.
+  function resultMessage(out, okText) {
+    var parts = [okText || 'Готово'];
+    if (out && out.when) { parts.push(out.when); }
+    if (out && out.promoted) { parts.push('в состав вошёл ' + out.promoted); }
+    return parts.join(' · ');
+  }
+
+  function field(caption, el) {
+    var box = document.createElement('label');
+    box.className = 'field';
+    var cap = document.createElement('span');
+    cap.className = 'muted small';
+    cap.textContent = caption;
+    box.appendChild(cap);
+    box.appendChild(el);
+    return box;
+  }
+
+  function input(type, value, placeholder) {
+    var el = document.createElement('input');
+    el.type = type;
+    el.value = value == null ? '' : value;
+    if (placeholder) { el.placeholder = placeholder; }
+    return el;
+  }
+
+  function cols(nodes) {
+    var row = document.createElement('div');
+    row.className = 'cols';
+    nodes.forEach(function (n) { row.appendChild(n); });
+    return row;
+  }
+
+  // formFields собирает поля игры: дату и время, название, место и число мест.
+  // Дата и время приходят с сервера в зоне беседы — телефон может быть в любой.
+  function formFields(v) {
+    var f = {
+      date: input('date', v.date),
+      time: input('time', v.time),
+      title: input('text', v.title, 'например Волейбол'),
+      location: input('text', v.location, 'например СК «Спартак»'),
+      capacity: input('number', v.capacity, 'мест')
+    };
+    var grid = document.createElement('div');
+    grid.className = 'grid';
+    grid.appendChild(cols([field('дата', f.date), field('время', f.time)]));
+    grid.appendChild(field('название', f.title));
+    grid.appendChild(cols([field('место', f.location), field('мест', f.capacity)]));
+    f.grid = grid;
+    return f;
+  }
+
+  function submitForm(f, path, extra, btn, okText) {
+    var body = {
+      date: f.date.value,
+      time: f.time.value,
+      title: f.title.value,
+      location: f.location.value,
+      capacity: Number(f.capacity.value) || 0
+    };
+    Object.keys(extra || {}).forEach(function (k) { body[k] = extra[k]; });
+    post(path, body, btn, okText);
+  }
+
+  // createCard — форма «Создать игру»: дата, время, место, название и число
+  // мест. Предзаполнение приходит с сервера: ближайший слот расписания чата.
+  function createCard(s) {
+    var box = document.createElement('section');
+    box.className = 'card';
+
+    var head = document.createElement('h2');
+    head.textContent = 'Создать игру';
+    box.appendChild(head);
+
+    var next = s.next_game || {};
+    var f = formFields({
+      date: next.date,
+      time: next.time,
+      title: next.title,
+      location: '',
+      capacity: next.capacity
+    });
+    box.appendChild(f.grid);
+
+    var slots = s.schedule || [];
+    if (slots.length) {
+      box.appendChild(label('Обычное время чата'));
+      var picks = document.createElement('div');
+      picks.className = 'picks';
+      slots.forEach(function (slot) {
+        var chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'chip';
+        chip.textContent = slot.weekday + ' ' + slot.time;
+        chip.addEventListener('click', function () { f.time.value = slot.time; });
+        picks.appendChild(chip);
+      });
+      box.appendChild(picks);
+    }
+
+    var create = button('Создать игру', '', function () {
+      submitForm(f, 'game', {}, create, 'Игра создана');
+    });
+    var row = document.createElement('div');
+    row.className = 'actions';
+    row.appendChild(create);
+    box.appendChild(row);
+    return box;
+  }
+
+  // adminGameControls — «Изменить» и «Отменить игру» на карточке игры.
+  function adminGameControls(g) {
+    var wrap = document.createElement('div');
+    var holder = document.createElement('div');
+    holder.className = 'edit-holder';
+
+    var edit = button('Изменить', 'ghost', function () {
+      if (holder.firstChild) {
+        holder.innerHTML = '';
+        edit.textContent = 'Изменить';
+        return;
+      }
+      holder.appendChild(editForm(g));
+      edit.textContent = 'Свернуть';
+    });
+
+    var cancel = button('Отменить игру', 'bad', function () {
+      if (!window.confirm('Отменить игру и снять все записи?')) {
+        return;
+      }
+      post('game/cancel', { event_id: g.id }, cancel, 'Игра отменена');
+    });
+
+    var row = document.createElement('div');
+    row.className = 'actions';
+    row.appendChild(edit);
+    row.appendChild(cancel);
+
+    wrap.appendChild(row);
+    wrap.appendChild(holder);
+    return wrap;
+  }
+
+  // editForm меняет время, место, название и число мест: анонс в беседе
+  // перепишется сам — правку делает адаптер, как и у кнопок.
+  function editForm(g) {
+    var box = document.createElement('div');
+    var f = formFields({
+      date: g.date,
+      time: g.time,
+      title: g.title,
+      location: g.location,
+      capacity: g.capacity
+    });
+    box.appendChild(f.grid);
+
+    var save = button('Сохранить', '', function () {
+      submitForm(f, 'game/edit', { event_id: g.id }, save, 'Игра изменена');
+    });
+    var row = document.createElement('div');
+    row.className = 'actions';
+    row.appendChild(save);
+    box.appendChild(row);
+    return box;
   }
 
   // --- ВКонтакте: тема, профиль, возвращение к экрану ---

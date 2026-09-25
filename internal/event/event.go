@@ -56,3 +56,15 @@ type CreateInput struct {
 	Location string
 	Capacity int
 }
+
+// UpdateInput describes the changes an administrator makes to a game. Title,
+// place, start and capacity go together: they all live in the same announcement
+// in the chat, so they are always rewritten as one.
+type UpdateInput struct {
+	ChatID   int64
+	EventID  int64
+	Title    string
+	Location string
+	StartsAt time.Time
+	Capacity int
+}
