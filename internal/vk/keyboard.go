@@ -56,15 +56,6 @@ func EventCommandPayload(command string, eventID int64) string {
 	return Payload{Command: command, EventID: eventID}.Marshal()
 }
 
-// AnnouncementCommandPayload is the payload of a button attached to the game
-// announcement itself. Such a press reports the id of the message it was
-// pressed on, and that is the only way the bot learns the id of its own
-// announcement in a conversation (messages.send answers 0 there), so the
-// roster can be rewritten in place afterwards.
-func AnnouncementCommandPayload(command string, eventID int64) string {
-	return Payload{Command: command, EventID: eventID, Announce: true}.Marshal()
-}
-
 // SlotCommandPayload is the payload of a settings button: the command plus
 // the weekday it applies to. The weekday is always written out (воскресенье
 // is 0), so a payload cannot lose it.
@@ -86,10 +77,6 @@ type Payload struct {
 	Command string `json:"command"`
 	EventID int64  `json:"event_id,omitempty"`
 	Weekday int    `json:"weekday,omitempty"`
-	// Announce marks a button that sits under the game announcement itself.
-	// Such a press carries the id of the announcement message, so the bot
-	// remembers it and can rewrite the announcement in place later.
-	Announce bool `json:"announce,omitempty"`
 }
 
 // Marshal renders the payload for a button.
@@ -134,6 +121,16 @@ func CallbackButton(label, payload string, color ButtonColor) Button {
 		Action: ButtonAction{Type: "callback", Label: label, Payload: payload},
 		Color:  color,
 	}
+}
+
+// RemoveKeyboard returns the keyboard value that takes the keyboard away from a
+// message: VK documents exactly this as «убрать клавиатуру» — пустой набор
+// кнопок («Чтобы убрать клавиатуру из чата, отправьте пустой набор кнопок в
+// параметре keyboard»). Поле inline при пустом наборе не передаём: для снятия
+// клавиатуры оно не нужно, а лишнее поле рискует обернуться 911 Keyboard
+// format is invalid.
+func RemoveKeyboard() (string, error) {
+	return Keyboard{Buttons: [][]Button{}}.Marshal()
 }
 
 // Marshal returns the keyboard as the JSON string VK expects in the

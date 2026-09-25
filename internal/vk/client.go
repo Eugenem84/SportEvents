@@ -59,18 +59,48 @@ func NewClient(token, groupID string, opts ...ClientOption) *Client {
 // returns the id VK reports. random_id makes repeated sends of the same
 // logical message idempotent within VK's dedup window.
 //
-// В беседе VK отвечает 0: у сообщения там нет отдельного id, есть только
-// conversation_message_id, который выдают события нажатий (message_event).
-// Поэтому id анонса бот узнаёт при первом нажатии на его же кнопку.
+// В беседе messages.send с peer_id отвечает 0: править и закреплять сообщение
+// там можно только по conversation_message_id. С peer_ids (множественное
+// число) VK отвечает объектом, в котором этот id есть, — так бот сразу узнаёт,
+// куда легло сообщение, и подсказывать ему кнопкой в самом сообщении не нужно.
+// В диалоге с человеком всё проще: там есть обычный message_id.
 func (c *Client) SendMessage(ctx context.Context, peerID int64, text, keyboard string) (int64, error) {
 	params := url.Values{}
-	params.Set("peer_id", strconv.FormatInt(peerID, 10))
 	params.Set("message", text)
 	params.Set("random_id", strconv.FormatInt(int64(rand.Int32()), 10))
 	if keyboard != "" {
 		params.Set("keyboard", keyboard)
 	}
 
+	if isConversation(peerID) {
+		params.Set("peer_ids", strconv.FormatInt(peerID, 10))
+		raw, err := c.call(ctx, "messages.send", params)
+		if err != nil {
+			return 0, err
+		}
+		var resp []struct {
+			MessageID             int64  `json:"message_id"`
+			ConversationMessageID int64  `json:"conversation_message_id"`
+			Error                 string `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return 0, fmt.Errorf("parse messages.send response: %w", err)
+		}
+		if len(resp) == 0 {
+			return 0, fmt.Errorf("messages.send: no response for peer %d", peerID)
+		}
+		// Недоставленное сообщение VK описывает ошибкой внутри объекта, а не
+		// верхнеуровневым error, поэтому её надо проверить отдельно.
+		if resp[0].Error != "" {
+			return 0, fmt.Errorf("messages.send: peer %d: %s", peerID, resp[0].Error)
+		}
+		if resp[0].ConversationMessageID != 0 {
+			return resp[0].ConversationMessageID, nil
+		}
+		return resp[0].MessageID, nil
+	}
+
+	params.Set("peer_id", strconv.FormatInt(peerID, 10))
 	raw, err := c.call(ctx, "messages.send", params)
 	if err != nil {
 		return 0, err
@@ -253,11 +283,10 @@ func (c *Client) GetConversationTitle(ctx context.Context, peerID int64) (string
 // LastOwnConversationMessageID returns the conversation_message_id of the last
 // message the community itself posted to a conversation.
 //
-// В беседе messages.send отвечает 0 вместо id, поэтому единственный способ
-// узнать, куда легло только что отправленное сообщение, — прочитать саму
-// беседу: берём id последнего сообщения и проверяем, что оно наше (человек мог
-// успеть написать в промежутке). Ноль означает «не удалось определить»: тогда
-// id анонса выучится по нажатию на его же кнопку.
+// Обычно id приходит прямо из messages.send (в беседе — при отправке с
+// peer_ids). Это запасной путь на случай, когда VK его не назвал: читаем саму
+// беседу, берём id последнего сообщения и проверяем, что оно наше (человек мог
+// успеть написать в промежутке). Ноль означает «не удалось определить».
 func (c *Client) LastOwnConversationMessageID(ctx context.Context, peerID int64) (int64, error) {
 	params := url.Values{}
 	params.Set("peer_ids", strconv.FormatInt(peerID, 10))

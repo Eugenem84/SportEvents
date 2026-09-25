@@ -23,6 +23,10 @@ func TestNewClientNilHTTP(t *testing.T) {
 	}
 }
 
+// В беседе messages.send с peer_id отвечает нулём, поэтому отправляем с
+// peer_ids: VK возвращает объект, в котором есть conversation_message_id, — им
+// потом адресуются messages.edit и messages.pin, и кнопок в сообщении для
+// этого не нужно.
 func TestSendMessagePostsFormParams(t *testing.T) {
 	var gotBody string
 	var gotContentType string
@@ -38,7 +42,7 @@ func TestSendMessagePostsFormParams(t *testing.T) {
 		}
 		gotBody = string(raw)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"response":42}`))
+		w.Write([]byte(`{"response":[{"peer_id":2000000047,"message_id":0,"conversation_message_id":42}]}`))
 	}))
 	defer srv.Close()
 
@@ -48,7 +52,7 @@ func TestSendMessagePostsFormParams(t *testing.T) {
 		t.Fatal(err)
 	}
 	if msgID != 42 {
-		t.Fatalf("message id: want 42, got %d", msgID)
+		t.Fatalf("conversation message id: want 42, got %d", msgID)
 	}
 	if !strings.HasPrefix(gotContentType, "application/x-www-form-urlencoded") {
 		t.Fatalf("content type: %q", gotContentType)
@@ -61,8 +65,11 @@ func TestSendMessagePostsFormParams(t *testing.T) {
 	if params.Get("access_token") != "tok123" {
 		t.Fatalf("access_token: %q", params.Get("access_token"))
 	}
-	if params.Get("peer_id") != "2000000047" {
-		t.Fatalf("peer_id: %q", params.Get("peer_id"))
+	if params.Get("peer_ids") != "2000000047" {
+		t.Fatalf("peer_ids: %q", params.Get("peer_ids"))
+	}
+	if params.Get("peer_id") != "" {
+		t.Fatalf("peer_id must not be sent for a conversation: %q", params.Get("peer_id"))
 	}
 	if params.Get("message") != "Привет" {
 		t.Fatalf("message: %q", params.Get("message"))
@@ -75,6 +82,53 @@ func TestSendMessagePostsFormParams(t *testing.T) {
 	}
 	if params.Get("v") == "" {
 		t.Fatal("v (api version) must be set")
+	}
+}
+
+// В диалоге с человеком адресация обычная: peer_id и числовой ответ.
+func TestSendMessageToUserReturnsMessageID(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		gotBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":7}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	msgID, err := c.SendMessage(context.Background(), 555, "ok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgID != 7 {
+		t.Fatalf("message id: want 7, got %d", msgID)
+	}
+	params, err := url.ParseQuery(gotBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params.Get("peer_id") != "555" || params.Get("peer_ids") != "" {
+		t.Fatalf("peer_id/peer_ids: %q/%q", params.Get("peer_id"), params.Get("peer_ids"))
+	}
+}
+
+// Недоставленное в беседу сообщение VK описывает ошибкой внутри объекта
+// ответа: считать такую отправку успешной нельзя.
+func TestSendMessageConversationErrorObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":[{"peer_id":2000000047,"message_id":0,"conversation_message_id":0,"error":"Can't send messages"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	if _, err := c.SendMessage(context.Background(), 2_000_000_047, "x", ""); err == nil {
+		t.Fatal("want error when VK reports a per-peer delivery error")
 	}
 }
 
@@ -431,6 +485,19 @@ func TestPinMessageEmptyResponseFails(t *testing.T) {
 	c := NewClient("tok", "123", WithBaseURL(srv.URL))
 	if err := c.PinMessage(context.Background(), 2_000_000_002, 615); err == nil {
 		t.Fatal("a response without a pinned message must be an error")
+	}
+}
+
+// RemoveKeyboard — ровно та форма снятия клавиатуры, которую описывает VK:
+// пустой набор кнопок. Лишнее поле inline в пустом наборе рискует обернуться
+// 911 Keyboard format is invalid.
+func TestRemoveKeyboardShape(t *testing.T) {
+	raw, err := RemoveKeyboard()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw != `{"buttons":[]}` {
+		t.Fatalf(`want {"buttons":[]}, got %q`, raw)
 	}
 }
 

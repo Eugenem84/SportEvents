@@ -34,8 +34,8 @@ type fakeMessenger struct {
 	// editErr makes EditMessage fail: обновление анонса не должно ломать
 	// действие человека, который нажал кнопку.
 	editErr error
-	// sendZero imitates VK: в беседе messages.send отвечает 0 вместо id, и
-	// тогда id последнего своего сообщения читается из беседы (lastCMID).
+	// sendZero имитирует случай, когда messages.send не назвал id: тогда id
+	// последнего своего сообщения читается из беседы (lastCMID).
 	sendZero bool
 	lastCMID int64
 }
@@ -949,6 +949,10 @@ func TestCallbackCreateGameByAdminPostsAnnouncement(t *testing.T) {
 	if !strings.Contains(h.msg.sent[1].Keyboard, "Иду") {
 		t.Fatalf("the notice must bring the buttons: %q", h.msg.sent[1].Keyboard)
 	}
+	// Своих кнопок у анонса нет: «Иду» / «Не иду» живут только под полем ввода.
+	if got := h.msg.sent[0].Keyboard; got != `{"buttons":[]}` {
+		t.Fatalf("the announcement must carry no buttons: %q", got)
+	}
 	if len(h.anns.saved) != 1 || h.anns.saved[0].MessageID == 0 {
 		t.Fatalf("announcement reference: %+v", h.anns.saved)
 	}
@@ -1038,8 +1042,10 @@ func TestCallbackAttendFullGameGoesToReserve(t *testing.T) {
 	}
 }
 
-// Анонс: дата с днём недели, номера мест с «свободно» вместо уехавших номеров,
-// счётчик свободных мест и резерв в порядке очереди.
+// Анонс: дата с днём недели, только занятые места с номерами (каждое с новой
+// строки, свободные пропущены) и резерв в порядке очереди. Своих кнопок у
+// сообщения нет: «Иду» / «Не иду» живут на постоянной клавиатуре под полем
+// ввода, дублировать их в анонсе не нужно.
 func TestCallbackAnnouncementShowsSeatsAndReserve(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
@@ -1067,13 +1073,22 @@ func TestCallbackAnnouncementShowsSeatsAndReserve(t *testing.T) {
 	for _, want := range []string{
 		"суббота, 26 сентября, 12:00",
 		"Состав (2/3)",
-		"1. Иван · 2. свободно · 3. Сергей",
-		"Свободно мест: 1",
+		"1. Иван",
+		"3. Сергей",
 		"Резерв (2): Мария · Иван Петров",
 	} {
 		if !strings.Contains(edit.Text, want) {
 			t.Fatalf("announcement must contain %q:\n%s", want, edit.Text)
 		}
+	}
+	// Свободное место не упоминается и не нумеруется, счётчика мест нет.
+	for _, unwanted := range []string{"свободно", "Свободно мест", "2. "} {
+		if strings.Contains(edit.Text, unwanted) {
+			t.Fatalf("announcement must not contain %q:\n%s", unwanted, edit.Text)
+		}
+	}
+	if edit.Keyboard != `{"buttons":[]}` {
+		t.Fatalf("the announcement must carry no buttons: %q", edit.Keyboard)
 	}
 }
 
@@ -1301,7 +1316,42 @@ func TestCallbackCreateGameSkipsExisting(t *testing.T) {
 	}
 }
 
-// Кнопка старого анонса не записывает на прошедшую игру: запись на неё закрыта.
+// Известный анонс повторный «старт» переписывает на месте: в беседе не должно
+// появляться второе сообщение с составом, а вместе с правкой уходит и клавиатура
+// анонса, оставшаяся от прежней версии.
+func TestCallbackCreateGameRewritesExistingAnnouncement(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{
+			ID:       7,
+			Title:    "Волейбол",
+			StartsAt: time.Date(2026, 9, 27, 10, 0, 0, 0, defaultLocation),
+			Capacity: 12,
+		},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.created) != 0 {
+		t.Fatalf("the game must not be created twice: %+v", h.events.created)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 615 {
+		t.Fatalf("the announcement must be rewritten in place: %+v", h.msg.edits)
+	}
+	if got := h.msg.edits[0].Keyboard; got != `{"buttons":[]}` {
+		t.Fatalf("the old buttons must be dropped: %q", got)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже создана") {
+		t.Fatalf("only the note must be sent: %+v", h.msg.sent)
+	}
+}
+
+// Нажатие «Иду» на прошедшую игру ничего не записывает: запись закрыта.
 func TestCallbackAttendPastGameIsRefused(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
@@ -1309,7 +1359,7 @@ func TestCallbackAttendPastGameIsRefused(t *testing.T) {
 	}}
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		eventEnvelope(2000000047, 555, 905, AnnouncementCommandPayload(cmdAttend, 7)))
+		eventEnvelope(2000000047, 555, 905, EventCommandPayload(cmdAttend, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1371,7 +1421,7 @@ func TestCallbackCancelGameDropsBookingsAndButtons(t *testing.T) {
 			t.Fatalf("cancelled announcement must contain %q:\n%s", want, edit.Text)
 		}
 	}
-	if edit.Keyboard != `{"inline":true,"buttons":[]}` {
+	if edit.Keyboard != `{"buttons":[]}` {
 		t.Fatalf("the buttons must be dropped: %q", edit.Keyboard)
 	}
 	if !strings.Contains(snackbar(t, h), "Игра отменена") {
@@ -1460,7 +1510,7 @@ func TestCallbackAttendCancelledGameIsRefused(t *testing.T) {
 	}}
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
-		eventEnvelope(2000000047, 555, 907, AnnouncementCommandPayload(cmdAttend, 7)))
+		eventEnvelope(2000000047, 555, 907, EventCommandPayload(cmdAttend, 7)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1501,95 +1551,49 @@ func TestCallbackSettingsOffersCancelGameButton(t *testing.T) {
 
 // --- Phase 6: id сообщения анонса ---
 
-// Нажатие кнопки самого анонса доносит id этого сообщения: в беседе
-// messages.send отвечает 0, поэтому только так бот узнаёт, что переписывать.
-func TestCallbackAnnouncementPressLearnsMessageID(t *testing.T) {
-	h := newHarness(t, true)
-	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
-	}}
-	// Анонс отправлен, но VK вернул 0: id пока неизвестен.
-	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047"}
-	h.anns.has = true
+// Своих кнопок у анонса нет: id его сообщения бот узнаёт из самой отправки — в
+// беседе messages.send вызывается с peer_ids и отвечает conversation_message_id.
+// Запасной путь (LastOwnConversationMessageID) проверяется в
+// TestCallbackCreateGameLearnsAnnouncementIDFromChat.
 
-	code, _ := postJSON(t, h.svc.HandleCallback,
-		eventEnvelope(2000000047, 555, 777, AnnouncementCommandPayload(cmdAttend, 7)))
+// Основной путь: id анонса называет сама отправка (в беседе messages.send
+// вызывается с peer_ids), поэтому бот запоминает его сразу, закрепляет анонс и
+// перерисовывает состав с первой же записи — ни кнопок в анонсе, ни ожидания
+// нажатия для этого не нужно.
+func TestCallbackAnnouncementIDComesFromSend(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/старт", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
-	if h.anns.ref.MessageID != 777 {
-		t.Fatalf("the announcement id must be remembered: %+v", h.anns.saved)
+	if len(h.msg.sent) != 2 || !strings.Contains(h.msg.sent[0].Text, "Состав") {
+		t.Fatalf("announcement: %+v", h.msg.sent)
 	}
-	if len(h.msg.pinned) != 1 || h.msg.pinned[0] != 777 {
-		t.Fatalf("the announcement must be pinned once its id is known: %+v", h.msg.pinned)
+	// Анонс — первое сообщение беседы, значит VK назвал для него id 1.
+	if h.anns.ref.MessageID != 1 {
+		t.Fatalf("the id must be taken from the send: %+v", h.anns.saved)
 	}
-	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "1 - Иван Петров" {
-		t.Fatalf("seat line: %+v", h.msg.sent)
+	if len(h.msg.pinned) != 1 || h.msg.pinned[0] != 1 {
+		t.Fatalf("the announcement must be pinned right away: %+v", h.msg.pinned)
 	}
-	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 777 {
-		t.Fatalf("announcement must be rewritten with the learned id: %+v", h.msg.edits)
-	}
-}
 
-// Известный id не подменяется нажатием на другое сообщение: анонс всегда один
-// и тот же, иначе состав начал бы обновлять чужую переписку.
-func TestCallbackAnnouncementIDNotOverwritten(t *testing.T) {
-	h := newHarness(t, true)
-	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
-	}}
-	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
-	h.anns.has = true
+	// Игра, которую создал «/старт».
+	h.events.games = append(h.events.games, event.EventSummary{Event: event.Event{
+		ID: 101, Title: defaultTitle, StartsAt: harnessNow().Add(24 * time.Hour),
+		Capacity: 12, Status: event.StatusScheduled,
+	}})
 
-	code, _ := postJSON(t, h.svc.HandleCallback,
-		eventEnvelope(2000000047, 555, 777, AnnouncementCommandPayload(cmdAttend, 7)))
+	code, _ = postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 300, EventCommandPayload(cmdAttend, 101)))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
-	if len(h.anns.saved) != 0 {
-		t.Fatalf("the known id must stay: %+v", h.anns.saved)
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 1 {
+		t.Fatalf("the roster must be rewritten in the announcement itself: %+v", h.msg.edits)
 	}
-	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 615 {
-		t.Fatalf("announcement must keep its message: %+v", h.msg.edits)
-	}
-}
-
-// Анонс живёт в своей беседе: id, пришедший из чужой, не подходит.
-func TestCallbackAnnouncementIDFromAnotherChatIgnored(t *testing.T) {
-	h := newHarness(t, true)
-	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
-	}}
-	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000999"}
-	h.anns.has = true
-
-	code, _ := postJSON(t, h.svc.HandleCallback,
-		eventEnvelope(2000000047, 555, 777, AnnouncementCommandPayload(cmdAttend, 7)))
-	if code != http.StatusOK {
-		t.Fatalf("status: %d", code)
-	}
-	if h.anns.ref.MessageID != 0 {
-		t.Fatalf("another chat must not hand the id over: %+v", h.anns.saved)
-	}
-}
-
-// Кнопка из списка игр не считается анонсом: её нажатие не должно связывать id
-// этого сообщения с анонсом.
-func TestCallbackGamesListPressDoesNotLearnAnnouncementID(t *testing.T) {
-	h := newHarness(t, true)
-	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
-	}}
-	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047"}
-	h.anns.has = true
-
-	code, _ := postJSON(t, h.svc.HandleCallback,
-		eventEnvelope(2000000047, 555, 777, EventCommandPayload(cmdAttend, 7)))
-	if code != http.StatusOK {
-		t.Fatalf("status: %d", code)
-	}
-	if h.anns.ref.MessageID != 0 {
-		t.Fatalf("a list button must not claim the announcement id: %+v", h.anns.saved)
+	if !strings.Contains(h.msg.edits[0].Text, "1. Иван Петров") {
+		t.Fatalf("roster: %q", h.msg.edits[0].Text)
 	}
 }
 
@@ -1620,9 +1624,9 @@ func TestCallbackAnnouncementEditFailureKeepsBooking(t *testing.T) {
 	}
 }
 
-// В беседе VK отвечает на messages.send нулём: id анонса бот читает из самой
-// беседы (последнее сообщение — только что отправленный анонс) и запоминает, а
-// заодно пробует закрепить его.
+// Запасной путь: если messages.send не назвал id, бот читает из беседы id
+// последнего своего сообщения (только что отправленный анонс и есть последнее)
+// и запоминает его, а заодно пробует закрепить анонс.
 func TestCallbackCreateGameLearnsAnnouncementIDFromChat(t *testing.T) {
 	h := newHarness(t, true)
 	h.msg.sendZero = true
@@ -1643,8 +1647,8 @@ func TestCallbackCreateGameLearnsAnnouncementIDFromChat(t *testing.T) {
 	}
 }
 
-// Если id прочитать не удалось, анонс всё равно отправлен: id выучится по
-// нажатию на кнопку самого анонса.
+// Если id прочитать не удалось, анонс всё равно отправлен: состав просто не
+// перерисовывается на месте, но строчки «N - Имя» в чат всё равно приходят.
 func TestCallbackCreateGameUnknownAnnouncementID(t *testing.T) {
 	h := newHarness(t, true)
 	h.msg.sendZero = true // lastCMID остаётся нулевым
