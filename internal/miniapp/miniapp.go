@@ -440,7 +440,8 @@ type mineView struct {
 // from a chat, or a chat the bot does not know) is not an error: the screen then
 // shows a hint instead of games.
 func (h *handler) state(ctx context.Context, lp launchParams) (state, error) {
-	resp := state{SignChecked: lp.checked, SignValid: lp.signed}
+	// An empty list, not null: the app draws from this answer directly.
+	resp := state{Games: []gameView{}, SignChecked: lp.checked, SignValid: lp.signed}
 
 	ch, me, err := h.resolve(ctx, lp)
 	switch {
