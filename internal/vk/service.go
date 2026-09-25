@@ -265,7 +265,7 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 		weekday: parsed.weekday,
 		minutes: parsed.minutes,
 		hasSlot: parsed.hasSlot,
-		text:    msg.Text,
+		text:    stripCommandWord(msg.Text),
 	})
 }
 
@@ -1041,12 +1041,13 @@ func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, ch
 	}
 	text := fmt.Sprintf(
 		"Привет, %s!\nЭто бот записи на игры чата «%s».\n\n"+
-			"Команды:\n"+
-			"• «игры» — ближайшие игры и запись\n"+
-			"• «мои записи» — ваши записи\n"+
-			"• «отмена» — отменить свою запись\n"+
-			"• «создать игру» — новая игра и анонс в беседу (дата берётся из расписания)\n"+
-			"• «настройки» — расписание игр: дни недели и время (только администратор)",
+			"Команды (можно писать со слэшем):\n"+
+			"/games — ближайшие игры и запись\n"+
+			"/my — ваши записи\n"+
+			"/cancel — отменить свою запись\n"+
+			"/create — создать игру и анонс (администратор)\n"+
+			"/settings — расписание игр: дни недели и время (администратор)\n\n"+
+			"Без слэша тоже работает: «игры», «мои записи», «создать игру», «настройки».",
 		displayName, chatTitle)
 	return s.sendText(ctx, peerID, text, kb)
 }
@@ -1083,6 +1084,16 @@ func (s *Service) parseCommand(text, payload string) parsedCommand {
 	}
 
 	t := strings.ToLower(strings.TrimSpace(text))
+
+	// Слэш-команды (/games, /my, /settings, /create, /cancel): их подсказывает
+	// сам клиент VK, если команды бота зарегистрированы (Client.SetBotCommands).
+	// Аргументы после команды обрабатываются как обычный текст.
+	if name, ok := slashCommand(t); ok {
+		if cmd, isCommand := commandByName(name); isCommand {
+			return parsedCommand{cmd: cmd}
+		}
+	}
+
 	switch {
 	case t == "/start" || t == "start" || t == "начать":
 		return parsedCommand{cmd: cmdStart}
@@ -1112,12 +1123,56 @@ func (s *Service) parseCommand(text, payload string) parsedCommand {
 	return parsedCommand{}
 }
 
+// slashCommand splits a slash command off a message: "/create 27.09 19:00"
+// yields "create". ok is false for ordinary text.
+func slashCommand(text string) (name string, ok bool) {
+	if !strings.HasPrefix(text, "/") {
+		return "", false
+	}
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return "", false
+	}
+	return strings.TrimPrefix(fields[0], "/"), true
+}
+
+// commandByName maps a command name to the internal command. The names are
+// both Latin (what the bot registers in VK, so the client can offer hints)
+// and Russian (what is easy to type).
+func commandByName(name string) (string, bool) {
+	switch name {
+	case "start", "help", "начать", "помощь":
+		return cmdStart, true
+	case "games", "игры":
+		return cmdGames, true
+	case "my", "мои", "моизаписи":
+		return cmdMyBookings, true
+	case "create", "создать":
+		return cmdCreateGame, true
+	case "settings", "настройки":
+		return cmdSettings, true
+	case "cancel", "отмена":
+		return cmdCancelBooking, true
+	case "connect", "подключить":
+		return cmdConnect, true
+	}
+	return "", false
+}
+
+// stripCommandWord removes a leading "/games" token, so the rest of the
+// message is parsed as arguments: "/create 27.09 19:00" → "27.09 19:00".
+func stripCommandWord(text string) string {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return text
+	}
+	return strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+}
+
 // slotFillers are the words a schedule message may contain besides the
-// weekday and the time: «добавить в среду 19:00», «убрать сб».
+// weekday and the time: «добавить в среду 19:00».
 var slotFillers = map[string]bool{
-	"добавить": true, "добавь": true, "поставить": true, "поставь": true,
-	"убрать": true, "убери": true, "удалить": true, "удали": true,
-	"снять": true, "сними": true, "задай": true,
+	"добавить": true, "добавь": true, "поставить": true, "поставь": true, "задай": true,
 	"в": true, "на": true, "по": true, "время": true,
 	"игру": true, "игра": true, "игры": true, "расписание": true, "расписания": true,
 }

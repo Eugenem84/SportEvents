@@ -1211,3 +1211,95 @@ func TestCallbackSlotRemoveEditsSettingsMessage(t *testing.T) {
 		t.Fatalf("a callback press must not post a message: %+v", h.msg.sent)
 	}
 }
+
+// --- Слэш-команды ---
+
+// TestParseCommand locks the whole mapping: payload beats text, a slash name
+// is recognised with its arguments stripped, and a message that is only a
+// schedule slot stays a slot.
+func TestParseCommand(t *testing.T) {
+	svc := newHarness(t, true).svc
+
+	cases := []struct {
+		name        string
+		text        string
+		payload     string
+		wantCmd     string
+		wantEvent   int64
+		wantWeekday int
+		wantMinutes int
+		wantSlot    bool
+	}{
+		{name: "payload wins", text: "что угодно", payload: `{"command":"book","event_id":7}`, wantCmd: cmdBook, wantEvent: 7},
+		{name: "slash games", text: "/games", wantCmd: cmdGames},
+		{name: "slash my", text: "/my", wantCmd: cmdMyBookings},
+		{name: "slash cancel", text: "/cancel", wantCmd: cmdCancelBooking},
+		{name: "slash settings", text: "/settings", wantCmd: cmdSettings},
+		{name: "slash help", text: "/help", wantCmd: cmdStart},
+		{name: "slash start", text: "/start", wantCmd: cmdStart},
+		{name: "slash russian", text: "/игры", wantCmd: cmdGames},
+		{name: "slash create with args", text: "/create 27.09 19:00", wantCmd: cmdCreateGame},
+		{name: "unknown slash", text: "/pizza", wantCmd: ""},
+		{name: "text games", text: "игры", wantCmd: cmdGames},
+		{name: "text my", text: "мои записи", wantCmd: cmdMyBookings},
+		{name: "text book", text: "записаться", wantCmd: cmdBook},
+		{name: "text skip", text: "Пропускаю", wantCmd: cmdSkip},
+		{name: "text cancel", text: "отмена", wantCmd: cmdCancelBooking},
+		{name: "text connect", text: "подключить", wantCmd: cmdConnect},
+		{name: "text settings", text: "настройки", wantCmd: cmdSettings},
+		{name: "slot by text", text: "вс 10:00", wantCmd: cmdSlotAdd, wantWeekday: 0, wantMinutes: 600, wantSlot: true},
+		{name: "slot with filler", text: "добавить в воскресенье 10:00", wantCmd: cmdSlotAdd, wantWeekday: 0, wantMinutes: 600, wantSlot: true},
+		{name: "slot remove", text: "убрать сб", wantCmd: cmdSlotRemove, wantWeekday: 6},
+		{name: "create with weekday stays a game", text: "создать игру в среду 19:00", wantCmd: cmdCreateGame},
+		{name: "plain talk", text: "привет, как дела", wantCmd: ""},
+	}
+
+	for _, tc := range cases {
+		got := svc.parseCommand(tc.text, tc.payload)
+		if got.cmd != tc.wantCmd || got.eventID != tc.wantEvent ||
+			got.weekday != tc.wantWeekday || got.minutes != tc.wantMinutes || got.hasSlot != tc.wantSlot {
+			t.Fatalf("%s: got %+v, want cmd=%q event=%d weekday=%d minutes=%d slot=%v",
+				tc.name, got, tc.wantCmd, tc.wantEvent, tc.wantWeekday, tc.wantMinutes, tc.wantSlot)
+		}
+	}
+}
+
+// /create с аргументами: сам слэш-слово не должно попадать ни в дату, ни в
+// название игры.
+func TestCallbackSlashCreateWithArguments(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create 27.09 19:00 8", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.created) != 1 {
+		t.Fatalf("created: %+v", h.events.created)
+	}
+	in := h.events.created[0]
+	want := time.Date(2026, 9, 27, 19, 0, 0, 0, defaultLocation).UTC()
+	if !in.StartsAt.Equal(want) {
+		t.Fatalf("starts_at: %v want %v", in.StartsAt.In(defaultLocation), want.In(defaultLocation))
+	}
+	if in.Title != defaultTitle || in.Capacity != 8 {
+		t.Fatalf("input: %+v", in)
+	}
+}
+
+func TestCallbackSlashHelpShowsCommands(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/help", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	text := h.msg.sent[0].Text
+	for _, want := range []string{"/games", "/my", "/cancel", "/create", "/settings"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("help must list %s: %q", want, text)
+		}
+	}
+}
