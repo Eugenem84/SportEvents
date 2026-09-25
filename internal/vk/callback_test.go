@@ -38,6 +38,10 @@ type fakeMessenger struct {
 	// последнего своего сообщения читается из беседы (lastCMID).
 	sendZero bool
 	lastCMID int64
+	// order перечисляет вызовы по порядку («send», «edit», «pin»): по нему
+	// проверяется, что последним в беседу уходит сообщение с клавиатурой
+	// записи — её беседа берёт у последнего сообщения бота.
+	order []string
 }
 
 type sentMessage struct {
@@ -62,6 +66,7 @@ type answeredEvent struct {
 
 func (f *fakeMessenger) SendMessage(_ context.Context, peerID int64, text, keyboard string) (int64, error) {
 	f.sent = append(f.sent, sentMessage{PeerID: peerID, Text: text, Keyboard: keyboard})
+	f.order = append(f.order, "send")
 	if f.sendZero {
 		return 0, nil
 	}
@@ -77,11 +82,13 @@ func (f *fakeMessenger) EditMessage(_ context.Context, peerID, messageID int64, 
 		return 0, f.editErr
 	}
 	f.edits = append(f.edits, editedMessage{PeerID: peerID, MessageID: messageID, Text: text, Keyboard: keyboard})
+	f.order = append(f.order, "edit")
 	return messageID, nil
 }
 
 func (f *fakeMessenger) PinMessage(_ context.Context, peerID, messageID int64) error {
 	f.pinned = append(f.pinned, messageID)
+	f.order = append(f.order, "pin")
 	return nil
 }
 
@@ -949,8 +956,9 @@ func TestCallbackCreateGameByAdminPostsAnnouncement(t *testing.T) {
 	if !strings.Contains(h.msg.sent[1].Keyboard, "Иду") {
 		t.Fatalf("the notice must bring the buttons: %q", h.msg.sent[1].Keyboard)
 	}
-	// Своих кнопок у анонса нет: «Иду» / «Не иду» живут только под полем ввода.
-	if got := h.msg.sent[0].Keyboard; got != `{"buttons":[]}` {
+	// Своих кнопок у анонса нет: «Иду» / «Не иду» живут только под полем ввода,
+	// и пустой inline-набор их там не гасит.
+	if got := h.msg.sent[0].Keyboard; got != `{"inline":true,"buttons":[]}` {
 		t.Fatalf("the announcement must carry no buttons: %q", got)
 	}
 	if len(h.anns.saved) != 1 || h.anns.saved[0].MessageID == 0 {
@@ -1087,8 +1095,38 @@ func TestCallbackAnnouncementShowsSeatsAndReserve(t *testing.T) {
 			t.Fatalf("announcement must not contain %q:\n%s", unwanted, edit.Text)
 		}
 	}
-	if edit.Keyboard != `{"buttons":[]}` {
+	if edit.Keyboard != `{"inline":true,"buttons":[]}` {
 		t.Fatalf("the announcement must carry no buttons: %q", edit.Keyboard)
+	}
+}
+
+// Кнопки «Иду» / «Не иду» не исчезают после записи: клавиатуру под полем ввода
+// беседа берёт у последнего сообщения бота, поэтому анонс переписывается до
+// строки в чат, а последней приходит строка, которая несёт кнопки записи.
+func TestCallbackAttendKeepsSignUpButtonsLast(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 902, EventCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.order) < 2 || h.msg.order[len(h.msg.order)-1] != "send" {
+		t.Fatalf("the chat line must come after the announcement edit: %v", h.msg.order)
+	}
+	last := h.msg.sent[len(h.msg.sent)-1]
+	if !strings.Contains(last.Keyboard, "Иду") {
+		t.Fatalf("the last message must keep the sign-up buttons: %q", last.Keyboard)
+	}
+	// Правка анонса несёт только свою, inline-клавиатуру: набор без inline VK
+	// понял бы как «убрать клавиатуру из чата» и кнопки исчезли бы.
+	if got := h.msg.edits[0].Keyboard; got != `{"inline":true,"buttons":[]}` {
+		t.Fatalf("the announcement edit must not touch the chat keyboard: %q", got)
 	}
 }
 
@@ -1343,7 +1381,7 @@ func TestCallbackCreateGameRewritesExistingAnnouncement(t *testing.T) {
 	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 615 {
 		t.Fatalf("the announcement must be rewritten in place: %+v", h.msg.edits)
 	}
-	if got := h.msg.edits[0].Keyboard; got != `{"buttons":[]}` {
+	if got := h.msg.edits[0].Keyboard; got != `{"inline":true,"buttons":[]}` {
 		t.Fatalf("the old buttons must be dropped: %q", got)
 	}
 	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже создана") {
@@ -1421,7 +1459,7 @@ func TestCallbackCancelGameDropsBookingsAndButtons(t *testing.T) {
 			t.Fatalf("cancelled announcement must contain %q:\n%s", want, edit.Text)
 		}
 	}
-	if edit.Keyboard != `{"buttons":[]}` {
+	if edit.Keyboard != `{"inline":true,"buttons":[]}` {
 		t.Fatalf("the buttons must be dropped: %q", edit.Keyboard)
 	}
 	if !strings.Contains(snackbar(t, h), "Игра отменена") {

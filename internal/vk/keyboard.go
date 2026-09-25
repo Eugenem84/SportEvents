@@ -123,14 +123,19 @@ func CallbackButton(label, payload string, color ButtonColor) Button {
 	}
 }
 
-// RemoveKeyboard returns the keyboard value that takes the keyboard away from a
-// message: VK documents exactly this as «убрать клавиатуру» — пустой набор
-// кнопок («Чтобы убрать клавиатуру из чата, отправьте пустой набор кнопок в
-// параметре keyboard»). Поле inline при пустом наборе не передаём: для снятия
-// клавиатуры оно не нужно, а лишнее поле рискует обернуться 911 Keyboard
-// format is invalid.
+// RemoveKeyboard takes the keyboard away from the chat input: VK documents an
+// empty buttons array as «убрать клавиатуру из чата». Это клавиатура под полем
+// ввода, к конкретному сообщению она не привязана, поэтому форма без inline.
 func RemoveKeyboard() (string, error) {
 	return Keyboard{Buttons: [][]Button{}}.Marshal()
+}
+
+// RemoveInlineKeyboard takes the buttons away from one message: клавиатура в
+// сообщении помечена признаком inline, и пустой набор с этим признаком снимает
+// только её, не трогая клавиатуру под полем ввода. Без inline VK понял бы набор
+// как «убрать клавиатуру из чата» и погасил бы кнопки «Иду» / «Не иду».
+func RemoveInlineKeyboard() (string, error) {
+	return Keyboard{Inline: true, Buttons: [][]Button{}}.Marshal()
 }
 
 // Marshal returns the keyboard as the JSON string VK expects in the

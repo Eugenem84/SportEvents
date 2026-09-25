@@ -488,16 +488,28 @@ func TestPinMessageEmptyResponseFails(t *testing.T) {
 	}
 }
 
-// RemoveKeyboard — ровно та форма снятия клавиатуры, которую описывает VK:
-// пустой набор кнопок. Лишнее поле inline в пустом наборе рискует обернуться
-// 911 Keyboard format is invalid.
-func TestRemoveKeyboardShape(t *testing.T) {
-	raw, err := RemoveKeyboard()
-	if err != nil {
-		t.Fatal(err)
+// Две разные пустые клавиатуры: без inline VK понимает набор как «убрать
+// клавиатуру из чата» (кнопки под полем ввода), с inline — как снятие кнопок
+// одного сообщения. Обе формы VK принимает: проверено запросом к API — битая
+// клавиатура отвечает 911 Keyboard format is invalid, а эти доходят до проверки
+// получателя.
+func TestEmptyKeyboards(t *testing.T) {
+	cases := []struct {
+		name string
+		got  func() (string, error)
+		want string
+	}{
+		{"chat", RemoveKeyboard, `{"buttons":[]}`},
+		{"inline", RemoveInlineKeyboard, `{"inline":true,"buttons":[]}`},
 	}
-	if raw != `{"buttons":[]}` {
-		t.Fatalf(`want {"buttons":[]}, got %q`, raw)
+	for _, tc := range cases {
+		raw, err := tc.got()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if raw != tc.want {
+			t.Fatalf("%s: want %s, got %q", tc.name, tc.want, raw)
+		}
 	}
 }
 

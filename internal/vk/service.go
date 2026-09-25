@@ -634,10 +634,10 @@ func (s *Service) handleCancelGame(ctx context.Context, c *commandCtx) error {
 	case removed > 1:
 		line += fmt.Sprintf(" Снял записи: %d.", removed)
 	}
+	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, cancelled.ID)
 	if err := s.sendText(ctx, c.chat.ID, c.peerID, line, ""); err != nil {
 		return err
 	}
-	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, cancelled.ID)
 	return s.notify(ctx, c, "Игра отменена")
 }
 
@@ -886,10 +886,10 @@ func (s *Service) renderAnnouncement(ev event.Event, confirmed, waitlist []booki
 	}
 
 	// Кнопок у анонса нет: «Иду» / «Не иду» живут на постоянной клавиатуре под
-	// полем ввода, дублировать их в сообщении не нужно. Пустой набор кнопок
-	// заодно снимает кнопки у анонсов, отправленных прежней версией, при
-	// первой же правке.
-	raw, err := RemoveKeyboard()
+	// полем ввода, дублировать их в сообщении не нужно. Пустой inline-набор
+	// заодно снимает кнопки у анонсов, отправленных прежней версией, и не
+	// трогает клавиатуру под полем ввода.
+	raw, err := RemoveInlineKeyboard()
 	if err != nil {
 		return "", "", err
 	}
@@ -935,7 +935,7 @@ func (s *Service) renderCancelledAnnouncement(ev event.Event, confirmed, waitlis
 	}
 
 	// Кнопки записи у отменённого анонса не нужны: записываться некуда.
-	raw, err := RemoveKeyboard()
+	raw, err := RemoveInlineKeyboard()
 	if err != nil {
 		return "", "", err
 	}
@@ -1022,10 +1022,13 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 		if err != nil {
 			return err
 		}
+		// Правка анонса идёт до строки в чат: клавиатуру под полем ввода беседа
+		// берёт у последнего сообщения бота, и последним должно быть сообщение с
+		// «Иду» / «Не иду», иначе кнопки исчезнут сразу после записи.
+		s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 		if err := s.sendText(ctx, c.chat.ID, c.peerID, fmt.Sprintf("резерв %d - %s", position, b.PlayerName), ""); err != nil {
 			return err
 		}
-		s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 		return s.notify(ctx, c, fmt.Sprintf("Мест нет — вы в резерве (%d-й)", position))
 	}
 
@@ -1033,10 +1036,13 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 	if b.SeatNo != nil {
 		seat = *b.SeatNo
 	}
+	// Правка анонса идёт до строки в чат: клавиатуру под полем ввода беседа берёт
+	// у последнего сообщения бота, и последним должно быть сообщение с «Иду» /
+	// «Не иду», иначе кнопки исчезнут сразу после записи.
+	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 	if err := s.sendText(ctx, c.chat.ID, c.peerID, fmt.Sprintf("%d - %s", seat, b.PlayerName), ""); err != nil {
 		return err
 	}
-	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 	return s.notify(ctx, c, fmt.Sprintf("✅ Вы записаны: место %d", seat))
 }
 
@@ -1127,10 +1133,10 @@ func (s *Service) cancelFor(ctx context.Context, c *commandCtx) error {
 		}
 		line += fmt.Sprintf("\n%d - %s из резерва", seat, res.Promoted.PlayerName)
 	}
+	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, me.EventID)
 	if err := s.sendText(ctx, c.chat.ID, c.peerID, line, ""); err != nil {
 		return err
 	}
-	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, me.EventID)
 	return s.notify(ctx, c, "Запись отменена")
 }
 
@@ -1337,7 +1343,9 @@ func (s *Service) refreshAnnouncementIfPosted(ctx context.Context, chatID, peerI
 // refreshAnnouncementLogged updates the announcement and only writes a failure
 // to the log: the booking itself already happened and was reported, so a stale
 // announcement must not turn into an error for the person who pressed the
-// button.
+// button. Вызывать её нужно до строки в чат: клавиатуру под полем ввода беседа
+// берёт у последнего сообщения бота, и последним должно остаться сообщение с
+// «Иду» / «Не иду».
 func (s *Service) refreshAnnouncementLogged(ctx context.Context, chatID, peerID, eventID int64) {
 	if err := s.refreshAnnouncement(ctx, chatID, peerID, eventID); err != nil {
 		s.log.Printf("vk: refresh announcement of game %d: %v", eventID, err)
