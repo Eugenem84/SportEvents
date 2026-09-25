@@ -527,6 +527,9 @@ func TestCallbackMessageNewStartWelcomes(t *testing.T) {
 	if strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
 		t.Fatalf("no game is open, so the reply must hide the sign-up buttons: %q", h.msg.sent[0].Keyboard)
 	}
+	if !strings.Contains(h.msg.sent[0].Text, "закрепите") {
+		t.Fatalf("help must explain how the announcement stays on top: %q", h.msg.sent[0].Text)
+	}
 }
 
 func TestCallbackMessageNewButtonPayload(t *testing.T) {
@@ -1689,6 +1692,9 @@ func TestCallbackSettingsScreenForAdmin(t *testing.T) {
 	}
 	if !strings.Contains(got.Text, defaultTitle) {
 		t.Fatalf("game name: %q", got.Text)
+	}
+	if !strings.Contains(got.Text, "закрепить анонс") {
+		t.Fatalf("settings must tell the admin how to keep the announcement on top: %q", got.Text)
 	}
 	btn := firstButton(t, got.Keyboard)
 	if btn.Action.Type != "callback" {

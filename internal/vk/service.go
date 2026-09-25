@@ -441,8 +441,23 @@ func (s *Service) rememberAnnouncementID(ctx context.Context, peerID int64, p Pa
 	// Только теперь анонс можно закрепить: при отправке VK не называет id
 	// сообщения в беседе. Закрепление разрешено владельцу беседы, остальным VK
 	// отвечает 925 — это не ошибка записи, поэтому просто пишем в лог.
+	s.pinAnnouncement(ctx, peerID, p.EventID, messageID)
+}
+
+// pinAnnouncement tries to pin the announcement, so the roster stays at the top
+// of the chat instead of scrolling away. VK allows that to the owner of the
+// conversation only: сообществу, которое в чужой беседе лишь администратор, он
+// отвечает 925 — тогда анонс закрепляет администратор вручную (долгое нажатие →
+// «Закрепить»), а бот продолжает обновлять то же сообщение: правка
+// закреплённого сообщения работает (проверено вживую). Неудача — не ошибка
+// записи, поэтому она только попадает в лог.
+func (s *Service) pinAnnouncement(ctx context.Context, peerID, eventID, messageID int64) {
+	if messageID == 0 {
+		return
+	}
 	if err := s.messenger.PinMessage(ctx, peerID, messageID); err != nil {
-		s.log.Printf("vk: cannot pin announcement of game %d: %v", p.EventID, err)
+		s.log.Printf("vk: game %d: announcement is not pinned (VK allows pinning to the chat owner only, "+
+			"the administrator pins it by hand): %v", eventID, err)
 	}
 }
 
@@ -753,12 +768,9 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 
 	// Пробуем закрепить анонс, чтобы состав не уезжал вверх вместе с
 	// перепиской. VK разрешает это владельцу беседы; сообществу, которое в
-	// беседе лишь администратор, он отвечает 925 — тогда просто живём дальше.
-	if msgID != 0 {
-		if err := s.messenger.PinMessage(ctx, c.peerID, msgID); err != nil {
-			s.log.Printf("vk: cannot pin announcement of game %d: %v", ev.ID, err)
-		}
-	}
+	// беседе лишь администратор, он отвечает 925 — тогда закрепляет
+	// администратор вручную, а бот продолжает обновлять то же сообщение.
+	s.pinAnnouncement(ctx, c.peerID, ev.ID, msgID)
 
 	// Открытие записи — это и повод показать кнопки «Иду» / «Не иду» под полем
 	// ввода: клавиатуру беседы держит последнее сообщение бота.
@@ -1555,7 +1567,13 @@ func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, str
 	fmt.Fprintf(&b, "Расписание игр чата «%s»\n", ch.Title)
 	fmt.Fprintf(&b, "Игра: %s, %d мест\n\n", defaultTitle, defaultCapacity)
 	fmt.Fprintf(&b, "Сейчас: %s\n\n", schedule.Describe(slots))
-	b.WriteString("Время указывается в поясе чата. Чтобы задать или изменить день, пришлите «/настройки вс 10:00», убрать — «/настройки убрать сб».")
+	// Закрепить анонс бот может только в беседе, которой владеет сообщество: в
+	// чужой беседе VK отвечает 925. Там закрепляет администратор вручную, и бот
+	// продолжает обновлять тот же анонс — правка закреплённого сообщения
+	// работает (проверено вживую 25.09.2026).
+	hint := "Время указывается в поясе чата. Чтобы задать или изменить день, пришлите «/настройки вс 10:00», убрать — «/настройки убрать сб».\n\n" +
+		"Если закрепить анонс игры в беседе (долгое нажатие на сообщение → «Закрепить»), он останется наверху, а состав бот продолжит обновлять в нём же."
+	b.WriteString(hint)
 
 	rows := make([][]Button, 0, len(slots)+2)
 	// Отмена игры стоит рядом с расписанием: это тот же экран администратора, и
@@ -1638,6 +1656,7 @@ func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, display
 			"/отменить игру — отменить игру и снять записи (администратор)\n"+
 			"/настройки — расписание: /настройки вс 10:00 (администратор)\n"+
 			"/помощь — эта справка\n\n"+
+			"Закрепить анонс игры в беседе VK даёт только её владельцу: закрепите сообщение-анонс вручную, и состав будет обновляться в нём же.\n\n"+
 			"Бот отвечает только на команды и кнопки, поэтому не мешает вашей переписке. "+
 			"Кнопки «Иду» и «Не иду» появляются под полем ввода, пока открыта запись на игру.",
 		displayName, chatTitle)
