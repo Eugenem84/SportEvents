@@ -247,14 +247,43 @@ func (h *handler) serveStatic(w http.ResponseWriter, r *http.Request) {
 type launchParams struct {
 	userID int64
 	chatID int64
+	// hash is the launch hash. Our own «Открыть приложение» button carries the
+	// conversation in it, because VK does not pass vk_chat_id for a launch from
+	// the bot keyboard.
+	hash string
 	// signed reports that the sign of the launch parameters is valid, checked
 	// that the check was possible at all (the protected key is configured).
 	signed  bool
 	checked bool
 }
 
-// peerID is the conversation peer id behind vk_chat_id.
-func (lp launchParams) peerID() int64 { return conversationPeerIDMin + lp.chatID }
+// peerID is the conversation the app was opened from: vk_chat_id numbers a chat,
+// and the «peer» in the launch hash names it directly — the app asks the bot's
+// own chat_channels about either. Zero means the app does not know the chat.
+func (lp launchParams) peerID() int64 {
+	if lp.chatID != 0 {
+		return conversationPeerIDMin + lp.chatID
+	}
+	return peerFromHash(lp.hash)
+}
+
+// peerFromHash reads what the app button put into the launch hash: «peer=<id>».
+// Empty or foreign content means the button was an older one or the hash is not
+// ours, and then the app can only tell the person to open it again.
+func peerFromHash(hash string) int64 {
+	for _, part := range strings.Split(strings.TrimPrefix(hash, "#"), "&") {
+		name, value, ok := strings.Cut(part, "=")
+		if !ok || name != "peer" {
+			continue
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || id < conversationPeerIDMin {
+			return 0
+		}
+		return id
+	}
+	return 0
+}
 
 // launchParams reads the query and, when the protected key is configured,
 // verifies the sign: without that check anyone could call the API with someone
@@ -264,6 +293,7 @@ func (h *handler) launchParams(w http.ResponseWriter, r *http.Request) (launchPa
 	lp := launchParams{
 		userID: atoi64(q.Get("vk_user_id")),
 		chatID: atoi64(q.Get("vk_chat_id")),
+		hash:   q.Get("hash"),
 	}
 	if h.appSecret != "" {
 		lp.checked = true
@@ -331,11 +361,11 @@ var (
 // resolve maps the launch parameters to the Chat and the internal User of the
 // person who opened the app.
 func (h *handler) resolve(ctx context.Context, lp launchParams) (chat.Chat, chat.User, error) {
-	if lp.chatID == 0 {
+	peer := lp.peerID()
+	if peer == 0 {
 		return chat.Chat{}, chat.User{}, errNoChatContext
 	}
-	peerID := strconv.FormatInt(lp.peerID(), 10)
-	ch, err := h.deps.Chats.FindByChannel(ctx, chat.PlatformVK, peerID)
+	ch, err := h.deps.Chats.FindByChannel(ctx, chat.PlatformVK, strconv.FormatInt(peer, 10))
 	if err != nil {
 		return chat.Chat{}, chat.User{}, err
 	}
@@ -446,7 +476,7 @@ func (h *handler) state(ctx context.Context, lp launchParams) (state, error) {
 	ch, me, err := h.resolve(ctx, lp)
 	switch {
 	case errors.Is(err, errNoChatContext):
-		resp.Notice = "Приложение открыто не из беседы. Откройте его кнопкой «Открыть приложение» в беседе — тогда будут видны игры и запись."
+		resp.Notice = "Приложение не знает, из какой беседы его открыли. Отправьте боту в беседе любую команду (например «/помощь»), чтобы клавиатура обновилась, и нажмите «Открыть приложение» ещё раз."
 		return resp, nil
 	case errors.Is(err, errNotConnected):
 		resp.Notice = "Эта беседа ещё не подключена к боту: администратору нужно написать ему «подключить»."

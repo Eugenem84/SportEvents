@@ -2162,7 +2162,7 @@ func TestCallbackObjectPayloadMessageEvent(t *testing.T) {
 func TestPersistentKeyboardShape(t *testing.T) {
 	h := newHarness(t, true)
 
-	raw, err := h.svc.signUpKeyboard()
+	raw, err := h.svc.signUpKeyboard(2000000047)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2203,6 +2203,10 @@ func TestPersistentKeyboardShape(t *testing.T) {
 	}
 	if app.Label != "Открыть приложение" {
 		t.Fatalf("app label: %q", app.Label)
+	}
+	// Хеш несёт беседу: VK не передаёт vk_chat_id при запуске с клавиатуры.
+	if app.Hash != "peer=2000000047" {
+		t.Fatalf("hash: %q", app.Hash)
 	}
 }
 

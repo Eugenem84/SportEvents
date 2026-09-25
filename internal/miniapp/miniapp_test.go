@@ -450,11 +450,47 @@ func TestStateWithoutChatContextExplains(t *testing.T) {
 	}
 
 	got := decodeState(t, body)
-	if !strings.Contains(got.Notice, "не из беседы") {
+	if !strings.Contains(got.Notice, "не знает") {
 		t.Fatalf("notice: %q", got.Notice)
 	}
 	if got.Chat != nil || len(got.Games) != 0 {
 		t.Fatalf("no chat, no games: %+v", got)
+	}
+}
+
+// Кнопка «Открыть приложение» несёт беседу в хеше: при запуске с клавиатуры VK
+// не передаёт vk_chat_id, поэтому без него приложение спрашивает сервер про peer
+// из хеша.
+func TestStateResolvesChatFromLaunchHash(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+
+	code, body := do(t, h.app, http.MethodGet,
+		"/app/api/state?vk_user_id=42&vk_platform=mobile_android&hash=peer%3D2000000047", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+
+	got := decodeState(t, body)
+	if got.Chat == nil || got.Chat.Title != "Волейбол Иваново" {
+		t.Fatalf("chat from the hash: %+v (notice %q)", got.Chat, got.Notice)
+	}
+}
+
+// Чужой хеш беседу не подменяет: без номера беседы остаётся подсказка.
+func TestStateIgnoresForeignHash(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+
+	code, body := do(t, h.app, http.MethodGet,
+		"/app/api/state?vk_user_id=42&hash=screen%3Dsettings", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+
+	got := decodeState(t, body)
+	if got.Chat != nil || !strings.Contains(got.Notice, "не знает") {
+		t.Fatalf("chat: %+v, notice: %q", got.Chat, got.Notice)
 	}
 }
 

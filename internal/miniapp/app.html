@@ -155,9 +155,11 @@ a { color: var(--accent); text-decoration: none; }
   var busy = false;
 
   // api зовёт наш же сервер и пересылает ему параметры запуска: подпись (sign)
-  // проверяет сервер, страница её не трогает.
+  // проверяет сервер, страница её не трогает. Хеш передаём сами: VK дописывает
+  // туда то, что положила кнопка «Открыть приложение» (номер беседы), а хеш в
+  // HTTP-запрос не попадает.
   function api(path, options) {
-    return fetch(BASE + '/api/' + path + location.search, options).then(function (res) {
+    return fetch(BASE + '/api/' + path + launchQuery(), options).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (body) {
         if (!res.ok) {
           throw new Error(body && body.error ? body.error : 'Ошибка ' + res.status);
@@ -169,6 +171,15 @@ a { color: var(--accent); text-decoration: none; }
 
   function load() {
     return api('state').then(render, function (err) { renderError(err); });
+  }
+
+  // launchQuery — параметры запуска страницы плюс её хеш: кнопка «Открыть
+  // приложение» кладёт туда номер беседы, а фрагмент адреса на сервер не уходит.
+  function launchQuery() {
+    var query = location.search || '';
+    var hash = (location.hash || '').replace(/^#/, '');
+    if (!hash) { return query; }
+    return (query ? query + '&' : '?') + 'hash=' + encodeURIComponent(hash);
   }
 
   function action(path, eventID, btn) {

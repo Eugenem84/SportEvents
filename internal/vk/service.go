@@ -493,7 +493,7 @@ func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
 		return s.sendText(ctx, ch.ID, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
 	}
 
-	kb, err := s.chatKeyboard(ctx, ch.ID)
+	kb, err := s.chatKeyboard(ctx, ch.ID, msg.PeerID)
 	if err != nil {
 		return err
 	}
@@ -773,7 +773,7 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 	if note == "" {
 		note = fmt.Sprintf("Запись открыта: %s.", s.formatWhenFull(ev.StartsAt))
 	}
-	signUp, err := s.signUpKeyboard()
+	signUp, err := s.signUpKeyboard(c.peerID)
 	if err != nil {
 		return err
 	}
@@ -1577,7 +1577,7 @@ func (s *Service) handleApp(ctx context.Context, c *commandCtx) error {
 			"Мини-приложение не подключено: на сервере не задан VK_APP_ID.", "")
 	}
 
-	kb, err := (Keyboard{Inline: true, Buttons: [][]Button{s.appRow()}}).Marshal()
+	kb, err := (Keyboard{Inline: true, Buttons: [][]Button{s.appRow(c.peerID)}}).Marshal()
 	if err != nil {
 		return err
 	}
@@ -1742,7 +1742,7 @@ func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, str
 // Живая беседа не должна держать кнопки записи, когда записываться некуда.
 func (s *Service) sendText(ctx context.Context, chatID, peerID int64, text, keyboard string) error {
 	if keyboard == "" {
-		kb, err := s.chatKeyboard(ctx, chatID)
+		kb, err := s.chatKeyboard(ctx, chatID, peerID)
 		if err != nil {
 			return err
 		}
@@ -1758,7 +1758,7 @@ func (s *Service) sendText(ctx context.Context, chatID, peerID int64, text, keyb
 // a game is open, and the «Открыть приложение» button otherwise. chatID 0 means
 // "unknown chat" (e.g. a conversation that is not connected yet) — there is
 // nothing to sign up to, so only the app button would be left.
-func (s *Service) chatKeyboard(ctx context.Context, chatID int64) (string, error) {
+func (s *Service) chatKeyboard(ctx context.Context, chatID, peerID int64) (string, error) {
 	open := false
 	if chatID != 0 {
 		games, err := s.events.ListUpcomingWithCounts(ctx, chatID, s.now().UTC(), 1)
@@ -1768,13 +1768,13 @@ func (s *Service) chatKeyboard(ctx context.Context, chatID int64) (string, error
 		open = len(games) > 0
 	}
 	if open {
-		return s.signUpKeyboard()
+		return s.signUpKeyboard(peerID)
 	}
-	return s.appKeyboard()
+	return s.appKeyboard(peerID)
 }
 
 func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, displayName, chatTitle string) error {
-	kb, err := s.chatKeyboard(ctx, chatID)
+	kb, err := s.chatKeyboard(ctx, chatID, peerID)
 	if err != nil {
 		return err
 	}
@@ -1805,12 +1805,12 @@ func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, display
 // open: see chatKeyboard. Buttons are callback buttons: VK delivers a press as
 // message_event, so pressing one posts nothing to the chat by itself.
 // Verified against the live community.
-func (s *Service) signUpKeyboard() (string, error) {
+func (s *Service) signUpKeyboard(peerID int64) (string, error) {
 	rows := [][]Button{{
 		CallbackButton("Иду", CommandPayload(cmdAttend), ColorPositive),
 		CallbackButton("Не иду", CommandPayload(cmdSkip), ColorNegative),
 	}}
-	if app := s.appRow(); len(app) > 0 {
+	if app := s.appRow(peerID); len(app) > 0 {
 		rows = append(rows, app)
 	}
 	return Keyboard{Buttons: rows}.Marshal()
@@ -1820,8 +1820,8 @@ func (s *Service) signUpKeyboard() (string, error) {
 // «Открыть приложение» row alone, so the mini app stays one tap away in the
 // chat even between games. Without VK_APP_ID there is nothing to show, and the
 // keyboard is taken away as before.
-func (s *Service) appKeyboard() (string, error) {
-	app := s.appRow()
+func (s *Service) appKeyboard(peerID int64) (string, error) {
+	app := s.appRow(peerID)
 	if len(app) == 0 {
 		return RemoveKeyboard()
 	}
@@ -1829,18 +1829,28 @@ func (s *Service) appKeyboard() (string, error) {
 }
 
 // appRow is the row with the button that opens the mini app in the chat's
-// WebView: VK passes vk_chat_id to an app launched from a conversation, which
-// is what the diagnostic page at /app/ looks for. Empty when VK_APP_ID is not
-// configured.
+// WebView. Empty when VK_APP_ID is not configured.
 //
 // The button sits in the chat keyboard right under «Иду» / «Не иду»: VK accepts
 // open_app there (проверено запросом к API: такая клавиатура доходит до
 // проверки получателя, 911 не приходит), and the app is then always at hand.
-func (s *Service) appRow() []Button {
+func (s *Service) appRow(peerID int64) []Button {
 	if s.appID == 0 {
 		return nil
 	}
-	return []Button{OpenAppButton("Открыть приложение", s.appID, s.appOwnerID(), "")}
+	return []Button{OpenAppButton("Открыть приложение", s.appID, s.appOwnerID(), appHash(peerID))}
+}
+
+// appHash is what the app button puts into the launch hash: the conversation the
+// button was pressed in. VK does not pass vk_chat_id for a launch from the bot
+// keyboard (проверено вживую: vk_ref=bot_keyboard, а vk_chat_id в адресе нет),
+// so the button carries the chat itself — and the app resolves that peer through
+// the bot's own chat_channels.
+func appHash(peerID int64) string {
+	if peerID == 0 {
+		return ""
+	}
+	return "peer=" + strconv.FormatInt(peerID, 10)
 }
 
 // parseCommand maps a message to a command with its parameters. A button
