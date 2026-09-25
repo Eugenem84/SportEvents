@@ -10,7 +10,9 @@ Callback API (group_id, type, event_id, object), поэтому приложен
 
 Что должно быть включено в сообществе: «Управление → Работа с API → Long Poll API»
 и события message_new и message_event (без второго не работают callback-кнопки —
-например, кнопки настроек расписания).
+например, кнопки настроек расписания). Чтобы увидеть то, что мини-приложение
+отправило через VKWebAppSendPayload, нужен ещё тип события app_payload и
+разрешение «Запуск приложения из сообщества» в настройках приложения.
 
 Запуск:
 
@@ -33,7 +35,7 @@ TARGET = os.environ.get("BRIDGE_TARGET", "http://localhost:8082/vk/callback")
 ONLY_PEER = os.environ.get("BRIDGE_PEER_ID", "")
 
 # Обновления, которые умеет обрабатывать приложение.
-FORWARD = {"message_new", "message_event"}
+FORWARD = {"message_new", "message_event", "app_payload"}
 
 
 def api(method, params):
@@ -63,6 +65,13 @@ def describe(update):
     msg = obj.get("message") or {}
     if update.get("type") == "message_new":
         return f"peer={msg.get('peer_id')} from={msg.get('from_id')} text={msg.get('text')!r}"
+    if update.get("type") == "app_payload":
+        # То, что мини-приложение отправило в сообщество: печатаем как есть,
+        # состав объекта у VK описан скупо, а угадывать поля не хочется.
+        return (
+            f"user={obj.get('user_id')} app={obj.get('app_id')} "
+            f"payload={obj.get('payload')!r}"
+        )
     return (
         f"peer={obj.get('peer_id')} user={obj.get('user_id')} "
         f"cmid={obj.get('conversation_message_id')} payload={obj.get('payload')!r}"
@@ -117,7 +126,9 @@ def main():
                 continue
             peer = peer_of(u)
             print(f"[{time.strftime('%H:%M:%S')}] {u.get('type')} {describe(u)}", flush=True)
-            if ONLY_PEER and str(peer) != str(ONLY_PEER):
+            # app_payload приходит сообществу, а не беседе: peer_id у него нет,
+            # и фильтр по выбранной беседе не должен его съедать.
+            if ONLY_PEER and peer is not None and str(peer) != str(ONLY_PEER):
                 continue
 
             req = urllib.request.Request(
