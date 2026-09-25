@@ -55,7 +55,9 @@ VK → VK Adapter → Go backend (Event / Booking) → PostgreSQL
 
 TODO Phase 1–3 (Event Service поверх PostgreSQL, Booking Service: запись, очередь, отмена, FIFO promotion, уведомление) — готово и покрыто интеграционными тестами.
 
-TODO Phase 4 (VK Adapter) — код готов и покрыт тестами: POST /vk/callback (confirmation и secret), message_new и callback-кнопки (message_event), from_id → identity, peer_id → ChatChannel, ответ в беседу с keyboard, идемпотентность повторного callback. Осталась только разовая ручная настройка реального сообщества VK (шаги ниже). Следующий этап — TODO Phase 5, подключение беседы.
+TODO Phase 4 (VK Adapter) — код готов и покрыт тестами: POST /vk/callback (confirmation и secret), message_new и callback-кнопки (message_event), from_id → identity, peer_id → ChatChannel, ответ в беседу с keyboard, идемпотентность повторного callback. Осталась только разовая ручная настройка реального сообщества VK (шаги ниже).
+
+TODO Phase 5 (Подключение беседы) — код готов и покрыт тестами: в беседе с ботом администратор пишет «подключить» → проверка прав через VK API (`messages.getConversationMembers`) → Chat + ChatChannel + первый ChatAdmin одной транзакцией (`chat.Connect`, идемпотентно, гонка повторного callback) → сообщение об успехе. Следующий этап — TODO Phase 6, пользовательский сценарий (список игр, запись, очередь, отмена).
 
 Запуск:
 
@@ -103,6 +105,7 @@ VK_SECRET — ключ проверки callback, если его требует
 4. Включить типы событий сообщества: `message_new` и `message_event`.
 5. Confirmation-строку, которую VK показывает в этом же разделе, занести в `VK_CONFIRMATION_TOKEN`. Если включён секретный ключ — его значение в `VK_SECRET`.
 6. `VK_GROUP_ID` — id сообщества (положительное число из адреса `https://vk.com/club<id>`).
+7. Добавить бота в беседу и выдать ему права администратора беседы — без них VK не отдаёт список участников, по которому проверяются права инициатора. После этого администратор беседы пишет боту «подключить»: беседа регистрируется, а он становится администратором Chat. Подключить может только администратор этой беседы.
 
 Локально VK не ходит на `localhost`: нужен публичный HTTPS-туннель на порт приложения или деплой на домашний сервер. В docker-compose VK-переменные идут из `.env` через `VK_*` (см. `.env.example`); без них сервис поднимается, но `/vk/callback` отключён. На домашнем контуре нужны `VK_TOKEN` **и** `VK_CONFIRMATION_TOKEN` (см. DEPLOY.md).
 

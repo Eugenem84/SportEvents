@@ -56,6 +56,11 @@ func (f *fakeMessenger) GetUserName(_ context.Context, userID int64) (string, er
 type fakeChatStore struct {
 	callCount int
 	chat      *chat.Chat
+
+	connectCalls   int
+	connectInput   chat.ConnectInput
+	connectedChat  chat.Chat
+	connectCreated bool
 }
 
 func (f *fakeChatStore) FindByChannel(_ context.Context, platform, externalChatID string) (*chat.Chat, error) {
@@ -64,6 +69,38 @@ func (f *fakeChatStore) FindByChannel(_ context.Context, platform, externalChatI
 		return nil, nil
 	}
 	return f.chat, nil
+}
+
+func (f *fakeChatStore) Connect(_ context.Context, in chat.ConnectInput) (chat.Chat, bool, error) {
+	f.connectCalls++
+	f.connectInput = in
+	if f.connectedChat.ID == 0 {
+		f.connectedChat = chat.Chat{ID: 42, Title: in.ChatTitle}
+	}
+	return f.connectedChat, f.connectCreated, nil
+}
+
+type fakeConversations struct {
+	title      string
+	admin      bool
+	titleErr   error
+	adminErr   error
+	adminCalls int
+}
+
+func (f *fakeConversations) GetConversationTitle(_ context.Context, peerID int64) (string, error) {
+	if f.titleErr != nil {
+		return "", f.titleErr
+	}
+	return f.title, nil
+}
+
+func (f *fakeConversations) IsConversationAdmin(_ context.Context, peerID, userID int64) (bool, error) {
+	f.adminCalls++
+	if f.adminErr != nil {
+		return false, f.adminErr
+	}
+	return f.admin, nil
 }
 
 type fakeUserStore struct {
@@ -84,14 +121,16 @@ type harness struct {
 	msg   *fakeMessenger
 	chats *fakeChatStore
 	users *fakeUserStore
+	convs *fakeConversations
 }
 
 func newHarness(t *testing.T, chatLinked bool) *harness {
 	t.Helper()
 	h := &harness{
 		msg:   &fakeMessenger{userName: "Иван Петров"},
-		chats: &fakeChatStore{},
+		chats: &fakeChatStore{connectCreated: true},
 		users: &fakeUserStore{},
+		convs: &fakeConversations{title: "Волейбол Иваново", admin: true},
 	}
 	if chatLinked {
 		h.chats.chat = &chat.Chat{ID: 1, Title: "Волейбол"}
@@ -100,7 +139,7 @@ func newHarness(t *testing.T, chatLinked bool) *harness {
 		ConfirmationToken: "confirmation-code-123",
 		Secret:            "sekret",
 		GroupID:           "12345",
-	}, h.msg, h.chats, h.users)
+	}, h.msg, h.chats, h.users, h.convs)
 	return h
 }
 
@@ -343,5 +382,142 @@ func TestCallbackRejectedSecretNotMarkedDeduped(t *testing.T) {
 	}
 	if len(h.msg.sent) != 1 {
 		t.Fatalf("want 1 welcome, got %d", len(h.msg.sent))
+	}
+}
+
+// --- connect (Phase 5) ---
+
+// connectEnvelope is a message_new asking to connect the conversation.
+func connectEnvelope(peerID, fromID int64, text string) string {
+	return fmt.Sprintf(`{"type":"message_new","group_id":12345,"secret":"sekret","object":{"message":{`+
+		`"id":9,"date":0,"peer_id":%d,"from_id":%d,"text":%q,"out":0}}}`, peerID, fromID, text)
+}
+
+func TestCallbackConnectCreatesChatAndAdmin(t *testing.T) {
+	h := newHarness(t, false) // conversation not connected yet
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.convs.adminCalls != 1 {
+		t.Fatalf("initiator rights must be checked once, got %d", h.convs.adminCalls)
+	}
+	if h.chats.connectCalls != 1 {
+		t.Fatalf("want 1 connect, got %d", h.chats.connectCalls)
+	}
+	got := h.chats.connectInput
+	if got.Platform != chat.PlatformVK || got.ExternalChatID != "2000000047" {
+		t.Fatalf("connect input channel: %+v", got)
+	}
+	if got.ChatTitle != "Волейбол Иваново" {
+		t.Fatalf("connect input title: %q", got.ChatTitle)
+	}
+	if got.InitiatorID != h.users.user.ID {
+		t.Fatalf("initiator: want %d, got %d", h.users.user.ID, got.InitiatorID)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "подключена") {
+		t.Fatalf("reply: %q", h.msg.sent[0].Text)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Волейбол Иваново") {
+		t.Fatalf("reply must mention the chat title: %q", h.msg.sent[0].Text)
+	}
+	if !strings.Contains(h.msg.sent[0].Keyboard, "Игры") {
+		t.Fatalf("connected chat must get the keyboard: %q", h.msg.sent[0].Keyboard)
+	}
+}
+
+func TestCallbackConnectDeniedForNonAdmin(t *testing.T) {
+	h := newHarness(t, false)
+	h.convs.admin = false
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.chats.connectCalls != 0 {
+		t.Fatal("a non-admin must not create a chat")
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "администратор") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+func TestCallbackConnectRejectsDirectDialog(t *testing.T) {
+	h := newHarness(t, false)
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(555, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.users.callCount != 0 || h.convs.adminCalls != 0 || h.chats.connectCalls != 0 {
+		t.Fatal("a one-to-one dialog must not reach identity, rights or the store")
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "бесед") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+func TestCallbackConnectAlreadyConnected(t *testing.T) {
+	h := newHarness(t, true) // chat is linked already
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.chats.connectCalls != 0 || h.convs.adminCalls != 0 {
+		t.Fatal("an already connected chat must not be connected again")
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже подключена") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+// A concurrent connect (a retried callback without event_id, or another bot
+// instance) is resolved by the store: created=false must be reported as
+// "already connected" instead of a second success message.
+func TestCallbackConnectRaceAlreadyConnected(t *testing.T) {
+	h := newHarness(t, false)
+	h.chats.connectCreated = false
+	h.chats.connectedChat = chat.Chat{ID: 7, Title: "Волейбол Иваново"}
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже подключена") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+// A missing title must not block the connection: a placeholder is stored.
+func TestCallbackConnectTitleFallback(t *testing.T) {
+	h := newHarness(t, false)
+	h.convs.titleErr = fmt.Errorf("vk: no access")
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.chats.connectCalls != 1 {
+		t.Fatalf("connect must proceed without a title, got %d calls", h.chats.connectCalls)
+	}
+	if h.chats.connectInput.ChatTitle != "Беседа 2000000047" {
+		t.Fatalf("fallback title: %q", h.chats.connectInput.ChatTitle)
+	}
+}
+
+// A retried connect callback (same event_id) must not connect twice.
+func TestCallbackConnectRetriedEventProcessedOnce(t *testing.T) {
+	h := newHarness(t, false)
+	env := strings.Replace(connectEnvelope(2000000047, 555, "подключить"),
+		`"type":"message_new"`, `"type":"message_new","event_id":"conn-1"`, 1)
+	for i := 0; i < 2; i++ {
+		if code, _ := postJSON(t, h.svc.HandleCallback, env); code != http.StatusOK {
+			t.Fatalf("attempt %d: status %d", i, code)
+		}
+	}
+	if h.chats.connectCalls != 1 {
+		t.Fatalf("retried event must connect once, got %d", h.chats.connectCalls)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
 }

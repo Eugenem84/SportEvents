@@ -280,3 +280,102 @@ func TestKeyboardMarshal(t *testing.T) {
 		t.Fatalf("keyboard content: %q", raw)
 	}
 }
+
+func TestGetConversationTitle(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "messages.getConversationsById") {
+			t.Errorf("method path: %q", r.URL.Path)
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		got = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":{"count":1,"items":[{"chat_settings":{"title":"Волейбол Иваново"}}]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	title, err := c.GetConversationTitle(context.Background(), 2_000_000_047)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if title != "Волейбол Иваново" {
+		t.Fatalf("title: %q", title)
+	}
+	params, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params.Get("peer_ids") != "2000000047" {
+		t.Fatalf("peer_ids: %q", params.Get("peer_ids"))
+	}
+}
+
+func TestGetConversationTitleEmptyFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":{"count":0,"items":[]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	if _, err := c.GetConversationTitle(context.Background(), 555); err == nil {
+		t.Fatal("want error when VK returns no conversation")
+	}
+}
+
+func TestIsConversationAdmin(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "messages.getConversationMembers") {
+			t.Errorf("method path: %q", r.URL.Path)
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		got = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":{"count":3,"items":[` +
+			`{"member_id":555,"is_admin":1},` +
+			`{"member_id":777,"is_admin":0},` +
+			`{"member_id":888,"is_owner":1}]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	ctx := context.Background()
+
+	cases := []struct {
+		name   string
+		userID int64
+		want   bool
+	}{
+		{"administrator", 555, true},
+		{"owner", 888, true},
+		{"plain member", 777, false},
+		{"not a member", 999, false},
+	}
+	for _, tc := range cases {
+		isAdmin, err := c.IsConversationAdmin(ctx, 2_000_000_047, tc.userID)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if isAdmin != tc.want {
+			t.Fatalf("%s: want %v, got %v", tc.name, tc.want, isAdmin)
+		}
+	}
+
+	params, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params.Get("peer_id") != "2000000047" {
+		t.Fatalf("peer_id: %q", params.Get("peer_id"))
+	}
+}

@@ -2,6 +2,7 @@ package chat_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -133,6 +134,200 @@ func TestFindOrCreateUserConcurrentOnce(t *testing.T) {
 	}
 }
 
+// --- Connect / IsChatAdmin (Phase 5) ---
+
+func TestConnectCreatesChatChannelAndAdmin(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	userID := insertUser(t, ctx, pool, "Иван Петров")
+	extID := uniqueExt(t, "conv")
+
+	c, created, err := svc.Connect(ctx, chat.ConnectInput{
+		Platform:       chat.PlatformVK,
+		ExternalChatID: extID,
+		ChatTitle:      "Волейбол Иваново",
+		InitiatorID:    userID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first connect must create a chat")
+	}
+	if c.ID == 0 || c.Title != "Волейбол Иваново" {
+		t.Fatalf("chat: %+v", c)
+	}
+
+	found, err := svc.FindByChannel(ctx, chat.PlatformVK, extID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found == nil || found.ID != c.ID {
+		t.Fatalf("channel must point at the new chat, got %+v", found)
+	}
+
+	ok, err := svc.IsChatAdmin(ctx, c.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("the initiator must become a chat admin")
+	}
+	if got := countAdmins(t, ctx, pool, c.ID); got != 1 {
+		t.Fatalf("admins: want 1, got %d", got)
+	}
+}
+
+// Reconnecting an already connected conversation must return the existing
+// Chat and neither create a second one nor change its title or admins.
+func TestConnectIdempotent(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	userA := insertUser(t, ctx, pool, "Иван")
+	userB := insertUser(t, ctx, pool, "Пётр")
+	extID := uniqueExt(t, "conv")
+
+	first, created, err := svc.Connect(ctx, chat.ConnectInput{
+		Platform:       chat.PlatformVK,
+		ExternalChatID: extID,
+		ChatTitle:      "Волейбол Иваново",
+		InitiatorID:    userA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first connect must create a chat")
+	}
+
+	second, created, err := svc.Connect(ctx, chat.ConnectInput{
+		Platform:       chat.PlatformVK,
+		ExternalChatID: extID,
+		ChatTitle:      "Другое название",
+		InitiatorID:    userB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Fatal("second connect must not create a chat")
+	}
+	if second.ID != first.ID || second.Title != first.Title {
+		t.Fatalf("second connect must return the existing chat: %+v vs %+v", second, first)
+	}
+	if got := countChannelsFor(t, ctx, pool, chat.PlatformVK, extID); got != 1 {
+		t.Fatalf("channels: want 1, got %d", got)
+	}
+	if got := countAdmins(t, ctx, pool, first.ID); got != 1 {
+		t.Fatalf("admins: want only the first initiator, got %d", got)
+	}
+}
+
+// Concurrent connects (a retried callback, another bot instance) must
+// collapse to one Chat: the UNIQUE (platform, external_chat_id) index
+// serializes them and the losers roll back their own Chat row.
+func TestConnectConcurrentOnce(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	userID := insertUser(t, ctx, pool, "Иван")
+	extID := uniqueExt(t, "conv")
+	title := "Волейбол " + extID
+	const total = 8
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ids := make([]int64, 0, total)
+	createdCount := 0
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, created, err := svc.Connect(ctx, chat.ConnectInput{
+				Platform:       chat.PlatformVK,
+				ExternalChatID: extID,
+				ChatTitle:      title,
+				InitiatorID:    userID,
+			})
+			if err != nil {
+				t.Errorf("concurrent connect: %v", err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			ids = append(ids, c.ID)
+			if created {
+				createdCount++
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(ids) != total {
+		t.Fatalf("connects: want %d results, got %d", total, len(ids))
+	}
+	for _, id := range ids {
+		if id != ids[0] {
+			t.Fatalf("concurrent connects must return one chat, got id %d and %d", ids[0], id)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("exactly one connect must report created=true, got %d", createdCount)
+	}
+	if got := countChatsWithTitle(t, ctx, pool, title); got != 1 {
+		t.Fatalf("orphan chats from losing transactions: want 1 chat titled %q, got %d", title, got)
+	}
+	if got := countChannelsFor(t, ctx, pool, chat.PlatformVK, extID); got != 1 {
+		t.Fatalf("channels: want 1, got %d", got)
+	}
+	if got := countAdmins(t, ctx, pool, ids[0]); got != 1 {
+		t.Fatalf("admins: want 1, got %d", got)
+	}
+}
+
+func TestConnectInvalidInput(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	userID := insertUser(t, ctx, pool, "Иван")
+	extID := uniqueExt(t, "conv")
+
+	cases := map[string]chat.ConnectInput{
+		"no platform":    {ExternalChatID: extID, ChatTitle: "Волейбол", InitiatorID: userID},
+		"no channel":     {Platform: chat.PlatformVK, ChatTitle: "Волейбол", InitiatorID: userID},
+		"no title":       {Platform: chat.PlatformVK, ExternalChatID: extID, InitiatorID: userID},
+		"no initiator":   {Platform: chat.PlatformVK, ExternalChatID: extID, ChatTitle: "Волейбол"},
+		"blank title":    {Platform: chat.PlatformVK, ExternalChatID: extID, ChatTitle: "  ", InitiatorID: userID},
+		"blank channel":  {Platform: chat.PlatformVK, ExternalChatID: " ", ChatTitle: "Волейбол", InitiatorID: userID},
+		"blank platform": {Platform: " ", ExternalChatID: extID, ChatTitle: "Волейбол", InitiatorID: userID},
+	}
+
+	for name, in := range cases {
+		if _, _, err := svc.Connect(ctx, in); !errors.Is(err, chat.ErrInvalidConnect) {
+			t.Fatalf("%s: want ErrInvalidConnect, got %v", name, err)
+		}
+	}
+}
+
+func TestIsChatAdminFalse(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	userA := insertUser(t, ctx, pool, "Иван")
+	userB := insertUser(t, ctx, pool, "Пётр")
+	extID := uniqueExt(t, "conv")
+
+	c, _, err := svc.Connect(ctx, chat.ConnectInput{
+		Platform:       chat.PlatformVK,
+		ExternalChatID: extID,
+		ChatTitle:      "Волейбол",
+		InitiatorID:    userA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := svc.IsChatAdmin(ctx, c.ID, userB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("a non-initiator must not be a chat admin")
+	}
+}
+
 func setup(t *testing.T) (context.Context, *chat.Service, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
@@ -198,6 +393,49 @@ func countDistinctUsersFor(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 		 WHERE ui.platform = $1 AND ui.external_user_id = $2`,
 		platform, externalID,
 	).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func insertUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) int64 {
+	t.Helper()
+	var id int64
+	err := pool.QueryRow(ctx, `INSERT INTO users (display_name) VALUES ($1) RETURNING id`, name).Scan(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func countChannelsFor(t *testing.T, ctx context.Context, pool *pgxpool.Pool, platform, externalID string) int64 {
+	t.Helper()
+	var n int64
+	err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM chat_channels WHERE platform = $1 AND external_chat_id = $2`,
+		platform, externalID,
+	).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func countChatsWithTitle(t *testing.T, ctx context.Context, pool *pgxpool.Pool, title string) int64 {
+	t.Helper()
+	var n int64
+	err := pool.QueryRow(ctx, `SELECT count(*) FROM chats WHERE title = $1`, title).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func countAdmins(t *testing.T, ctx context.Context, pool *pgxpool.Pool, chatID int64) int64 {
+	t.Helper()
+	var n int64
+	err := pool.QueryRow(ctx, `SELECT count(*) FROM chat_admins WHERE chat_id = $1`, chatID).Scan(&n)
 	if err != nil {
 		t.Fatal(err)
 	}

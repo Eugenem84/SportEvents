@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -99,6 +100,107 @@ func (s *Service) FindOrCreateUserByExternalID(ctx context.Context, platform, ex
 		return User{}, fmt.Errorf("commit: %w", err)
 	}
 	return u, nil
+}
+
+// Connect binds an external conversation to an internal Chat, creating the
+// Chat, its ChatChannel and the first ChatAdmin in one transaction. It is
+// idempotent: connecting an already connected conversation returns the
+// existing Chat with created=false and never creates a second Chat.
+//
+// A concurrent connect (a retried VK callback) is serialized by the
+// UNIQUE (platform, external_chat_id) index: the loser gets no row back
+// from the channel insert, discards its own Chat via the deferred
+// rollback and returns the winner's Chat.
+func (s *Service) Connect(ctx context.Context, in ConnectInput) (Chat, bool, error) {
+	if err := validateConnect(in); err != nil {
+		return Chat{}, false, err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Chat{}, false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var c Chat
+	err = tx.QueryRow(ctx,
+		`INSERT INTO chats (title) VALUES ($1)
+		 RETURNING id, title, created_at`,
+		in.ChatTitle,
+	).Scan(&c.ID, &c.Title, &c.CreatedAt)
+	if err != nil {
+		return Chat{}, false, fmt.Errorf("insert chat: %w", err)
+	}
+
+	// ON CONFLICT DO NOTHING RETURNING reports who actually owns the
+	// channel: the caller. When another request connected the conversation
+	// first, no row comes back; the deferred rollback discards our fresh
+	// (and now orphan) Chat row and we return the existing Chat.
+	var channelID int64
+	err = tx.QueryRow(ctx,
+		`INSERT INTO chat_channels (chat_id, platform, external_chat_id)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (platform, external_chat_id) DO NOTHING
+		 RETURNING id`,
+		c.ID, in.Platform, in.ExternalChatID,
+	).Scan(&channelID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, ferr := s.FindByChannel(ctx, in.Platform, in.ExternalChatID)
+		if ferr != nil {
+			return Chat{}, false, ferr
+		}
+		if existing == nil {
+			return Chat{}, false, fmt.Errorf("connect: channel %s/%s vanished after conflict", in.Platform, in.ExternalChatID)
+		}
+		return *existing, false, nil
+	}
+	if err != nil {
+		return Chat{}, false, fmt.Errorf("insert channel: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO chat_admins (chat_id, user_id) VALUES ($1, $2)
+		 ON CONFLICT DO NOTHING`,
+		c.ID, in.InitiatorID,
+	); err != nil {
+		return Chat{}, false, fmt.Errorf("insert admin: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Chat{}, false, fmt.Errorf("commit: %w", err)
+	}
+	return c, true, nil
+}
+
+// IsChatAdmin reports whether the user administers the Chat.
+func (s *Service) IsChatAdmin(ctx context.Context, chatID, userID int64) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM chat_admins WHERE chat_id = $1 AND user_id = $2
+		)`,
+		chatID, userID,
+	).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("is chat admin: %w", err)
+	}
+	return ok, nil
+}
+
+func validateConnect(in ConnectInput) error {
+	if strings.TrimSpace(in.Platform) == "" {
+		return ErrInvalidConnect
+	}
+	if strings.TrimSpace(in.ExternalChatID) == "" {
+		return ErrInvalidConnect
+	}
+	if strings.TrimSpace(in.ChatTitle) == "" {
+		return ErrInvalidConnect
+	}
+	if in.InitiatorID == 0 {
+		return ErrInvalidConnect
+	}
+	return nil
 }
 
 func (s *Service) findUserByIdentity(ctx context.Context, platform, externalUserID string) (User, bool, error) {

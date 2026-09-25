@@ -64,11 +64,13 @@ func newVKService(pool *pgxpool.Pool) (*vk.Service, bool) {
 
 	client := vk.NewClient(token, os.Getenv("VK_GROUP_ID"))
 	chats := chat.NewService(pool)
+	// The VK client is both the messenger and the source of conversation
+	// metadata; the chat store resolves and registers external channels.
 	return vk.NewService(vk.Config{
 		ConfirmationToken: confirmation,
 		Secret:            os.Getenv("VK_SECRET"),
 		GroupID:           os.Getenv("VK_GROUP_ID"),
-	}, client, chats, chats), true
+	}, client, chats, chats, client), true
 }
 
 func healthHandler(pool *pgxpool.Pool) http.HandlerFunc {

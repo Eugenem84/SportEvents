@@ -23,9 +23,24 @@ type Messenger interface {
 	GetUserName(ctx context.Context, userID int64) (string, error)
 }
 
-// ChatStore resolves an external channel to the internal Chat.
+// ChatStore resolves and registers external channels in the internal Chat
+// model.
 type ChatStore interface {
 	FindByChannel(ctx context.Context, platform, externalChatID string) (*chat.Chat, error)
+	// Connect binds the external conversation to an internal Chat and
+	// returns it with created=false when it was already connected.
+	Connect(ctx context.Context, in chat.ConnectInput) (chat.Chat, bool, error)
+}
+
+// ConversationInfo reads the VK conversation metadata needed at connect
+// time (title, initiator rights). It is separate from Messenger because it
+// is used only when a conversation is registered.
+type ConversationInfo interface {
+	// GetConversationTitle returns the title of a group conversation.
+	GetConversationTitle(ctx context.Context, peerID int64) (string, error)
+	// IsConversationAdmin reports whether userID administers the
+	// conversation (messages.getConversationMembers).
+	IsConversationAdmin(ctx context.Context, peerID, userID int64) (bool, error)
 }
 
 // UserStore resolves an external identity to the internal User.
@@ -56,6 +71,7 @@ type Service struct {
 	messenger Messenger
 	chats     ChatStore
 	users     UserStore
+	convs     ConversationInfo
 
 	// events deduplicates VK callback events by their event_id, so a retry of
 	// the same event is not processed twice.
@@ -64,7 +80,7 @@ type Service struct {
 	log *log.Logger
 }
 
-func NewService(cfg Config, messenger Messenger, chats ChatStore, users UserStore) *Service {
+func NewService(cfg Config, messenger Messenger, chats ChatStore, users UserStore, convs ConversationInfo) *Service {
 	gid, _ := strconv.ParseInt(strings.TrimSpace(cfg.GroupID), 10, 64)
 	return &Service{
 		confirmationToken: strings.TrimSpace(cfg.ConfirmationToken),
@@ -73,6 +89,7 @@ func NewService(cfg Config, messenger Messenger, chats ChatStore, users UserStor
 		messenger:         messenger,
 		chats:             chats,
 		users:             users,
+		convs:             convs,
 		events:            newEventDedup(callbackDedupTTL),
 		log:               log.Default(),
 	}
@@ -83,7 +100,15 @@ const (
 	cmdGames         = "games"
 	cmdMyBookings    = "my"
 	cmdCancelBooking = "cancel"
+	cmdConnect       = "connect"
 )
+
+// conversationPeerIDMin is the lowest peer_id of a VK group conversation.
+// One-to-one dialogs use a plain user id below it, and a dialog has no
+// admins to register, so only group conversations can be connected.
+const conversationPeerIDMin = 2_000_000_000
+
+func isConversation(peerID int64) bool { return peerID >= conversationPeerIDMin }
 
 // handleMessageNew routes a conversation message. from_id / peer_id are
 // resolved to an internal User and Chat; the identity is created on first
@@ -98,9 +123,16 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 	if err != nil {
 		return fmt.Errorf("find chat: %w", err)
 	}
+	cmd := s.commandOf(msg.Text, msg.Payload)
+
+	// An unconnected conversation is not a Chat yet: the connection
+	// request is the only command that can act on it.
 	if ch == nil {
+		if cmd == cmdConnect {
+			return s.handleConnect(ctx, msg)
+		}
 		s.log.Printf("vk: message from unconnected peer %d", msg.PeerID)
-		return s.sendText(ctx, msg.PeerID, "Эта беседа ещё не подключена. Подключение появится в следующей версии бота.", "")
+		return s.sendText(ctx, msg.PeerID, "Эта беседа ещё не подключена. Напишите «подключить», чтобы подключить её.", "")
 	}
 
 	user, err := s.ensureUser(ctx, msg.FromID)
@@ -108,9 +140,11 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 		return err
 	}
 
-	switch s.commandOf(msg.Text, msg.Payload) {
+	switch cmd {
 	case cmdStart:
 		return s.sendWelcome(ctx, msg.PeerID, user.DisplayName, ch.Title)
+	case cmdConnect:
+		return s.sendText(ctx, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
 	case cmdGames:
 		return s.sendText(ctx, msg.PeerID, "Список игр появится на следующем этапе.", "")
 	case cmdMyBookings:
@@ -159,6 +193,59 @@ func (s *Service) handleMessageEvent(ctx context.Context, ev messageEvent) error
 	default:
 		return s.sendText(ctx, ev.PeerID, "Не понял команду. Напишите /start.", "")
 	}
+}
+
+// handleConnect registers the conversation as an internal Chat. Only a VK
+// conversation administrator may connect it, and only a group conversation:
+// a one-to-one dialog has no admins to speak of. The initiator becomes the
+// first ChatAdmin. Rights are checked against the VK API here, at connect
+// time; afterwards they are read from chat_admins.
+func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
+	if !isConversation(msg.PeerID) {
+		return s.sendText(ctx, msg.PeerID,
+			"Подключить можно только беседу: добавьте бота в беседу и напишите «подключить».", "")
+	}
+
+	user, err := s.ensureUser(ctx, msg.FromID)
+	if err != nil {
+		return err
+	}
+
+	isAdmin, err := s.convs.IsConversationAdmin(ctx, msg.PeerID, msg.FromID)
+	if err != nil {
+		return fmt.Errorf("check conversation admin: %w", err)
+	}
+	if !isAdmin {
+		s.log.Printf("vk: connect denied for peer %d: user %d is not an admin", msg.PeerID, msg.FromID)
+		return s.sendText(ctx, msg.PeerID, "Подключить беседу может только её администратор.", "")
+	}
+
+	title, err := s.convs.GetConversationTitle(ctx, msg.PeerID)
+	if err != nil || strings.TrimSpace(title) == "" {
+		s.log.Printf("vk: conversation title unavailable for %d: %v", msg.PeerID, err)
+		title = fmt.Sprintf("Беседа %d", msg.PeerID)
+	}
+
+	ch, created, err := s.chats.Connect(ctx, chat.ConnectInput{
+		Platform:       chat.PlatformVK,
+		ExternalChatID: strconv.FormatInt(msg.PeerID, 10),
+		ChatTitle:      title,
+		InitiatorID:    user.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("connect chat: %w", err)
+	}
+	if !created {
+		return s.sendText(ctx, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
+	}
+
+	kb, err := defaultKeyboard()
+	if err != nil {
+		return err
+	}
+	text := fmt.Sprintf("Беседа «%s» подключена.\n%s — администратор.\nКоманды: «Игры», «Мои записи», «Отмена записи».",
+		ch.Title, user.DisplayName)
+	return s.sendText(ctx, msg.PeerID, text, kb)
 }
 
 // ensureUser resolves the VK user to an internal User, creating the
@@ -217,6 +304,8 @@ func (s *Service) commandOf(text, payload string) string {
 	switch {
 	case t == "/start" || t == "start" || t == "начать":
 		return cmdStart
+	case strings.Contains(t, "подключ"):
+		return cmdConnect
 	case strings.Contains(t, "игр"):
 		return cmdGames
 	case strings.Contains(t, "запис"):

@@ -131,6 +131,68 @@ func (c *Client) GetUserName(ctx context.Context, userID int64) (string, error) 
 	return name, nil
 }
 
+// GetConversationTitle returns the title of a group conversation
+// (messages.getConversationsById). It fails when VK returns no title, e.g.
+// for a one-to-one dialog or when the bot cannot read the conversation.
+func (c *Client) GetConversationTitle(ctx context.Context, peerID int64) (string, error) {
+	params := url.Values{}
+	params.Set("peer_ids", strconv.FormatInt(peerID, 10))
+
+	raw, err := c.call(ctx, "messages.getConversationsById", params)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Items []struct {
+			ChatSettings struct {
+				Title string `json:"title"`
+			} `json:"chat_settings"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("parse messages.getConversationsById response: %w", err)
+	}
+	if len(resp.Items) == 0 {
+		return "", fmt.Errorf("messages.getConversationsById: no items for peer %d", peerID)
+	}
+	title := strings.TrimSpace(resp.Items[0].ChatSettings.Title)
+	if title == "" {
+		return "", fmt.Errorf("messages.getConversationsById: empty title for peer %d", peerID)
+	}
+	return title, nil
+}
+
+// IsConversationAdmin reports whether userID administers the conversation
+// (messages.getConversationMembers). VK marks both an administrator and the
+// owner; both count as admins here. The members list is paginated, but the
+// initiator of the connect command is an active participant and is returned
+// on the first page, so V1 does not page through it.
+func (c *Client) IsConversationAdmin(ctx context.Context, peerID, userID int64) (bool, error) {
+	params := url.Values{}
+	params.Set("peer_id", strconv.FormatInt(peerID, 10))
+
+	raw, err := c.call(ctx, "messages.getConversationMembers", params)
+	if err != nil {
+		return false, err
+	}
+	var resp struct {
+		Items []struct {
+			MemberID int64 `json:"member_id"`
+			IsAdmin  int   `json:"is_admin"`
+			IsOwner  int   `json:"is_owner"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return false, fmt.Errorf("parse messages.getConversationMembers response: %w", err)
+	}
+	for _, m := range resp.Items {
+		if m.MemberID == userID {
+			return m.IsAdmin == 1 || m.IsOwner == 1, nil
+		}
+	}
+	return false, nil
+}
+
 type apiResponse struct {
 	Response json.RawMessage `json:"response"`
 	Error    *apiError       `json:"error"`
