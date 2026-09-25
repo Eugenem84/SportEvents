@@ -240,16 +240,21 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 	if err != nil {
 		return fmt.Errorf("find chat: %w", err)
 	}
-	parsed := s.parseCommand(msg.Text, msg.Payload)
+	parsed := s.parseCommand(msg.Text, msg.Payload, ch != nil)
 
-	// An unconnected conversation is not a Chat yet: the connection
-	// request is the only command that can act on it.
+	// An unconnected conversation is not a Chat yet: only the connection
+	// request makes sense there, the rest is people talking.
 	if ch == nil {
 		if parsed.cmd == cmdConnect {
 			return s.handleConnect(ctx, msg)
 		}
-		s.log.Printf("vk: message from unconnected peer %d", msg.PeerID)
-		return s.sendText(ctx, msg.PeerID, "Эта беседа ещё не подключена. Напишите «подключить», чтобы подключить её.", "")
+		return nil
+	}
+
+	// Не команда — это обычная переписка в беседе. Бот молчит и даже не
+	// заводит identity: сообщения людей — не его дело.
+	if parsed.cmd == "" {
+		return nil
 	}
 
 	user, err := s.ensureUser(ctx, msg.FromID)
@@ -324,7 +329,8 @@ func (s *Service) handleCommand(ctx context.Context, c commandCtx) error {
 	case cmdSlotRemove:
 		return s.handleSlotRemove(ctx, c)
 	default:
-		return s.sendText(ctx, c.peerID, "Не понял команду. Напишите «игры» или /start.", "")
+		// Неизвестная команда: молчим, чтобы не мешать переписке в беседе.
+		return nil
 	}
 }
 
@@ -1007,7 +1013,7 @@ func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, str
 	fmt.Fprintf(&b, "Расписание игр чата «%s»\n", ch.Title)
 	fmt.Fprintf(&b, "Игра: %s, %d мест\n\n", defaultTitle, defaultCapacity)
 	fmt.Fprintf(&b, "Сейчас: %s\n\n", schedule.Describe(slots))
-	b.WriteString("Время указывается в поясе чата. Чтобы добавить или изменить день, пришлите сообщение вида «вс 10:00».")
+	b.WriteString("Время указывается в поясе чата. Чтобы добавить или изменить день, пришлите команду вида «/slot вс 10:00», убрать — «/slot убрать сб».")
 
 	rows := make([][]Button, 0, len(slots)+1)
 	for _, slot := range slots {
@@ -1041,13 +1047,14 @@ func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, ch
 	}
 	text := fmt.Sprintf(
 		"Привет, %s!\nЭто бот записи на игры чата «%s».\n\n"+
-			"Команды (можно писать со слэшем):\n"+
+			"Команды:\n"+
 			"/games — ближайшие игры и запись\n"+
 			"/my — ваши записи\n"+
 			"/cancel — отменить свою запись\n"+
 			"/create — создать игру и анонс (администратор)\n"+
-			"/settings — расписание игр: дни недели и время (администратор)\n\n"+
-			"Без слэша тоже работает: «игры», «мои записи», «создать игру», «настройки».",
+			"/settings — расписание игр (администратор)\n"+
+			"/help — эта справка\n\n"+
+			"Бот отвечает только на команды и кнопки, поэтому не мешает вашей переписке.",
 		displayName, chatTitle)
 	return s.sendText(ctx, peerID, text, kb)
 }
@@ -1072,91 +1079,71 @@ func defaultKeyboard() (string, error) {
 	return kb.Marshal()
 }
 
-// parseCommand maps a message text and/or a button payload to a command with
-// its parameters. A payload always wins: it carries the button's intent
-// together with what it applies to. Text is checked from the most specific
-// phrase down, and a message that is *only* a schedule slot («вс 10:00»,
-// «убрать сб») is recognised last, so «создать игру в среду 19:00» stays a
-// game and not a schedule change.
-func (s *Service) parseCommand(text, payload string) parsedCommand {
+// parseCommand maps a message to a command with its parameters. A button
+// payload always wins: buttons are explicit. Otherwise only slash commands
+// are commands — in a live chat people talk to each other, and everything
+// without a slash is conversation the bot must not answer.
+//
+// Two deliberate exceptions, both narrow:
+//   - a chat that is not connected yet has no keyboard at all, so there
+//     "подключить" (or /connect) is accepted without a slash: it is a
+//     one-time action;
+//   - the schedule screen shows the exact format it expects, and /slot
+//     carries the weekday and the time: "/slot вс 10:00".
+func (s *Service) parseCommand(text, payload string, connected bool) parsedCommand {
 	if p := ParseButtonPayload(payload); p.Command != "" {
 		return parsedCommand{cmd: p.Command, eventID: p.EventID, weekday: p.Weekday}
 	}
 
 	t := strings.ToLower(strings.TrimSpace(text))
 
-	// Слэш-команды (/games, /my, /settings, /create, /cancel): их подсказывает
-	// сам клиент VK, если команды бота зарегистрированы (Client.SetBotCommands).
-	// Аргументы после команды обрабатываются как обычный текст.
-	if name, ok := slashCommand(t); ok {
-		if cmd, isCommand := commandByName(name); isCommand {
-			return parsedCommand{cmd: cmd}
+	if !connected {
+		if t == "подключить" || t == "/connect" {
+			return parsedCommand{cmd: cmdConnect}
 		}
+		return parsedCommand{}
 	}
 
-	switch {
-	case t == "/start" || t == "start" || t == "начать":
-		return parsedCommand{cmd: cmdStart}
-	case strings.Contains(t, "подключ"):
-		return parsedCommand{cmd: cmdConnect}
-	case strings.Contains(t, "настройк") || strings.Contains(t, "расписани"):
-		return parsedCommand{cmd: cmdSettings}
-	case strings.Contains(t, "созда"):
-		return parsedCommand{cmd: cmdCreateGame}
-	case strings.Contains(t, "мои запис"):
-		return parsedCommand{cmd: cmdMyBookings}
-	case strings.Contains(t, "пропуск"):
-		return parsedCommand{cmd: cmdSkip}
-	case strings.Contains(t, "отмен") || strings.Contains(t, "отпис"):
-		return parsedCommand{cmd: cmdCancelBooking}
-	case strings.Contains(t, "резерв"):
-		return parsedCommand{cmd: cmdBook}
-	case strings.Contains(t, "записат") || strings.Contains(t, "запиши"):
-		return parsedCommand{cmd: cmdBook}
-	case strings.Contains(t, "игр"):
+	name, args, ok := slashCommand(t)
+	if !ok {
+		return parsedCommand{}
+	}
+
+	switch name {
+	case "games", "игры":
 		return parsedCommand{cmd: cmdGames}
-	}
-
-	if slot, ok := parseSlotMessage(t); ok {
-		return slot
+	case "my", "мои", "моизаписи":
+		return parsedCommand{cmd: cmdMyBookings}
+	case "cancel", "отмена":
+		return parsedCommand{cmd: cmdCancelBooking}
+	case "create", "создать":
+		return parsedCommand{cmd: cmdCreateGame}
+	case "settings", "настройки":
+		return parsedCommand{cmd: cmdSettings}
+	case "slot", "слот":
+		// /slot вс 10:00 — задать день, /slot убрать сб — убрать его.
+		// Без аргументов команда отвечает подсказкой о формате.
+		if slot, ok := parseSlotMessage(args); ok {
+			return slot
+		}
+		return parsedCommand{cmd: cmdSlotAdd}
+	case "connect", "подключить":
+		return parsedCommand{cmd: cmdConnect}
+	case "help", "start", "начать", "помощь":
+		return parsedCommand{cmd: cmdStart}
 	}
 	return parsedCommand{}
 }
 
-// slashCommand splits a slash command off a message: "/create 27.09 19:00"
-// yields "create". ok is false for ordinary text.
-func slashCommand(text string) (name string, ok bool) {
+// slashCommand splits "/create 27.09 19:00" into "create" and "27.09 19:00".
+// ok is false for anything without a leading slash: that is conversation, not
+// a command.
+func slashCommand(text string) (name, args string, ok bool) {
 	if !strings.HasPrefix(text, "/") {
-		return "", false
+		return "", "", false
 	}
-	fields := strings.Fields(text)
-	if len(fields) == 0 {
-		return "", false
-	}
-	return strings.TrimPrefix(fields[0], "/"), true
-}
-
-// commandByName maps a command name to the internal command. The names are
-// both Latin (what the bot registers in VK, so the client can offer hints)
-// and Russian (what is easy to type).
-func commandByName(name string) (string, bool) {
-	switch name {
-	case "start", "help", "начать", "помощь":
-		return cmdStart, true
-	case "games", "игры":
-		return cmdGames, true
-	case "my", "мои", "моизаписи":
-		return cmdMyBookings, true
-	case "create", "создать":
-		return cmdCreateGame, true
-	case "settings", "настройки":
-		return cmdSettings, true
-	case "cancel", "отмена":
-		return cmdCancelBooking, true
-	case "connect", "подключить":
-		return cmdConnect, true
-	}
-	return "", false
+	name, args, _ = strings.Cut(strings.TrimPrefix(text, "/"), " ")
+	return strings.ToLower(strings.TrimSpace(name)), strings.TrimSpace(args), true
 }
 
 // stripCommandWord removes a leading "/games" token, so the rest of the

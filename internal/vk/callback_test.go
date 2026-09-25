@@ -388,25 +388,19 @@ func TestCallbackWrongGroupRejected(t *testing.T) {
 	}
 }
 
-func TestCallbackMessageNewUnknownChatRepliesHint(t *testing.T) {
+// В неподключённой беседе бот тоже не вмешивается в разговор: он реагирует
+// только на запрос подключения.
+func TestCallbackUnconnectedChatIgnoresSmallTalk(t *testing.T) {
 	h := newHarness(t, false) // no linked chat
-	payload := `{"type":"message_new","group_id":12345,"secret":"sekret","object":{"message":{` +
-		`"id":1,"date":0,"peer_id":2000000047,"from_id":555,"text":"/start","out":0}}}`
-	code, body := postJSON(t, h.svc.HandleCallback, payload)
+	code, body := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/start", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
 	if body != "ok" {
 		t.Fatalf("body must be ok, got %q", body)
 	}
-	if len(h.msg.sent) != 1 {
-		t.Fatalf("want 1 hint, got %d", len(h.msg.sent))
-	}
-	if h.msg.sent[0].PeerID != 2000000047 {
-		t.Fatalf("peer: %d", h.msg.sent[0].PeerID)
-	}
-	if !strings.Contains(h.msg.sent[0].Text, "не подключена") {
-		t.Fatalf("hint text: %q", h.msg.sent[0].Text)
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("an unconnected chat must stay silent, got %+v", h.msg.sent)
 	}
 	if h.users.callCount != 0 {
 		t.Fatal("unknown chat must not create an identity")
@@ -644,9 +638,11 @@ func TestCallbackConnectRejectsDirectDialog(t *testing.T) {
 	}
 }
 
+// Повторное подключение — теперь явная команда со слэшем; без слэша в живой
+// беседе «подключить» это просто слово в переписке.
 func TestCallbackConnectAlreadyConnected(t *testing.T) {
 	h := newHarness(t, true) // chat is linked already
-	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/connect", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -655,6 +651,37 @@ func TestCallbackConnectAlreadyConnected(t *testing.T) {
 	}
 	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже подключена") {
 		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+// Обычная переписка в подключённой беседе не должна вызывать бота: ни ответа,
+// ни создания identity, ни обращения к VK за именем.
+func TestCallbackSmallTalkIsIgnored(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, body := postJSON(t, h.svc.HandleCallback,
+		msgEnvelope(2000000047, 555, "ребята, кто в воскресенье играет?", ""))
+	if code != http.StatusOK || body != "ok" {
+		t.Fatalf("status %d body %q", code, body)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("the bot must not answer small talk: %+v", h.msg.sent)
+	}
+	if h.users.callCount != 0 {
+		t.Fatal("small talk must not create an identity")
+	}
+}
+
+// «подключить» без слэша в подключённой беседе — уже не команда.
+func TestCallbackPlainConnectInConnectedChatIsIgnored(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 0 || h.chats.connectCalls != 0 {
+		t.Fatalf("a connected chat must stay silent: sent=%+v connects=%d", h.msg.sent, h.chats.connectCalls)
 	}
 }
 
@@ -788,7 +815,7 @@ func TestCallbackGamesListsFreeSlotsAndButtons(t *testing.T) {
 
 func TestCallbackCreateGameByAdminPostsAnnouncement(t *testing.T) {
 	h := newHarness(t, true)
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру 27.09 19:00 8", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create 27.09 19:00 8", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -818,7 +845,7 @@ func TestCallbackCreateGameDeniedForNonAdmin(t *testing.T) {
 	h := newHarness(t, true)
 	h.chats.isAdmin = false
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -965,7 +992,7 @@ func TestCallbackMyBookings(t *testing.T) {
 		EventStartsAt: harnessNow().Add(24 * time.Hour),
 	}}
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "мои записи", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/my", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1049,7 +1076,7 @@ func TestCallbackCreateGameUsesSchedule(t *testing.T) {
 	h := newHarness(t, true)
 	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1067,7 +1094,7 @@ func TestCallbackCreateGameUsesSchedule(t *testing.T) {
 func TestCallbackCreateGameByWeekdayWord(t *testing.T) {
 	h := newHarness(t, true)
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру в среду 19:00", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create в среду 19:00", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1097,7 +1124,7 @@ func TestCallbackCreateGameSkipsExisting(t *testing.T) {
 		},
 	}}
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "создать игру", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/create", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1124,7 +1151,7 @@ func TestCallbackSettingsScreenForAdmin(t *testing.T) {
 	h := newHarness(t, true)
 	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "настройки", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/settings", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1151,7 +1178,7 @@ func TestCallbackSettingsDeniedForNonAdmin(t *testing.T) {
 	h := newHarness(t, true)
 	h.chats.isAdmin = false
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "настройки", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/settings", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1166,7 +1193,7 @@ func TestCallbackSettingsDeniedForNonAdmin(t *testing.T) {
 func TestCallbackSlotAddByText(t *testing.T) {
 	h := newHarness(t, true)
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "добавить в воскресенье 10:00", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/slot добавить в воскресенье 10:00", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1214,9 +1241,10 @@ func TestCallbackSlotRemoveEditsSettingsMessage(t *testing.T) {
 
 // --- Слэш-команды ---
 
-// TestParseCommand locks the whole mapping: payload beats text, a slash name
-// is recognised with its arguments stripped, and a message that is only a
-// schedule slot stays a slot.
+// TestParseCommand locks the whole mapping: buttons always work, commands are
+// slash-only, ordinary conversation is not a command at all, and the two
+// narrow exceptions (connect before the chat is linked, /slot with arguments)
+// behave as documented.
 func TestParseCommand(t *testing.T) {
 	svc := newHarness(t, true).svc
 
@@ -1224,38 +1252,47 @@ func TestParseCommand(t *testing.T) {
 		name        string
 		text        string
 		payload     string
+		connected   bool
 		wantCmd     string
 		wantEvent   int64
 		wantWeekday int
 		wantMinutes int
 		wantSlot    bool
 	}{
-		{name: "payload wins", text: "что угодно", payload: `{"command":"book","event_id":7}`, wantCmd: cmdBook, wantEvent: 7},
-		{name: "slash games", text: "/games", wantCmd: cmdGames},
-		{name: "slash my", text: "/my", wantCmd: cmdMyBookings},
-		{name: "slash cancel", text: "/cancel", wantCmd: cmdCancelBooking},
-		{name: "slash settings", text: "/settings", wantCmd: cmdSettings},
-		{name: "slash help", text: "/help", wantCmd: cmdStart},
-		{name: "slash start", text: "/start", wantCmd: cmdStart},
-		{name: "slash russian", text: "/игры", wantCmd: cmdGames},
-		{name: "slash create with args", text: "/create 27.09 19:00", wantCmd: cmdCreateGame},
-		{name: "unknown slash", text: "/pizza", wantCmd: ""},
-		{name: "text games", text: "игры", wantCmd: cmdGames},
-		{name: "text my", text: "мои записи", wantCmd: cmdMyBookings},
-		{name: "text book", text: "записаться", wantCmd: cmdBook},
-		{name: "text skip", text: "Пропускаю", wantCmd: cmdSkip},
-		{name: "text cancel", text: "отмена", wantCmd: cmdCancelBooking},
-		{name: "text connect", text: "подключить", wantCmd: cmdConnect},
-		{name: "text settings", text: "настройки", wantCmd: cmdSettings},
-		{name: "slot by text", text: "вс 10:00", wantCmd: cmdSlotAdd, wantWeekday: 0, wantMinutes: 600, wantSlot: true},
-		{name: "slot with filler", text: "добавить в воскресенье 10:00", wantCmd: cmdSlotAdd, wantWeekday: 0, wantMinutes: 600, wantSlot: true},
-		{name: "slot remove", text: "убрать сб", wantCmd: cmdSlotRemove, wantWeekday: 6},
-		{name: "create with weekday stays a game", text: "создать игру в среду 19:00", wantCmd: cmdCreateGame},
-		{name: "plain talk", text: "привет, как дела", wantCmd: ""},
+		{name: "payload wins over text", text: "что угодно", payload: `{"command":"book","event_id":7}`, connected: true, wantCmd: cmdBook, wantEvent: 7},
+		{name: "buttons work even before connect", text: "", payload: `{"command":"book","event_id":7}`, connected: false, wantCmd: cmdBook, wantEvent: 7},
+
+		{name: "slash games", text: "/games", connected: true, wantCmd: cmdGames},
+		{name: "slash my", text: "/my", connected: true, wantCmd: cmdMyBookings},
+		{name: "slash cancel", text: "/cancel", connected: true, wantCmd: cmdCancelBooking},
+		{name: "slash settings", text: "/settings", connected: true, wantCmd: cmdSettings},
+		{name: "slash create with args", text: "/create 27.09 19:00", connected: true, wantCmd: cmdCreateGame},
+		{name: "slash connect", text: "/connect", connected: true, wantCmd: cmdConnect},
+		{name: "slash help", text: "/help", connected: true, wantCmd: cmdStart},
+		{name: "slash start", text: "/start", connected: true, wantCmd: cmdStart},
+		{name: "slash russian", text: "/игры", connected: true, wantCmd: cmdGames},
+		{name: "unknown slash", text: "/pizza", connected: true, wantCmd: ""},
+
+		{name: "plain games is conversation", text: "игры", connected: true, wantCmd: ""},
+		{name: "plain my is conversation", text: "мои записи", connected: true, wantCmd: ""},
+		{name: "plain create is conversation", text: "надо создать игру на выходные", connected: true, wantCmd: ""},
+		{name: "plain settings is conversation", text: "какие настройки у бота?", connected: true, wantCmd: ""},
+		{name: "plain slot is conversation", text: "вс 10:00", connected: true, wantCmd: ""},
+		{name: "plain connect in connected chat", text: "подключить", connected: true, wantCmd: ""},
+		{name: "small talk", text: "ребята, кто играет?", connected: true, wantCmd: ""},
+
+		{name: "connect without slash before linking", text: "подключить", connected: false, wantCmd: cmdConnect},
+		{name: "slash connect before linking", text: "/connect", connected: false, wantCmd: cmdConnect},
+		{name: "nothing else before linking", text: "/games", connected: false, wantCmd: ""},
+
+		{name: "slot by command", text: "/slot вс 10:00", connected: true, wantCmd: cmdSlotAdd, wantWeekday: 0, wantMinutes: 600, wantSlot: true},
+		{name: "slot with filler", text: "/slot добавить в воскресенье 10:00", connected: true, wantCmd: cmdSlotAdd, wantWeekday: 0, wantMinutes: 600, wantSlot: true},
+		{name: "slot remove", text: "/slot убрать сб", connected: true, wantCmd: cmdSlotRemove, wantWeekday: 6},
+		{name: "slot without arguments asks for format", text: "/slot", connected: true, wantCmd: cmdSlotAdd},
 	}
 
 	for _, tc := range cases {
-		got := svc.parseCommand(tc.text, tc.payload)
+		got := svc.parseCommand(tc.text, tc.payload, tc.connected)
 		if got.cmd != tc.wantCmd || got.eventID != tc.wantEvent ||
 			got.weekday != tc.wantWeekday || got.minutes != tc.wantMinutes || got.hasSlot != tc.wantSlot {
 			t.Fatalf("%s: got %+v, want cmd=%q event=%d weekday=%d minutes=%d slot=%v",
