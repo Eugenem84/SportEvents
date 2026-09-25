@@ -226,3 +226,81 @@ func insertConfirmed(t *testing.T, ctx context.Context, pool *pgxpool.Pool, even
 		t.Fatal(err)
 	}
 }
+
+// --- Counters for the chat list ("свободных мест") ---
+
+func TestListUpcomingWithCounts(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	full := mustCreate(t, svc, ctx, event.CreateInput{
+		ChatID: chatID, StartsAt: now.Add(time.Hour), Title: "Заполнена", Capacity: 2,
+	})
+	roomy := mustCreate(t, svc, ctx, event.CreateInput{
+		ChatID: chatID, StartsAt: now.Add(2 * time.Hour), Title: "Есть места", Capacity: 5,
+	})
+
+	u1 := insertUser(t, ctx, pool, "Иван")
+	u2 := insertUser(t, ctx, pool, "Пётр")
+	u3 := insertUser(t, ctx, pool, "Сергей")
+	insertConfirmed(t, ctx, pool, full.ID, u1, u1)
+	insertConfirmed(t, ctx, pool, full.ID, u2, u2)
+	insertWaitlist(t, ctx, pool, full.ID, u3, u3)
+	insertConfirmed(t, ctx, pool, roomy.ID, u1, u1)
+
+	list, err := svc.ListUpcomingWithCounts(ctx, chatID, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want 2 events, got %d: %+v", len(list), list)
+	}
+	if list[0].ID != full.ID || list[0].Confirmed != 2 || list[0].Waitlist != 1 || list[0].Free != 0 {
+		t.Fatalf("full event: %+v", list[0])
+	}
+	if list[1].ID != roomy.ID || list[1].Confirmed != 1 || list[1].Waitlist != 0 || list[1].Free != 4 {
+		t.Fatalf("roomy event: %+v", list[1])
+	}
+}
+
+// Free is capacity - confirmed and must never go negative, whatever the data.
+func TestListUpcomingWithCountsNeverNegativeFree(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	ev := mustCreate(t, svc, ctx, event.CreateInput{
+		ChatID: chatID, StartsAt: now.Add(time.Hour), Title: "Игра", Capacity: 2,
+	})
+	for _, name := range []string{"Иван", "Пётр", "Сергей"} {
+		u := insertUser(t, ctx, pool, name)
+		insertConfirmed(t, ctx, pool, ev.ID, u, u)
+	}
+
+	list, err := svc.ListUpcomingWithCounts(ctx, chatID, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("want 1 event, got %d", len(list))
+	}
+	if list[0].Free != 0 {
+		t.Fatalf("free must not be negative, got %d", list[0].Free)
+	}
+	if list[0].Confirmed != 3 {
+		t.Fatalf("confirmed=%d", list[0].Confirmed)
+	}
+}
+
+func insertWaitlist(t *testing.T, ctx context.Context, pool *pgxpool.Pool, eventID, userID, bookedBy int64) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO bookings (event_id, player_name, user_id, booked_by_user_id, status)
+		VALUES ($1, $2, $3, $4, 'waitlist')`,
+		eventID, "игрок", userID, bookedBy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}

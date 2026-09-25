@@ -47,6 +47,17 @@ type CreateInput struct {
 	BookedByUserID int64
 }
 
+// BookingWithEvent is a booking together with the event it belongs to. It is
+// what "мои записи" renders: status, when the game is, and the booking id to
+// cancel.
+type BookingWithEvent struct {
+	Booking
+	EventTitle    string
+	EventStartsAt time.Time
+	EventLocation string
+	EventCapacity int
+}
+
 // CancelResult is the outcome of cancelling a booking. Promoted is set
 // when cancelling freed a confirmed slot and the first waitlist booking
 // was moved to confirmed. Callers (e.g. the VK adapter) use Promoted to

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -271,6 +272,51 @@ func (s *Service) ListByEvent(ctx context.Context, eventID int64, statuses ...St
 	}
 	if out == nil {
 		out = []Booking{}
+	}
+	return out, nil
+}
+
+// ListActiveByUser returns the user's active bookings (confirmed and
+// waitlist) for events starting at or after from, ordered by event time.
+// Guests (user_id IS NULL) never appear here: they have no identity to ask
+// for "my bookings".
+func (s *Service) ListActiveByUser(ctx context.Context, userID int64, from time.Time) ([]BookingWithEvent, error) {
+	const q = `
+		SELECT b.id, b.event_id, b.player_name, b.phone, b.user_id, b.booked_by_user_id,
+		       b.status, b.created_at,
+		       e.title, e.starts_at, e.location, e.capacity
+		FROM bookings b
+		JOIN events e ON e.id = b.event_id
+		WHERE b.user_id = $1
+		  AND b.status IN ('confirmed', 'waitlist')
+		  AND e.starts_at >= $2
+		ORDER BY e.starts_at ASC, b.id ASC`
+
+	rows, err := s.pool.Query(ctx, q, userID, from.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list user bookings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []BookingWithEvent
+	for rows.Next() {
+		var b BookingWithEvent
+		var statusStr string
+		if err := rows.Scan(
+			&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID,
+			&statusStr, &b.CreatedAt,
+			&b.EventTitle, &b.EventStartsAt, &b.EventLocation, &b.EventCapacity,
+		); err != nil {
+			return nil, fmt.Errorf("scan user booking: %w", err)
+		}
+		b.Status = Status(statusStr)
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list user bookings: %w", err)
+	}
+	if out == nil {
+		out = []BookingWithEvent{}
 	}
 	return out, nil
 }

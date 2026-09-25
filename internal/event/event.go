@@ -22,6 +22,16 @@ type Event struct {
 	CreatedAt time.Time
 }
 
+// EventSummary is an Event together with its booking counters. Free is the
+// number of remaining confirmed slots (capacity - confirmed) and is never
+// negative.
+type EventSummary struct {
+	Event
+	Confirmed int
+	Waitlist  int
+	Free      int
+}
+
 type CreateInput struct {
 	ChatID   int64
 	StartsAt time.Time

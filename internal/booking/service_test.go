@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"sportevents.local/internal/booking"
 	"sportevents.local/internal/postgres"
@@ -403,4 +404,88 @@ func TestNotifyPromotionNotSilentForGuest(t *testing.T) {
 	if got := notifier.snapshot(); len(got) != 1 {
 		t.Fatalf("notifier: cancelling waitlist must not notify, got %d calls", len(got))
 	}
+}
+
+// --- ListActiveByUser ("мои записи") ---
+
+func TestListActiveByUser(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	userID := insertUser(t, ctx, pool, "Иван")
+	other := insertUser(t, ctx, pool, "Пётр")
+
+	full := insertEvent(t, ctx, pool, chatID, 1)
+	roomy := insertEvent(t, ctx, pool, chatID, 5)
+
+	mine := mustBookUser(t, svc, ctx, roomy, userID, "Иван")        // confirmed
+	_ = mustBookUser(t, svc, ctx, roomy, other, "Пётр")             // чужая запись
+	_ = mustBookUser(t, svc, ctx, full, other, "Пётр")              // занимает единственное место
+	queued := mustBookUser(t, svc, ctx, full, userID, "Иван")       // waitlist
+	_ = mustCreate(t, svc, ctx, roomy, other, "Гость без identity") // гость
+
+	got, err := svc.ListActiveByUser(ctx, userID, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 active bookings, got %d: %+v", len(got), got)
+	}
+
+	byID := map[int64]booking.BookingWithEvent{}
+	for _, b := range got {
+		byID[b.ID] = b
+	}
+	if b, ok := byID[mine.ID]; !ok || b.Status != booking.StatusConfirmed {
+		t.Fatalf("confirmed booking missing: %+v", b)
+	}
+	if b, ok := byID[queued.ID]; !ok || b.Status != booking.StatusWaitlist {
+		t.Fatalf("waitlist booking missing: %+v", b)
+	}
+	if b := byID[mine.ID]; b.EventID != roomy || b.EventTitle == "" || b.EventCapacity != 5 {
+		t.Fatalf("event fields not filled: %+v", b)
+	}
+}
+
+func TestListActiveByUserIgnoresCancelledAndPast(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "A")
+	userID := insertUser(t, ctx, pool, "Иван")
+	eventID := insertEvent(t, ctx, pool, chatID, 5)
+
+	b := mustBookUser(t, svc, ctx, eventID, userID, "Иван")
+	if _, err := svc.Cancel(ctx, eventID, b.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.ListActiveByUser(ctx, userID, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("cancelled booking must not be listed: %+v", got)
+	}
+
+	// Игра началась раньше "from" — на будущее её уже не показываем.
+	got, err = svc.ListActiveByUser(ctx, userID, time.Now().UTC().Add(72*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("events before 'from' must not be listed: %+v", got)
+	}
+}
+
+// mustBookUser books a player who has an identity (not a guest).
+func mustBookUser(t *testing.T, svc *booking.Service, ctx context.Context, eventID, userID int64, name string) booking.Booking {
+	t.Helper()
+	b, err := svc.Create(ctx, booking.CreateInput{
+		EventID:        eventID,
+		PlayerName:     name,
+		UserID:         &userID,
+		BookedByUserID: userID,
+	})
+	if err != nil {
+		t.Fatalf("book %s: %v", name, err)
+	}
+	return b
 }

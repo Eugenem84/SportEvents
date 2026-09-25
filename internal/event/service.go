@@ -102,6 +102,58 @@ func (s *Service) ListUpcoming(ctx context.Context, chatID int64, from time.Time
 	return out, nil
 }
 
+// ListUpcomingWithCounts returns the upcoming events of a chat together with
+// their booking counters. Free is computed as capacity - confirmed, the way
+// the chat renders "свободных мест"; free slots are never stored.
+//
+// One query, one row per event: the chat may render a dozen events at once,
+// so counting per event would be N+1.
+func (s *Service) ListUpcomingWithCounts(ctx context.Context, chatID int64, from time.Time, limit int) ([]EventSummary, error) {
+	if limit <= 0 {
+		limit = defaultUpcomingLimit
+	}
+
+	const q = `
+		SELECT e.id, e.chat_id, e.starts_at, e.title, e.location, e.capacity, e.created_at,
+		       count(b.id) FILTER (WHERE b.status = 'confirmed')::int AS confirmed,
+		       count(b.id) FILTER (WHERE b.status = 'waitlist')::int  AS waitlist
+		FROM events e
+		LEFT JOIN bookings b ON b.event_id = e.id
+		WHERE e.chat_id = $1 AND e.starts_at >= $2
+		GROUP BY e.id
+		ORDER BY e.starts_at ASC, e.id ASC
+		LIMIT $3`
+
+	rows, err := s.pool.Query(ctx, q, chatID, from.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list upcoming events with counts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EventSummary
+	for rows.Next() {
+		var e EventSummary
+		if err := rows.Scan(
+			&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.CreatedAt,
+			&e.Confirmed, &e.Waitlist,
+		); err != nil {
+			return nil, fmt.Errorf("scan event summary: %w", err)
+		}
+		e.Free = e.Capacity - e.Confirmed
+		if e.Free < 0 {
+			e.Free = 0
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list upcoming events with counts: %w", err)
+	}
+	if out == nil {
+		out = []EventSummary{}
+	}
+	return out, nil
+}
+
 func (s *Service) SetCapacity(ctx context.Context, chatID, eventID int64, capacity int) error {
 	if capacity < 1 {
 		return ErrInvalid
