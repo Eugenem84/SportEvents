@@ -5,6 +5,11 @@
 // (vk_user_id, vk_platform, vk_chat_id, sign)? The page shows the raw query,
 // what VK Bridge reports, and can send an app_payload back to the community.
 // It is a smoke-test tool: it reads nothing from the database.
+//
+// The first block on the page is the test output: the template stamps the
+// render time (Page.ServedAt) and the script marks its row, so a WebView that
+// shows a stale time (cache) or no script mark (scripts off) is visible at a
+// glance.
 package miniapp
 
 import (
@@ -12,6 +17,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"time"
 )
 
 // assets holds the page and the VK Bridge bundle. The bundle is kept in the
@@ -26,6 +32,11 @@ type Page struct {
 	// it, so the value pre-fills the form; on a box without VK_* variables it
 	// is empty and the person types it by hand.
 	GroupID string
+
+	// ServedAt is the moment the server rendered this page (RFC3339, UTC). It
+	// is the test marker on the page: a fresh timestamp proves the WebView got
+	// a live response from the Go binary rather than a stale page from cache.
+	ServedAt string
 }
 
 // Handler serves the page at "/" and its static files below it. Mount it with
@@ -52,7 +63,10 @@ func Handler(groupID string) http.Handler {
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		if err := page.Execute(w, Page{GroupID: groupID}); err != nil {
+		if err := page.Execute(w, Page{
+			GroupID:  groupID,
+			ServedAt: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
 			log.Printf("miniapp: render: %v", err)
 		}
 	})

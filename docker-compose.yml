@@ -22,6 +22,7 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/booking?sslmode=disable
       VK_GROUP_ID: ${VK_GROUP_ID:-}
+      VK_APP_ID: ${VK_APP_ID:-}
       VK_TOKEN: ${VK_TOKEN:-}
       VK_CONFIRMATION_TOKEN: ${VK_CONFIRMATION_TOKEN:-}
       VK_SECRET: ${VK_SECRET:-}

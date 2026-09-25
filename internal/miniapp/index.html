@@ -54,6 +54,24 @@ pre {
 <h1>Запуск мини-приложения</h1>
 <p class="hint">SportEvents · диагностика запуска: что VK передал странице и как открыл её.</p>
 
+<!-- Тестовый вывод: первое, что видно в WebView. Строка «сервер отдал страницу»
+     отрисована Go-шаблоном (Page.ServedAt), строка «JavaScript» заполняется
+     скриптом. Вместе они отвечают на вопрос «живая ли это страница»: старое
+     время значит кэш, пустая вторая строка — скрипты в WebView не работают. -->
+<section>
+  <h2>Тестовый вывод</h2>
+  <table><tbody>
+    <tr>
+      <td class="k">Сервер отдал страницу</td>
+      <td class="v"><b>{{.ServedAt}}</b> <span class="muted">UTC · Go-шаблон</span></td>
+    </tr>
+    <tr>
+      <td class="k">JavaScript в WebView</td>
+      <td class="v" id="probeJs"><b class="bad">не выполнился</b></td>
+    </tr>
+  </tbody></table>
+</section>
+
 <section>
   <h2>Итог</h2>
   <table><tbody id="verdict"></tbody></table>
@@ -279,6 +297,12 @@ pre {
   }
 
   function boot() {
+    // Тестовый вывод, строка про JavaScript: если скрипт дошёл сюда, JS в WebView
+    // выполняется. Рядом с серверной меткой Page.ServedAt это и есть проверка
+    // «страница живая»: старое серверное время — кэш, эта строка пустая — нет JS.
+    el('probeJs').innerHTML = '<b class="ok">выполнился</b> <span class="muted">' +
+      esc(stamp()) + ' локальное время браузера</span>';
+
     renderParams();
     renderEnv();
     renderBridge();

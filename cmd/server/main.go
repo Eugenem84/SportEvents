@@ -81,6 +81,7 @@ func newVKService(pool *pgxpool.Pool) (*vk.Service, bool) {
 		ConfirmationToken: confirmation,
 		Secret:            os.Getenv("VK_SECRET"),
 		GroupID:           os.Getenv("VK_GROUP_ID"),
+		AppID:             os.Getenv("VK_APP_ID"),
 	}, vk.Deps{
 		Messenger: client,
 		Chats:     chats,

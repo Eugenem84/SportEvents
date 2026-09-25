@@ -418,6 +418,7 @@ func newHarness(t *testing.T, chatLinked bool) *harness {
 		ConfirmationToken: "confirmation-code-123",
 		Secret:            "sekret",
 		GroupID:           "12345",
+		AppID:             "54789848",
 	}, Deps{
 		Messenger: h.msg,
 		Chats:     h.chats,
@@ -536,6 +537,9 @@ func TestCallbackMessageNewStartWelcomes(t *testing.T) {
 	}
 	if !strings.Contains(h.msg.sent[0].Text, "закрепите") {
 		t.Fatalf("help must explain how the announcement stays on top: %q", h.msg.sent[0].Text)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "/приложение") {
+		t.Fatalf("help must list the mini app command: %q", h.msg.sent[0].Text)
 	}
 }
 
@@ -1446,9 +1450,12 @@ func TestCallbackCancelGameDropsBookingsAndButtons(t *testing.T) {
 	if !strings.Contains(h.msg.sent[0].Text, "Снял записи: 2") {
 		t.Fatalf("chat line must count the dropped bookings: %q", h.msg.sent[0].Text)
 	}
-	// Игр больше нет — кнопки записи убираются из поля ввода.
-	if got := h.msg.sent[0].Keyboard; got != `{"buttons":[]}` {
-		t.Fatalf("want an empty keyboard, got %q", got)
+	// Игр больше нет — кнопки записи убираются из поля ввода; кнопка
+	// мини-приложения остаётся.
+	if got := h.msg.sent[0].Keyboard; strings.Contains(got, "Иду") {
+		t.Fatalf("sign-up buttons must be dropped: %q", got)
+	} else if !strings.Contains(got, "open_app") {
+		t.Fatalf("the mini app button must stay: %q", got)
 	}
 	if len(h.msg.edits) != 1 {
 		t.Fatalf("the announcement must be rewritten: %+v", h.msg.edits)
@@ -1584,6 +1591,69 @@ func TestCallbackSettingsOffersCancelGameButton(t *testing.T) {
 	}
 	if !strings.Contains(btn.Action.Label, "Отменить игру") {
 		t.Fatalf("label: %q", btn.Action.Label)
+	}
+}
+
+// Кнопка /приложение opens the mini app right in the chat: VK loads the app in
+// a WebView and, because the launch happens from a conversation, passes
+// vk_chat_id — exactly what the diagnostic page at /app/ looks for.
+func TestCallbackAppCommandSendsOpenAppButton(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/приложение", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+
+	got := h.msg.sent[0]
+	if !strings.Contains(got.Text, "vk_chat_id") {
+		t.Fatalf("the reply must say what the button is for: %q", got.Text)
+	}
+
+	btn := firstButton(t, got.Keyboard)
+	if btn.Action.Type != "open_app" {
+		t.Fatalf("button type: %q", btn.Action.Type)
+	}
+	if btn.Action.AppID != 54789848 {
+		t.Fatalf("app_id: %d", btn.Action.AppID)
+	}
+	// Сообщество VK пишет отрицательным id, а VK_GROUP_ID задан положительным.
+	if btn.Action.OwnerID != -12345 {
+		t.Fatalf("owner_id: %d", btn.Action.OwnerID)
+	}
+
+	// Кнопка едет в клавиатуре своего сообщения: клавиатуру записи под полем
+	// ввода она не трогает.
+	var kb Keyboard
+	if err := json.Unmarshal([]byte(got.Keyboard), &kb); err != nil {
+		t.Fatalf("keyboard json: %v (%q)", err, got.Keyboard)
+	}
+	if !kb.Inline {
+		t.Fatalf("the open_app button must travel in an inline keyboard: %q", got.Keyboard)
+	}
+}
+
+// Without VK_APP_ID there is nothing to open: the command says so instead of
+// sending a button that would fail in VK clients.
+func TestCallbackAppCommandWithoutAppIDExplains(t *testing.T) {
+	h := newHarness(t, true)
+	h.svc.appID = 0
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/приложение", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "VK_APP_ID") {
+		t.Fatalf("reply: %q", h.msg.sent[0].Text)
+	}
+	if strings.Contains(h.msg.sent[0].Keyboard, "open_app") {
+		t.Fatalf("no app id — no button: %q", h.msg.sent[0].Keyboard)
 	}
 }
 
@@ -1985,9 +2055,13 @@ func TestCallbackObjectPayloadMessageEvent(t *testing.T) {
 }
 
 // Клавиатура, которая остаётся под полем ввода: без inline, без one_time и с
-// callback-кнопками — нажатие не пишет текст в чат.
+// callback-кнопками — нажатие не пишет текст в чат. Вторая строка — кнопка
+// мини-приложения: она открывает WebView прямо из беседы, а VK передаёт такому
+// запуску vk_chat_id.
 func TestPersistentKeyboardShape(t *testing.T) {
-	raw, err := persistentKeyboard()
+	h := newHarness(t, true)
+
+	raw, err := h.svc.signUpKeyboard()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1997,13 +2071,37 @@ func TestPersistentKeyboardShape(t *testing.T) {
 	if strings.Contains(raw, `"one_time"`) {
 		t.Fatalf("persistent keyboard must not be one_time: %q", raw)
 	}
-	if !strings.Contains(raw, `"type":"callback"`) {
-		t.Fatalf("persistent buttons must be callback buttons: %q", raw)
+
+	var kb Keyboard
+	if err := json.Unmarshal([]byte(raw), &kb); err != nil {
+		t.Fatalf("keyboard json: %v (%q)", err, raw)
 	}
-	for _, label := range []string{"Иду", "Не иду"} {
-		if !strings.Contains(raw, label) {
-			t.Fatalf("keyboard must contain %q: %q", label, raw)
+	if len(kb.Buttons) != 2 || len(kb.Buttons[0]) != 2 || len(kb.Buttons[1]) != 1 {
+		t.Fatalf("rows: want [Иду Не иду] + [Открыть приложение], got %q", raw)
+	}
+	for i, label := range []string{"Иду", "Не иду"} {
+		btn := kb.Buttons[0][i]
+		if btn.Action.Type != "callback" {
+			t.Fatalf("%s must be a callback button: %+v", label, btn.Action)
 		}
+		if btn.Action.Label != label {
+			t.Fatalf("label: %q, want %q", btn.Action.Label, label)
+		}
+	}
+
+	// Строка мини-приложения: кнопка open_app с приложением и сообществом.
+	app := kb.Buttons[1][0].Action
+	if app.Type != "open_app" {
+		t.Fatalf("app row type: %q", app.Type)
+	}
+	if app.AppID != 54789848 {
+		t.Fatalf("app_id: %d", app.AppID)
+	}
+	if app.OwnerID != -12345 {
+		t.Fatalf("owner_id: %d", app.OwnerID)
+	}
+	if app.Label != "Открыть приложение" {
+		t.Fatalf("app label: %q", app.Label)
 	}
 }
 
@@ -2025,12 +2123,40 @@ func TestRepliesCarrySignUpButtonsWhileGameIsOpen(t *testing.T) {
 	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
 		t.Fatalf("reply must carry the sign-up buttons: %q", h.msg.sent[0].Keyboard)
 	}
+	// Под кнопками записи живёт кнопка мини-приложения.
+	if !strings.Contains(h.msg.sent[0].Keyboard, "open_app") {
+		t.Fatalf("reply must carry the mini app button: %q", h.msg.sent[0].Keyboard)
+	}
 }
 
-// А когда открытых игр нет, кнопки убираются: пустая клавиатура скрывает их из
-// поля ввода, чтобы запись не висела там, где записываться некуда.
+// А когда открытых игр нет, кнопки записи убираются: пустых мест нет, и запись
+// не должна висеть в поле ввода. Кнопка мини-приложения остаётся — приложение
+// открывается из беседы в любой момент.
 func TestRepliesHideSignUpButtonsWhenNoGameIsOpen(t *testing.T) {
 	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/мои", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+
+	got := h.msg.sent[0].Keyboard
+	if strings.Contains(got, "Иду") {
+		t.Fatalf("no game is open, so the sign-up buttons must be hidden: %q", got)
+	}
+	if !strings.Contains(got, "open_app") {
+		t.Fatalf("the mini app button must stay in the chat: %q", got)
+	}
+}
+
+// Без VK_APP_ID и без открытой игры показывать нечего: клавиатура убирается,
+// как и раньше.
+func TestRepliesRemoveKeyboardWhenNoGameAndNoApp(t *testing.T) {
+	h := newHarness(t, true)
+	h.svc.appID = 0
 
 	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/мои", ""))
 	if code != http.StatusOK {

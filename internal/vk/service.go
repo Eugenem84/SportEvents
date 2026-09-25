@@ -119,6 +119,10 @@ type Config struct {
 	// GroupID is the community id; when non-empty, events from other
 	// communities are rejected.
 	GroupID string
+	// AppID is the mini app id (VK_APP_ID). The «/приложение» command offers a
+	// button that opens it right in the chat; without the id there is nothing
+	// to open, so the command only explains that the server is not configured.
+	AppID string
 	// Location is the timezone games are shown in. Times are stored in UTC;
 	// V1 renders them in one fixed zone per chat (ARCHITECTURE §7), and a
 	// fixed offset keeps the bot working in a container without tzdata.
@@ -150,6 +154,7 @@ type Service struct {
 	confirmationToken string
 	secret            string
 	groupID           int64
+	appID             int64
 	loc               *time.Location
 
 	messenger Messenger
@@ -171,6 +176,7 @@ type Service struct {
 
 func NewService(cfg Config, deps Deps) *Service {
 	gid, _ := strconv.ParseInt(strings.TrimSpace(cfg.GroupID), 10, 64)
+	aid, _ := strconv.ParseInt(strings.TrimSpace(cfg.AppID), 10, 64)
 	loc := cfg.Location
 	if loc == nil {
 		loc = defaultLocation
@@ -183,6 +189,7 @@ func NewService(cfg Config, deps Deps) *Service {
 		confirmationToken: strings.TrimSpace(cfg.ConfirmationToken),
 		secret:            cfg.Secret,
 		groupID:           gid,
+		appID:             aid,
 		loc:               loc,
 		messenger:         deps.Messenger,
 		chats:             deps.Chats,
@@ -218,6 +225,10 @@ const (
 	cmdSkip = "skip"
 	// cmdSettings opens the schedule screen of the chat (admins only).
 	cmdSettings = "settings"
+	// cmdApp offers the button that opens the mini app inside the chat: VK
+	// loads it in a WebView and, because the launch happens from a
+	// conversation, passes vk_chat_id to the page.
+	cmdApp = "app"
 	// cmdSlotAdd and cmdSlotRemove edit one weekday of that schedule:
 	// cmdSlotAdd without parameters only explains the expected input.
 	cmdSlotAdd    = "slot_add"
@@ -352,6 +363,8 @@ func (s *Service) handleCommand(ctx context.Context, c *commandCtx) error {
 		return s.handleMyBookings(ctx, c)
 	case cmdCancelBooking:
 		return s.handleCancel(ctx, c)
+	case cmdApp:
+		return s.handleApp(ctx, c)
 	case cmdSettings:
 		return s.handleSettings(ctx, c)
 	case cmdSlotAdd:
@@ -760,7 +773,7 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 	if note == "" {
 		note = fmt.Sprintf("Запись открыта: %s.", s.formatWhenFull(ev.StartsAt))
 	}
-	signUp, err := persistentKeyboard()
+	signUp, err := s.signUpKeyboard()
 	if err != nil {
 		return err
 	}
@@ -1463,6 +1476,42 @@ func titleOf(rest string) string {
 	return strings.Join(kept, " ")
 }
 
+// handleApp posts a message with the button that opens the mini app right in
+// the chat. VK loads the app URL in a WebView and appends the launch
+// parameters; because the launch happens from a conversation, VK passes
+// vk_chat_id — the very parameter the diagnostic page looks for. The button
+// carries the community, so the app opens in the community context.
+//
+// The same button always sits in the chat keyboard (see appRow), so the command
+// is the way to bring it back when the keyboard has scrolled away or was hidden;
+// its inline copy does not touch the sign-up keyboard under the input field.
+func (s *Service) handleApp(ctx context.Context, c *commandCtx) error {
+	if s.appID == 0 {
+		return s.sendText(ctx, c.chat.ID, c.peerID,
+			"Мини-приложение не подключено: на сервере не задан VK_APP_ID.", "")
+	}
+
+	kb, err := (Keyboard{Inline: true, Buttons: [][]Button{s.appRow()}}).Marshal()
+	if err != nil {
+		return err
+	}
+	return s.sendText(ctx, c.chat.ID, c.peerID,
+		"Откройте мини-приложение SportEvents кнопкой ниже.\n\n"+
+			"Запуск из беседы VK передаёт приложению идентификатор чата (vk_chat_id): "+
+			"страница приложения показывает его в параметрах запуска.", kb)
+}
+
+// appOwnerID is the owner_id of the open_app button. GroupID is configured as
+// the positive community id (that is how VK names the chat's community in
+// callbacks), while VK writes a community as a negative id — the same minus as
+// in the «vk.com/app<app_id>_-<group_id>» link.
+func (s *Service) appOwnerID() int64 {
+	if s.groupID > 0 {
+		return -s.groupID
+	}
+	return s.groupID
+}
+
 // handleSettings shows the schedule screen of the chat. When it was opened by a
 // button, the screen rewrites the very message the button was pressed on (VK
 // tells us its id), so the chat keeps one live settings message instead of a
@@ -1620,20 +1669,22 @@ func (s *Service) sendText(ctx context.Context, chatID, peerID int64, text, keyb
 }
 
 // chatKeyboard is what the chat input shows right now: the sign-up buttons while
-// a game is open, and an empty keyboard otherwise. chatID 0 means "unknown
-// chat" (e.g. a conversation that is not connected yet) — there is nothing to
-// sign up to, so the buttons stay hidden.
+// a game is open, and the «Открыть приложение» button otherwise. chatID 0 means
+// "unknown chat" (e.g. a conversation that is not connected yet) — there is
+// nothing to sign up to, so only the app button would be left.
 func (s *Service) chatKeyboard(ctx context.Context, chatID int64) (string, error) {
+	open := false
 	if chatID != 0 {
 		games, err := s.events.ListUpcomingWithCounts(ctx, chatID, s.now().UTC(), 1)
 		if err != nil {
 			return "", fmt.Errorf("list games: %w", err)
 		}
-		if len(games) > 0 {
-			return persistentKeyboard()
-		}
+		open = len(games) > 0
 	}
-	return RemoveKeyboard()
+	if open {
+		return s.signUpKeyboard()
+	}
+	return s.appKeyboard()
 }
 
 func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, displayName, chatTitle string) error {
@@ -1647,6 +1698,7 @@ func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, display
 			"/игры — ближайшие игры и запись\n"+
 			"/мои — ваши записи\n"+
 			"/отмена — отменить свою запись\n"+
+			"/приложение — открыть мини-приложение\n"+
 			"/старт — создать игру и анонс (администратор)\n"+
 			"/отменить игру — отменить игру и снять записи (администратор)\n"+
 			"/настройки — расписание: /настройки вс 10:00 (администратор)\n"+
@@ -1655,25 +1707,54 @@ func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, display
 			"Бот отвечает только на команды и кнопки, поэтому не мешает вашей переписке. "+
 			"Кнопки «Иду» и «Не иду» появляются под полем ввода, пока открыта запись на игру.",
 		displayName, chatTitle)
+	if s.appID != 0 {
+		text += "\n\nМини-приложение открывается кнопкой «Открыть приложение» под полем ввода."
+	}
 	return s.sendText(ctx, chatID, peerID, text, kb)
 }
 
-// persistentKeyboard is the keyboard that stays under the chat input instead
-// of scrolling away with a message (VK: no "inline", no one_time). It carries
-// the two actions of the sign-up flow and is shown only while a game is open:
-// see chatKeyboard. Buttons are callback buttons: VK delivers a press as
+// signUpKeyboard is the keyboard that stays under the chat input instead of
+// scrolling away with a message (VK: no "inline", no one_time). The first row
+// carries the two actions of the sign-up flow and is shown only while a game is
+// open: see chatKeyboard. Buttons are callback buttons: VK delivers a press as
 // message_event, so pressing one posts nothing to the chat by itself.
 // Verified against the live community.
-func persistentKeyboard() (string, error) {
-	kb := Keyboard{
-		Buttons: [][]Button{
-			{
-				CallbackButton("Иду", CommandPayload(cmdAttend), ColorPositive),
-				CallbackButton("Не иду", CommandPayload(cmdSkip), ColorNegative),
-			},
-		},
+func (s *Service) signUpKeyboard() (string, error) {
+	rows := [][]Button{{
+		CallbackButton("Иду", CommandPayload(cmdAttend), ColorPositive),
+		CallbackButton("Не иду", CommandPayload(cmdSkip), ColorNegative),
+	}}
+	if app := s.appRow(); len(app) > 0 {
+		rows = append(rows, app)
 	}
-	return kb.Marshal()
+	return Keyboard{Buttons: rows}.Marshal()
+}
+
+// appKeyboard is the keyboard shown when there is nothing to sign up to: the
+// «Открыть приложение» row alone, so the mini app stays one tap away in the
+// chat even between games. Without VK_APP_ID there is nothing to show, and the
+// keyboard is taken away as before.
+func (s *Service) appKeyboard() (string, error) {
+	app := s.appRow()
+	if len(app) == 0 {
+		return RemoveKeyboard()
+	}
+	return Keyboard{Buttons: [][]Button{app}}.Marshal()
+}
+
+// appRow is the row with the button that opens the mini app in the chat's
+// WebView: VK passes vk_chat_id to an app launched from a conversation, which
+// is what the diagnostic page at /app/ looks for. Empty when VK_APP_ID is not
+// configured.
+//
+// The button sits in the chat keyboard right under «Иду» / «Не иду»: VK accepts
+// open_app there (проверено запросом к API: такая клавиатура доходит до
+// проверки получателя, 911 не приходит), and the app is then always at hand.
+func (s *Service) appRow() []Button {
+	if s.appID == 0 {
+		return nil
+	}
+	return []Button{OpenAppButton("Открыть приложение", s.appID, s.appOwnerID(), "")}
 }
 
 // parseCommand maps a message to a command with its parameters. A button
@@ -1737,6 +1818,8 @@ func (s *Service) parseCommand(text, payload string, connected bool) parsedComma
 		return parsedCommand{cmd: cmdSlotAdd}
 	case "connect", "подключить":
 		return parsedCommand{cmd: cmdConnect}
+	case "app", "приложение":
+		return parsedCommand{cmd: cmdApp}
 	case "help", "помощь":
 		return parsedCommand{cmd: cmdStart}
 	}

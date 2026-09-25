@@ -513,6 +513,26 @@ func TestEmptyKeyboards(t *testing.T) {
 	}
 }
 
+// The open_app button mirrors the VK Bot API object: app_id opens the mini
+// app, owner_id names the community (negative for communities), hash carries
+// optional navigation. No colour and no empty fields — a stray field is a
+// keyboard VK may reject with 911.
+func TestOpenAppButtonMarshal(t *testing.T) {
+	kb := Keyboard{
+		Inline:  true,
+		Buttons: [][]Button{{OpenAppButton("Открыть приложение", 54789848, -12345, "")}},
+	}
+	raw, err := kb.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"inline":true,"buttons":[[{"action":{"type":"open_app","label":"Открыть приложение",` +
+		`"app_id":54789848,"owner_id":-12345}}]]}`
+	if raw != want {
+		t.Fatalf("keyboard:\n got %s\nwant %s", raw, want)
+	}
+}
+
 func TestKeyboardMarshal(t *testing.T) {
 	kb := Keyboard{
 		Inline: true,

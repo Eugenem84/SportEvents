@@ -31,6 +31,14 @@ type ButtonAction struct {
 	Type    string `json:"type"`
 	Label   string `json:"label,omitempty"`
 	Payload string `json:"payload,omitempty"`
+	// AppID, OwnerID and Hash belong to the open_app button: it opens the mini
+	// app (WebView) by its id. OwnerID names the community the app is installed
+	// in, so the app opens in the community context; VK writes a community as a
+	// negative id (the same minus as in the «vk.com/app<app_id>_-<group_id>»
+	// link). Hash is optional navigation the app receives after «#».
+	AppID   int64  `json:"app_id,omitempty"`
+	OwnerID int64  `json:"owner_id,omitempty"`
+	Hash    string `json:"hash,omitempty"`
 }
 
 // TextButton builds a keyboard button that sends its label as a chat
@@ -120,6 +128,17 @@ func CallbackButton(label, payload string, color ButtonColor) Button {
 	return Button{
 		Action: ButtonAction{Type: "callback", Label: label, Payload: payload},
 		Color:  color,
+	}
+}
+
+// OpenAppButton builds a button that opens the mini app right in the chat: VK
+// loads the app URL in a WebView and appends the launch parameters. appID is
+// the mini app id (VK_APP_ID), ownerID the community it is installed in, hash
+// the optional section to open. The button takes no colour: VK documents
+// colour for text and callback buttons only.
+func OpenAppButton(label string, appID, ownerID int64, hash string) Button {
+	return Button{
+		Action: ButtonAction{Type: "open_app", Label: label, AppID: appID, OwnerID: ownerID, Hash: hash},
 	}
 }
 
