@@ -2039,18 +2039,35 @@ func TestParseSeatMessage(t *testing.T) {
 		ok    bool
 	}{
 		{"3", 3, "", true},
+		// Разделители и регистр не важны: пишут по-разному.
+		{"3 - Сергей Иванов", 3, "Сергей Иванов", true},
+		{"3. Сергей иванов", 3, "Сергей иванов", true},
+		{"3  Сергей", 3, "Сергей", true},
+		{"3-Сергей", 3, "Сергей", true},
+		{"3,Сергей", 3, "Сергей", true},
+		{"3: Сергей", 3, "Сергей", true},
+		{"3.  Сергей   Иванов", 3, "Сергей Иванов", true},
 		{"11 Сергей Иванов", 11, "Сергей Иванов", true},
 		{"7 Иван", 7, "Иван", true},
 		{"5 Иванов-Петров", 5, "Иванов-Петров", true},
+		{"3.", 3, "", true},
 		{"  3  ", 3, "", true},
-		// Не заявка: болтовня, счёт, ноль, число внутри фразы.
+		// Не заявка: болтовня, счёт, ноль, больше трёх слов, слова не из имени.
 		{"12 человек пришли", 0, "", false},
+		{"3 сентября", 0, "", false},
+		{"3 сет", 0, "", false},
+		{"10 свободных мест", 0, "", false},
 		{"3:2", 0, "", false},
 		{"0", 0, "", false},
 		{"3 место", 0, "", false},
 		{"поставили 3", 0, "", false},
 		{"", 0, "", false},
 		{"10.5", 0, "", false},
+		{"3 и", 0, "", false},
+		{"5 минут", 0, "", false},
+		{"2 команды", 0, "", false},
+		{"3 да", 0, "", false},
+		{"3 Сергей Иванов Петрович Младший", 0, "", false},
 	}
 	for _, tc := range cases {
 		seat, guest, ok := parseSeatMessage(tc.text)
@@ -2179,6 +2196,36 @@ func TestCallbackSeatNumberInvitesGuest(t *testing.T) {
 	}
 	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "11 - Сергей Иванов" {
 		t.Fatalf("line: %+v", h.msg.sent)
+	}
+}
+
+// Один и тот же гость, как бы его ни написали: тире, точка, лишние пробелы,
+// нижний регистр — всё это одна заявка.
+func TestCallbackSeatNumberGuestVariants(t *testing.T) {
+	for _, text := range []string{"3 - Сергей Иванов", "3. сергей иванов", "3  Сергей"} {
+		t.Run(text, func(t *testing.T) {
+			h := newHarness(t, true)
+			h.events.games = []event.EventSummary{{
+				Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+			}}
+
+			if code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, text, "")); code != http.StatusOK {
+				t.Fatalf("status: %d", code)
+			}
+			if len(h.books.created) != 1 {
+				t.Fatalf("created: %+v", h.books.created)
+			}
+			in := h.books.created[0]
+			if in.SeatNo != 3 {
+				t.Fatalf("seat: %+v", in)
+			}
+			if in.UserID != nil {
+				t.Fatalf("a guest has no profile: %+v", in)
+			}
+			if len(h.msg.sent) != 1 || !strings.HasPrefix(h.msg.sent[0].Text, "3 - ") {
+				t.Fatalf("line: %+v", h.msg.sent)
+			}
+		})
 	}
 }
 

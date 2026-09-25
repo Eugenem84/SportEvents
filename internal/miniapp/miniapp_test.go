@@ -351,8 +351,9 @@ func TestAppPageIsServed(t *testing.T) {
 		"Отменить игру",                // и отмена игры
 		"game/edit",                    // правка игры
 		"remove",                       // снятие участника
-		"Пригласить человека",          // приглашение гостя (любой участник)
-		"guest",                        // его ручка
+		"Добавить человека",            // форма для гостя, которого нет в чате
+		"Записать гостя",
+		"guest", // её ручка
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page does not contain %q", want)

@@ -106,11 +106,11 @@ a { color: var(--accent); text-decoration: none; }
 .cols > * { flex: 1; min-width: 0; }
 .field { display: block; margin-bottom: 8px; }
 .field > span { display: block; margin-bottom: 4px; }
-input {
+input, select {
   font: inherit; color: var(--text); background: var(--card-2); width: 100%;
   border: 1px solid transparent; border-radius: 8px; padding: 9px 10px;
 }
-input:focus { border-color: var(--accent); outline: none; }
+input:focus, select:focus { border-color: var(--accent); outline: none; }
 .picks { display: flex; flex-wrap: wrap; }
 .chip {
   font: inherit; font-size: 13px; color: var(--text); background: var(--card-2);
@@ -264,6 +264,7 @@ input:focus { border-color: var(--accent); outline: none; }
       return;
     }
     games.forEach(function (g) { screen.appendChild(gameCard(g, s.admin)); });
+    screen.appendChild(inviteCard(games));
     if (s.admin) {
       screen.appendChild(createCard(s));
     }
@@ -364,7 +365,6 @@ input:focus { border-color: var(--accent); outline: none; }
     row.className = 'actions';
     row.appendChild(btn);
     box.appendChild(row);
-    box.appendChild(inviteForm(g));
 
     if (admin) {
       box.appendChild(adminGameControls(g));
@@ -554,61 +554,65 @@ input:focus { border-color: var(--accent); outline: none; }
     post(path, body, btn, okText);
   }
 
-  // inviteForm — «пригласить человека»: имя и, если нужно, номер места. В беседе
-  // это пишут как «11 Сергей Иванов», здесь — формой. Приглашать может любой
-  // участник, а не только администратор.
-  function inviteForm(g) {
-    var box = document.createElement('div');
-    var holder = document.createElement('div');
-    holder.className = 'edit-holder';
+  // inviteCard — «добавить человека», которого в чате нет: имя и, если знаете,
+  // место. Игра выбирается, если их несколько. Профиля у гостя не будет, поэтому
+  // аватарка ему не достаётся, а уведомления адресованы пригласившему. Делать это
+  // может любой участник, а не только администратор.
+  function inviteCard(games) {
+    var box = document.createElement('section');
+    box.className = 'card';
 
-    var toggle = button('Пригласить человека', 'ghost', function () {
-      if (holder.firstChild) {
-        holder.innerHTML = '';
-        toggle.textContent = 'Пригласить человека';
+    var head = document.createElement('h2');
+    head.textContent = 'Добавить человека';
+    box.appendChild(head);
+
+    var hint = document.createElement('div');
+    hint.className = 'g-when';
+    hint.textContent = 'Кого нет в чате — например, Сергей Иванов. Поставим на указанное место или на свободное.';
+    box.appendChild(hint);
+
+    var game = select(games.map(function (g) {
+      return { value: String(g.id), label: g.when + ' · ' + g.title };
+    }));
+    var name = input('text', '', 'имя и фамилия');
+    var seat = input('number', '', 'место, если знаете');
+
+    var grid = document.createElement('div');
+    grid.className = 'grid';
+    grid.appendChild(field('игра', game));
+    grid.appendChild(field('гость', name));
+    grid.appendChild(field('место', seat));
+    box.appendChild(grid);
+
+    var add = button('Записать гостя', '', function () {
+      var guest = name.value.trim();
+      if (!guest) {
+        toast('Напишите имя гостя');
+        name.focus();
         return;
       }
-      holder.appendChild(fields());
-      toggle.textContent = 'Свернуть';
+      post('guest', {
+        event_id: Number(game.value),
+        name: guest,
+        seat_no: Number(seat.value) || 0
+      }, add, 'Гость записан');
     });
-
-    function fields() {
-      var inner = document.createElement('div');
-      var name = input('text', '', 'имя и фамилия, например Сергей Иванов');
-      var seat = input('number', '', 'место, если знаете');
-
-      var grid = document.createElement('div');
-      grid.className = 'grid';
-      grid.appendChild(field('гость', name));
-      grid.appendChild(field('место', seat));
-      inner.appendChild(grid);
-
-      var add = button('Записать гостя', '', function () {
-        var guest = name.value.trim();
-        if (!guest) {
-          toast('Напишите имя гостя');
-          name.focus();
-          return;
-        }
-        post('guest', {
-          event_id: g.id,
-          name: guest,
-          seat_no: Number(seat.value) || 0
-        }, add, 'Гость записан');
-      });
-      var row = document.createElement('div');
-      row.className = 'actions';
-      row.appendChild(add);
-      inner.appendChild(row);
-      return inner;
-    }
-
     var row = document.createElement('div');
     row.className = 'actions';
-    row.appendChild(toggle);
+    row.appendChild(add);
     box.appendChild(row);
-    box.appendChild(holder);
     return box;
+  }
+
+  function select(options) {
+    var el = document.createElement('select');
+    options.forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o.value;
+      opt.textContent = o.label;
+      el.appendChild(opt);
+    });
+    return el;
   }
 
   // createCard — форма «Создать игру»: дата, время, место, название и число

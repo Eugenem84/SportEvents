@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"sportevents.local/internal/announce"
 	"sportevents.local/internal/booking"
@@ -2198,35 +2199,100 @@ func (s *Service) parseCommand(text, payload string, connected bool) parsedComma
 	return parsedCommand{}
 }
 
-// The old way of signing up in the chat: a bare seat number («3»), or a number
-// with a name («11 Сергей Иванов») to invite someone who is not in the chat. The
-// name filter is what keeps ordinary talk out: every word starts with a capital,
-// so «12 человек пришли» stays conversation.
-var (
-	seatOnlyRE  = regexp.MustCompile(`^(\d{1,2})$`)
-	seatGuestRE = regexp.MustCompile(`^(\d{1,2})[ \t]+([A-ZА-ЯЁ][a-zа-яё]+(?:[ \t-]+[A-ZА-ЯЁ][a-zа-яё]+){0,2})$`)
-)
+// seatStopWords are words that follow a number in ordinary talk («12 человек
+// пришли», «3 сентября игра»). A name never is one of them, so a message with
+// such a word is not a seat request at all: молчание лучше, чем чужое имя в
+// составе.
+var seatStopWords = map[string]bool{
+	"человек": true, "человека": true, "человеку": true, "людей": true,
+	"мест": true, "места": true, "месту": true, "место": true,
+	"свободно": true, "свободных": true, "занято": true, "заняты": true, "осталось": true, "всего": true,
+	"игра": true, "игры": true, "игре": true, "игру": true, "играем": true, "играли": true, "играть": true,
+	"игрок": true, "игрока": true, "игроков": true, "состав": true, "резерв": true,
+	"пришли": true, "пришло": true, "придёт": true, "придет": true, "собрались": true,
+	"будет": true, "будут": true, "было": true, "есть": true, "надо": true, "нужно": true,
+	"можно": true, "давай": true, "давайте": true, "хочу": true, "хотим": true,
+	"сет": true, "сета": true, "сетов": true, "партия": true, "партии": true, "партий": true,
+	"гол": true, "гола": true, "голов": true, "очко": true, "очка": true, "очков": true,
+	"мяч": true, "мяча": true, "мячей": true, "тайм": true, "тайма": true,
+	"команда": true, "команды": true, "команд": true, "счёт": true, "счет": true,
+	"минута": true, "минуту": true, "минуты": true, "минут": true,
+	"час": true, "часа": true, "часов": true, "день": true, "дня": true, "дней": true,
+	"неделя": true, "неделю": true, "недели": true, "раз": true, "раза": true, "лет": true,
+	"да": true, "нет": true, "ок": true, "ok": true, "ага": true, "угу": true, "ясно": true,
+	"ладно": true, "точно": true, "верно": true, "здесь": true, "тут": true, "там": true,
+	"уже": true, "ещё": true, "еще": true, "пока": true, "привет": true, "спасибо": true, "спс": true,
+	"января": true, "февраля": true, "марта": true, "апреля": true, "мая": true, "июня": true,
+	"июля": true, "августа": true, "сентября": true, "октября": true, "ноября": true, "декабря": true,
+	"сегодня": true, "завтра": true, "вчера": true,
+	"понедельник": true, "вторник": true, "среду": true, "среда": true, "четверг": true,
+	"пятницу": true, "пятница": true, "субботу": true, "суббота": true,
+	"воскресенье": true, "выходные": true,
+}
 
-// parseSeatMessage reads a message that is nothing but a seat request. Seat 0
-// does not exist, so «0» is not a request either.
+// parseSeatMessage reads the old way of signing up: «3» takes seat 3, and a
+// number with a name invites that guest to that seat. People write it
+// differently — «3 - Сергей Иванов», «3. Сергей иванов», with two spaces or
+// without any case rules — поэтому разделители и регистр не важны.
+//
+// A message is a request only when the number is at its very start and the rest
+// is one to three words that could be a name: letters (with hyphens) and nothing
+// from seatStopWords. Everything else is conversation and gets no answer.
 func parseSeatMessage(text string) (seat int, guest string, ok bool) {
-	text = strings.TrimSpace(text)
-	if text == "" {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
 		return 0, "", false
 	}
 
-	if m := seatOnlyRE.FindStringSubmatch(text); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return n, "", true
-		}
+	// Номер — ведущие цифры первого слова; хвост того же слова («3.» или
+	// «3-Сергей») относится уже к имени.
+	first := fields[0]
+	cut := 0
+	for cut < len(first) && first[cut] >= '0' && first[cut] <= '9' {
+		cut++
+	}
+	if cut == 0 {
 		return 0, "", false
 	}
-	if m := seatGuestRE.FindStringSubmatch(text); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return n, strings.TrimSpace(m[2]), true
+	number, err := strconv.Atoi(first[:cut])
+	if err != nil || number < 1 {
+		return 0, "", false
+	}
+
+	// Имя: хвост первого слова плюс остальные слова, без разделителей.
+	words := make([]string, 0, 3)
+	parts := append([]string{first[cut:]}, fields[1:]...)
+	for _, part := range parts {
+		part = strings.Trim(part, ".,:;!?-–—()")
+		if part == "" {
+			// Лишние разделители: «3 -  Сергей», «3. Сергей».
+			continue
+		}
+		if !isNameWord(part) || seatStopWords[strings.ToLower(part)] {
+			return 0, "", false
+		}
+		words = append(words, part)
+	}
+	if len(words) > 3 {
+		return 0, "", false
+	}
+	return number, strings.Join(words, " "), true
+}
+
+// isNameWord reports whether a word can be part of a name: letters of any case,
+// hyphens allowed inside, at least two letters («Иван», «Иванов-Петров»).
+func isNameWord(word string) bool {
+	letters := 0
+	for _, r := range word {
+		switch {
+		case unicode.IsLetter(r):
+			letters++
+		case r == '-':
+		default:
+			return false
 		}
 	}
-	return 0, "", false
+	return letters >= 2
 }
 
 // slashCommand splits "/create 27.09 19:00" into "create" and "27.09 19:00".
