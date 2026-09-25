@@ -41,6 +41,7 @@ Phase 4 — VK — готово
 * User identity и ChatChannel — готово (идемпотентно, гонки покрыты тестами)
 * Ответ в беседу, keyboard — готово
 * Идемпотентность повторного callback — готово (дедуп по event_id + unique-индексы PostgreSQL)
+* Дев-стенд как приёмник событий VK — наполовину: 25.09.2026 `VK_CONFIRMATION_TOKEN` задан на `sportevent.dev.medovf2h.beget.tech`, `/vk/callback` отвечает (confirmation → 200, чужой `group_id` → 403, своё событие → `200 ok`), smoke 7/7 зелёных. Ручной шаг владельца: переключить в сообществе URL Callback API на стенд и остановить Long Poll-мостик (иначе VK доставит событие двумя каналами и бот ответит дважды)
 
 Phase 5 — Подключение беседы — готово
 
