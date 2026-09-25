@@ -261,6 +261,61 @@ func TestSendMessageEventAnswerUnexpectedResponse(t *testing.T) {
 	}
 }
 
+// VK returns is_admin/is_owner either as booleans (as in the
+// messages.getConversationMembers example in the docs) or as 0/1, so both
+// forms must parse.
+func TestIsConversationAdminParsesBoolAndIntFlags(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":{"count":5,"items":[` +
+			`{"member_id":-182536237,"invited_by":-182536237,"is_admin":true,"is_owner":true,"join_date":1574008940},` +
+			`{"member_id":555,"is_admin":false},` +
+			`{"member_id":777,"is_admin":1},` +
+			`{"member_id":888,"is_owner":1},` +
+			`{"member_id":999}]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	ctx := context.Background()
+
+	cases := []struct {
+		name   string
+		userID int64
+		want   bool
+	}{
+		{"doc example (bool true)", -182536237, true},
+		{"bool false", 555, false},
+		{"int 1", 777, true},
+		{"owner int 1", 888, true},
+		{"flags absent", 999, false},
+	}
+	for _, tc := range cases {
+		isAdmin, err := c.IsConversationAdmin(ctx, 2_000_000_047, tc.userID)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if isAdmin != tc.want {
+			t.Fatalf("%s: want %v, got %v", tc.name, tc.want, isAdmin)
+		}
+	}
+}
+
+// An unexpected flag value must be an error, not a silent "not an admin":
+// otherwise a wrong type would look like a permission problem.
+func TestIsConversationAdminRejectsUnexpectedFlag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":{"items":[{"member_id":555,"is_admin":"yes"}]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	if _, err := c.IsConversationAdmin(context.Background(), 2_000_000_047, 555); err == nil {
+		t.Fatal("want error for an unexpected is_admin value")
+	}
+}
+
 func TestKeyboardMarshal(t *testing.T) {
 	kb := Keyboard{
 		Inline: true,

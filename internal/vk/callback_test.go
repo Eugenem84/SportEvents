@@ -521,3 +521,24 @@ func TestCallbackConnectRetriedEventProcessedOnce(t *testing.T) {
 		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
 }
+
+// A VK API failure while checking the initiator's rights must be answered,
+// not swallowed: the user has to learn that the bot is not a chat admin
+// (otherwise the bot just stays silent in the conversation).
+func TestCallbackConnectVKAPIErrorReplies(t *testing.T) {
+	h := newHarness(t, false)
+	h.convs.adminErr = fmt.Errorf("vk messages.getConversationMembers: error 15: Access denied")
+	code, _ := postJSON(t, h.svc.HandleCallback, connectEnvelope(2000000047, 555, "подключить"))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.chats.connectCalls != 0 {
+		t.Fatal("a failed rights check must not create a chat")
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Не удалось") {
+		t.Fatalf("reply: %q", h.msg.sent[0].Text)
+	}
+}

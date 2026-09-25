@@ -213,7 +213,12 @@ func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
 
 	isAdmin, err := s.convs.IsConversationAdmin(ctx, msg.PeerID, msg.FromID)
 	if err != nil {
-		return fmt.Errorf("check conversation admin: %w", err)
+		// VK refusing to list members (e.g. the bot is not an admin of the
+		// chat) is an external failure the user can act on: answer instead
+		// of staying silent, and keep the real error in the log.
+		s.log.Printf("vk: cannot check admins of peer %d: %v", msg.PeerID, err)
+		return s.sendText(ctx, msg.PeerID,
+			"Не удалось проверить права в беседе. Убедитесь, что бот добавлен в беседу и назначен администратором, и попробуйте ещё раз.", "")
 	}
 	if !isAdmin {
 		s.log.Printf("vk: connect denied for peer %d: user %d is not an admin", msg.PeerID, msg.FromID)

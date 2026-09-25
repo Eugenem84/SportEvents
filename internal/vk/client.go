@@ -131,6 +131,25 @@ func (c *Client) GetUserName(ctx context.Context, userID int64) (string, error) 
 	return name, nil
 }
 
+// vkFlag is a VK boolean flag. Depending on the method and API version VK
+// returns these either as JSON booleans (the messages.getConversationMembers
+// example in the docs uses "is_admin": true) or as 0/1 integers, so both
+// forms must parse. Anything else is an error rather than a silent false:
+// a wrong type would otherwise be reported as "not an admin".
+type vkFlag bool
+
+func (f *vkFlag) UnmarshalJSON(data []byte) error {
+	switch strings.TrimSpace(string(data)) {
+	case "true", "1":
+		*f = true
+	case "false", "0", "null":
+		*f = false
+	default:
+		return fmt.Errorf("vkFlag: unexpected value %s", data)
+	}
+	return nil
+}
+
 // GetConversationTitle returns the title of a group conversation
 // (messages.getConversationsById). It fails when VK returns no title, e.g.
 // for a one-to-one dialog or when the bot cannot read the conversation.
@@ -167,6 +186,9 @@ func (c *Client) GetConversationTitle(ctx context.Context, peerID int64) (string
 // owner; both count as admins here. The members list is paginated, but the
 // initiator of the connect command is an active participant and is returned
 // on the first page, so V1 does not page through it.
+//
+// In a one-to-one dialog the method returns members without is_admin/is_owner
+// at all, so a dialog can never pass this check.
 func (c *Client) IsConversationAdmin(ctx context.Context, peerID, userID int64) (bool, error) {
 	params := url.Values{}
 	params.Set("peer_id", strconv.FormatInt(peerID, 10))
@@ -177,9 +199,9 @@ func (c *Client) IsConversationAdmin(ctx context.Context, peerID, userID int64) 
 	}
 	var resp struct {
 		Items []struct {
-			MemberID int64 `json:"member_id"`
-			IsAdmin  int   `json:"is_admin"`
-			IsOwner  int   `json:"is_owner"`
+			MemberID int64  `json:"member_id"`
+			IsAdmin  vkFlag `json:"is_admin"`
+			IsOwner  vkFlag `json:"is_owner"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -187,7 +209,7 @@ func (c *Client) IsConversationAdmin(ctx context.Context, peerID, userID int64) 
 	}
 	for _, m := range resp.Items {
 		if m.MemberID == userID {
-			return m.IsAdmin == 1 || m.IsOwner == 1, nil
+			return bool(m.IsAdmin) || bool(m.IsOwner), nil
 		}
 	}
 	return false, nil
