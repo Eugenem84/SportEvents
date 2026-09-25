@@ -125,7 +125,7 @@ type PhotoSource interface {
 // announcement and the rights check all live behind it, so the app and the bot
 // take the same path. *vk.Service implements it.
 type ChatSyncer interface {
-	BookInChat(ctx context.Context, peerID, chatID, eventID int64, user chat.User) (booking.Booking, error)
+	BookInChat(ctx context.Context, peerID, chatID, eventID int64, by chat.User, seat int, guest string) (booking.Booking, error)
 	CancelInChat(ctx context.Context, peerID, chatID, eventID, userID int64) (booking.CancelResult, error)
 	// StartGameInChat creates a game and opens its sign-up in the chat.
 	StartGameInChat(ctx context.Context, peerID, userID int64, in event.CreateInput) (event.Event, error)
@@ -241,6 +241,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.bookingAction(w, r, true)
 	case path == h.base+"/api/skip":
 		h.bookingAction(w, r, false)
+	case path == h.base+"/api/guest":
+		h.apiInviteGuest(w, r)
 	case path == h.base+"/api/game":
 		h.apiGameCreate(w, r)
 	case path == h.base+"/api/game/edit":
@@ -831,7 +833,7 @@ func (h *handler) bookingAction(w http.ResponseWriter, r *http.Request, attend b
 // attend signs the person up: the same booking the «Иду» button makes, including
 // the line in the chat and the rewritten announcement.
 func (h *handler) attend(w http.ResponseWriter, ctx context.Context, lp launchParams, chatID, eventID int64, me chat.User) {
-	b, err := h.deps.Chat.BookInChat(ctx, lp.peerID(), chatID, eventID, me)
+	b, err := h.deps.Chat.BookInChat(ctx, lp.peerID(), chatID, eventID, me, 0, "")
 	switch {
 	case errors.Is(err, booking.ErrAlreadyBooked):
 		writeError(w, http.StatusConflict, "вы уже записаны на эту игру")
@@ -866,6 +868,88 @@ func (h *handler) skip(w http.ResponseWriter, ctx context.Context, lp launchPara
 	out := map[string]any{"ok": true}
 	if res.Promoted != nil {
 		out["promoted"] = fmt.Sprintf("%d - %s", seatOf(*res.Promoted), res.Promoted.PlayerName)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// apiInviteGuest signs up someone who is not in the chat: «11 Сергей Иванов», as
+// people write it in the conversation, only as a form. Any participant may invite
+// — so the chat does it too, without asking an administrator. The guest gets no
+// profile, so no avatar; the inviter stays the one to notify.
+func (h *handler) apiInviteGuest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "нужен POST")
+		return
+	}
+	lp, ok := h.launchParams(w, r)
+	if !ok {
+		return
+	}
+	if h.deps.Chat == nil {
+		writeError(w, http.StatusConflict, "бот не настроен на сервере: записать гостя нельзя")
+		return
+	}
+
+	var body struct {
+		EventID int64  `json:"event_id"`
+		Name    string `json:"name"`
+		SeatNo  int    `json:"seat_no"`
+	}
+	if !decodeForm(w, r, &body) {
+		return
+	}
+	if body.EventID <= 0 || strings.TrimSpace(body.Name) == "" {
+		writeError(w, http.StatusBadRequest, "нужны игра и имя гостя")
+		return
+	}
+
+	ctx := r.Context()
+	ch, me, err := h.resolve(ctx, lp)
+	if err != nil {
+		h.writeResolveError(w, err)
+		return
+	}
+
+	ev, err := h.deps.Events.Get(ctx, ch.ID, body.EventID)
+	switch {
+	case errors.Is(err, event.ErrNotFound):
+		writeError(w, http.StatusNotFound, "игра не найдена")
+		return
+	case err != nil:
+		h.writeServerError(w, err)
+		return
+	}
+	switch {
+	case ev.Status == event.StatusCancelled:
+		writeError(w, http.StatusConflict, "игра отменена")
+		return
+	case !ev.StartsAt.After(h.now()):
+		writeError(w, http.StatusConflict, "игра уже прошла")
+		return
+	}
+
+	b, err := h.deps.Chat.BookInChat(ctx, lp.peerID(), ch.ID, ev.ID, me, body.SeatNo, body.Name)
+	if err != nil {
+		switch {
+		case errors.Is(err, booking.ErrSeatTaken):
+			writeError(w, http.StatusConflict, "это место уже занято")
+		case errors.Is(err, booking.ErrSeatOutOfRange):
+			writeError(w, http.StatusConflict, "в этой игре нет такого места")
+		case errors.Is(err, booking.ErrInvalid):
+			writeError(w, http.StatusBadRequest, "не понял имя гостя")
+		default:
+			h.writeServerError(w, err)
+		}
+		return
+	}
+	h.log.Printf("miniapp: guest %q booked into game %d (seat %d) by user %d",
+		b.PlayerName, ev.ID, seatOf(b), me.ID)
+
+	out := map[string]any{
+		"ok": true, "name": b.PlayerName, "status": string(b.Status), "seat_no": seatOf(b),
+	}
+	if b.Status == booking.StatusWaitlist {
+		out["place"] = h.reservePlace(ctx, ev.ID, b.ID)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

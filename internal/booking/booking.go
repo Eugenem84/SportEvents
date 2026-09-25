@@ -12,6 +12,12 @@ var (
 	ErrNotFound      = errors.New("booking not found")
 	ErrAlreadyBooked = errors.New("user already has an active booking for this event")
 	ErrNotActive     = errors.New("booking is not active")
+	// ErrSeatTaken reports that the seat the caller asked for is already held by
+	// a confirmed booking: in a chat people write «3» meaning seat 3, and the
+	// bot answers who has it.
+	ErrSeatTaken = errors.New("seat is already taken")
+	// ErrSeatOutOfRange reports a seat outside 1..capacity.
+	ErrSeatOutOfRange = errors.New("seat is out of the game's range")
 )
 
 // Status is a booking lifecycle state. Values must match the CHECK
@@ -42,13 +48,16 @@ type Booking struct {
 }
 
 // CreateInput describes a new booking request. UserID is nil for a guest
-// added by another participant or by an administrator.
+// added by another participant or by an administrator. SeatNo is the seat the
+// caller asked for (in the chat people write «11 Сергей Иванов»); zero means
+// «any free seat», and the domain takes the smallest one.
 type CreateInput struct {
 	EventID        int64
 	PlayerName     string
 	Phone          string
 	UserID         *int64
 	BookedByUserID int64
+	SeatNo         int
 }
 
 // BookingWithEvent is a booking together with the event it belongs to. It is

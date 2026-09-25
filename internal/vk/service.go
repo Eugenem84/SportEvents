@@ -226,6 +226,10 @@ const (
 	cmdBook = "book"
 	// cmdSkip is the "Не иду" button: cancel the caller's booking.
 	cmdSkip = "skip"
+	// cmdSeat is the old way of signing up in the chat: a message that is just a
+	// seat number («3»), or a seat with a name («11 Сергей Иванов») to invite
+	// someone who is not in the chat.
+	cmdSeat = "seat"
 	// cmdSettings opens the schedule screen of the chat (admins only).
 	cmdSettings = "settings"
 	// cmdApp offers the button that opens the mini app inside the chat: VK
@@ -305,6 +309,8 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 		weekday: parsed.weekday,
 		minutes: parsed.minutes,
 		hasSlot: parsed.hasSlot,
+		seat:    parsed.seat,
+		guest:   parsed.guest,
 		text:    stripCommandWord(msg.Text),
 	})
 }
@@ -321,6 +327,10 @@ type commandCtx struct {
 	minutes int
 	hasSlot bool
 	text    string
+	// seat and guest belong to the old way of signing up in the chat: a seat
+	// number, optionally with the name of the person being invited.
+	seat  int
+	guest string
 	// messageID is the message this interaction must rewrite: callback
 	// buttons carry the id of the message they were pressed on. Zero means
 	// "post a new message".
@@ -341,6 +351,10 @@ type parsedCommand struct {
 	weekday int
 	minutes int
 	hasSlot bool
+	// seat and guest come from the old way of signing up: «3» takes seat 3 for
+	// the sender, «11 Сергей Иванов» invites a guest to seat 11.
+	seat  int
+	guest string
 }
 
 // handleCommand runs one command. Both message_new (typed text and text
@@ -362,6 +376,8 @@ func (s *Service) handleCommand(ctx context.Context, c *commandCtx) error {
 		return s.handleAttend(ctx, c)
 	case cmdSkip:
 		return s.handleSkip(ctx, c)
+	case cmdSeat:
+		return s.handleSeat(ctx, c)
 	case cmdMyBookings:
 		return s.handleMyBookings(ctx, c)
 	case cmdCancelBooking:
@@ -1159,26 +1175,40 @@ func (s *Service) cancelLine(ctx context.Context, b booking.BookingWithEvent) (s
 	return fmt.Sprintf("%s - пропускает", b.PlayerName), nil
 }
 
-// BookInChat signs a user up for a game on behalf of the mini app and shows the
-// booking in the chat: the «N - Имя» line (or «резерв N - Имя») and the
-// rewritten announcement are exactly what the «Иду» button produces, so the two
-// entry points cannot drift apart. user is resolved by the caller from the
-// launch parameters of the app.
+// BookInChat signs a person up for a game on behalf of the mini app or of a
+// message in the chat, and shows the booking in the conversation: the «N - Имя»
+// line (or «резерв N - Имя») and the rewritten announcement are exactly what the
+// «Иду» button produces, so the entry points cannot drift apart.
 //
-// A repeated call is not an error: the ordinary "Иду" already booked, and the
-// app may simply be retried — the existing booking comes back.
-func (s *Service) BookInChat(ctx context.Context, peerID, chatID, eventID int64, user chat.User) (booking.Booking, error) {
-	if existing, booked, err := s.findActiveBooking(ctx, user.ID, eventID); err != nil {
-		return booking.Booking{}, err
-	} else if booked {
-		return existing.Booking, nil
+// seat is the seat the caller asked for; zero means any free one. A non-empty
+// guest invites that person instead of the caller: записи у него нет, поэтому
+// профиля не требуется, а пригласивший остаётся тем, кому адресованы
+// уведомления (ARCHITECTURE §16).
+//
+// A repeated call of a person's own booking is not an error: the ordinary "Иду"
+// already booked, and the caller may simply be retried — the existing booking
+// comes back. booking.ErrSeatTaken means the seat someone asked for is held by
+// another person, and the caller explains who has it.
+func (s *Service) BookInChat(ctx context.Context, peerID, chatID, eventID int64, by chat.User, seat int, guest string) (booking.Booking, error) {
+	player, userID := by.DisplayName, &by.ID
+	if guest = strings.TrimSpace(guest); guest != "" {
+		player, userID = guest, nil
+	}
+
+	if userID != nil {
+		if existing, booked, err := s.findActiveBooking(ctx, by.ID, eventID); err != nil {
+			return booking.Booking{}, err
+		} else if booked {
+			return existing.Booking, nil
+		}
 	}
 
 	b, err := s.bookings.Create(ctx, booking.CreateInput{
 		EventID:        eventID,
-		PlayerName:     user.DisplayName,
-		UserID:         &user.ID,
-		BookedByUserID: user.ID,
+		PlayerName:     player,
+		UserID:         userID,
+		BookedByUserID: by.ID,
+		SeatNo:         seat,
 	})
 	if err != nil {
 		return booking.Booking{}, fmt.Errorf("create booking: %w", err)
@@ -1192,11 +1222,7 @@ func (s *Service) BookInChat(ctx context.Context, peerID, chatID, eventID int64,
 		}
 		line = fmt.Sprintf("резерв %d - %s", position, b.PlayerName)
 	} else {
-		seat := 0
-		if b.SeatNo != nil {
-			seat = *b.SeatNo
-		}
-		line = fmt.Sprintf("%d - %s", seat, b.PlayerName)
+		line = fmt.Sprintf("%d - %s", seatOf(b), b.PlayerName)
 	}
 
 	// Правка анонса идёт до строки в чат: клавиатуру под полем ввода беседа
@@ -1206,6 +1232,14 @@ func (s *Service) BookInChat(ctx context.Context, peerID, chatID, eventID int64,
 		return b, err
 	}
 	return b, nil
+}
+
+// seatOf is the seat number of a booking; a confirmed booking always has one.
+func seatOf(b booking.Booking) int {
+	if b.SeatNo == nil {
+		return 0
+	}
+	return *b.SeatNo
 }
 
 // CancelInChat cancels the user's booking in a game on behalf of the mini app
@@ -1395,6 +1429,95 @@ func removalLine(b booking.Booking) string {
 		return fmt.Sprintf("%d - %s минус (снято администратором)", *b.SeatNo, b.PlayerName)
 	}
 	return fmt.Sprintf("%s минус из резерва (снято администратором)", b.PlayerName)
+}
+
+// handleSeat is the old way of signing up: a seat number typed in the chat.
+// «3» books the sender into seat 3, «11 Сергей Иванов» invites a guest. The bot
+// answers only when it can act — there is an open game and the number fits its
+// capacity — so a bare number in ordinary conversation stays conversation.
+func (s *Service) handleSeat(ctx context.Context, c *commandCtx) error {
+	ev, ok, err := s.targetGame(ctx, c)
+	if err != nil || !ok {
+		return err
+	}
+	if c.seat > ev.Capacity {
+		// Номер больше, чем мест: это не заявка на место, а что-то другое.
+		return nil
+	}
+
+	if c.guest == "" {
+		// Своё место. Если человек уже записан, скажем куда: он просил другое.
+		existing, booked, err := s.findActiveBooking(ctx, c.user.ID, ev.ID)
+		if err != nil {
+			return err
+		}
+		if booked {
+			return s.sendText(ctx, c.chat.ID, c.peerID, alreadySeatedLine(existing), "")
+		}
+	}
+
+	if _, err := s.BookInChat(ctx, c.peerID, c.chat.ID, ev.ID, c.user, c.seat, c.guest); err != nil {
+		switch {
+		case errors.Is(err, booking.ErrSeatTaken):
+			return s.sendText(ctx, c.chat.ID, c.peerID, s.seatTakenLine(ctx, ev, c.seat), "")
+		case errors.Is(err, booking.ErrAlreadyBooked), errors.Is(err, booking.ErrSeatOutOfRange):
+			// Гонка: записали между проверкой и вставкой, или вместимость
+			// изменили. Говорить нечего — человек увидит состав в анонсе.
+			return nil
+		default:
+			return err
+		}
+	}
+	return nil
+}
+
+// alreadySeatedLine tells the person where they already sit: их номер виден в
+// анонсе, поэтому второй записи на другое место быть не может.
+func alreadySeatedLine(b booking.BookingWithEvent) string {
+	switch {
+	case b.Status == booking.StatusWaitlist:
+		return "Вы уже в резерве. Чтобы взять место — сначала «/отмена»."
+	case b.SeatNo != nil:
+		return fmt.Sprintf("Вы уже записаны: место %d. Чтобы пересесть — «/отмена», потом номер места.", *b.SeatNo)
+	default:
+		return "Вы уже записаны. Чтобы взять место — сначала «/отмена»."
+	}
+}
+
+// seatTakenLine names who holds the seat and what is free: номер места в анонсе —
+// это человек, поэтому молча посадить кого-то на другое место нельзя.
+func (s *Service) seatTakenLine(ctx context.Context, ev event.Event, seat int) string {
+	line := fmt.Sprintf("Место %d занято", seat)
+
+	confirmed, _, err := s.roster(ctx, ev)
+	if err != nil {
+		s.log.Printf("vk: roster of game %d: %v", ev.ID, err)
+		return line + "."
+	}
+
+	taken := make(map[int]bool, ev.Capacity)
+	for _, b := range confirmed {
+		if b.SeatNo == nil {
+			continue
+		}
+		taken[*b.SeatNo] = true
+		if *b.SeatNo == seat {
+			line += fmt.Sprintf(" (%s)", b.PlayerName)
+		}
+	}
+
+	free := make([]string, 0, ev.Capacity)
+	for n := 1; n <= ev.Capacity; n++ {
+		if !taken[n] {
+			free = append(free, strconv.Itoa(n))
+		}
+	}
+
+	line += "."
+	if len(free) == 0 {
+		return line + " Свободных мест нет — «Иду» поставит вас в резерв."
+	}
+	return line + " Свободные: " + strings.Join(free, ", ") + "."
 }
 
 // findActiveBooking returns the caller's active booking for the event in the
@@ -1932,7 +2055,8 @@ func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, display
 			"/настройки — расписание: /настройки вс 10:00 (администратор)\n"+
 			"/помощь — эта справка\n\n"+
 			"Закрепить анонс игры в беседе VK даёт только её владельцу: закрепите сообщение-анонс вручную, и состав будет обновляться в нём же.\n\n"+
-			"Бот отвечает только на команды и кнопки, поэтому не мешает вашей переписке. "+
+			"Бот отвечает только на команды, кнопки и номер места, поэтому не мешает вашей переписке. "+
+			"Записаться можно и по-старому: напишите номер места («3»), а гостя — «11 Сергей Иванов». "+
 			"Кнопки «Иду» и «Не иду» появляются под полем ввода, пока открыта запись на игру.",
 		displayName, chatTitle)
 	if s.appID != 0 {
@@ -2000,12 +2124,17 @@ func appHash(peerID int64) string {
 // are commands — in a live chat people talk to each other, and everything
 // without a slash is conversation the bot must not answer.
 //
-// Two deliberate exceptions, both narrow:
+// Three deliberate exceptions, all narrow:
 //   - a chat that is not connected yet has no keyboard at all, so there
 //     "подключить" (or /connect) is accepted without a slash: it is a
 //     one-time action;
 //   - the schedule screen shows the exact format it expects, and /slot
-//     carries the weekday and the time: "/slot вс 10:00".
+//     carries the weekday and the time: "/slot вс 10:00";
+//   - people sign up the old way, writing the seat number: «3» takes seat 3,
+//     «11 Сергей Иванов» invites a guest to seat 11. parseSeatMessage accepts
+//     such a message only when it is nothing but that, and handleSeat acts on it
+//     only when there is someone to sign up to: a bare number in a chat that has
+//     no open game stays conversation.
 func (s *Service) parseCommand(text, payload string, connected bool) parsedCommand {
 	if p := ParseButtonPayload(payload); p.Command != "" {
 		return parsedCommand{cmd: p.Command, eventID: p.EventID, weekday: p.Weekday}
@@ -2022,6 +2151,11 @@ func (s *Service) parseCommand(text, payload string, connected bool) parsedComma
 
 	name, args, ok := slashCommand(t)
 	if !ok {
+		// Старинный способ: место цифрой. Разбираем исходный текст, а не
+		// приведённый к нижнему регистру: имя гостя нужно сохранить как написали.
+		if seat, guest, ok := parseSeatMessage(text); ok {
+			return parsedCommand{cmd: cmdSeat, seat: seat, guest: guest}
+		}
 		return parsedCommand{}
 	}
 
@@ -2062,6 +2196,37 @@ func (s *Service) parseCommand(text, payload string, connected bool) parsedComma
 		return parsedCommand{cmd: cmdStart}
 	}
 	return parsedCommand{}
+}
+
+// The old way of signing up in the chat: a bare seat number («3»), or a number
+// with a name («11 Сергей Иванов») to invite someone who is not in the chat. The
+// name filter is what keeps ordinary talk out: every word starts with a capital,
+// so «12 человек пришли» stays conversation.
+var (
+	seatOnlyRE  = regexp.MustCompile(`^(\d{1,2})$`)
+	seatGuestRE = regexp.MustCompile(`^(\d{1,2})[ \t]+([A-ZА-ЯЁ][a-zа-яё]+(?:[ \t-]+[A-ZА-ЯЁ][a-zа-яё]+){0,2})$`)
+)
+
+// parseSeatMessage reads a message that is nothing but a seat request. Seat 0
+// does not exist, so «0» is not a request either.
+func parseSeatMessage(text string) (seat int, guest string, ok bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0, "", false
+	}
+
+	if m := seatOnlyRE.FindStringSubmatch(text); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return n, "", true
+		}
+		return 0, "", false
+	}
+	if m := seatGuestRE.FindStringSubmatch(text); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return n, strings.TrimSpace(m[2]), true
+		}
+	}
+	return 0, "", false
 }
 
 // slashCommand splits "/create 27.09 19:00" into "create" and "27.09 19:00".

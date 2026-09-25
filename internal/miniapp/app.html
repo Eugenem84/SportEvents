@@ -364,6 +364,7 @@ input:focus { border-color: var(--accent); outline: none; }
     row.className = 'actions';
     row.appendChild(btn);
     box.appendChild(row);
+    box.appendChild(inviteForm(g));
 
     if (admin) {
       box.appendChild(adminGameControls(g));
@@ -485,11 +486,13 @@ input:focus { border-color: var(--accent); outline: none; }
     });
   }
 
-  // resultMessage собирает понятный ответ: что сделали, когда игра и кто вошёл
-  // в состав из резерва.
+  // resultMessage собирает понятный ответ: что сделали, когда игра, какое место
+  // досталось и кто вошёл в состав из резерва.
   function resultMessage(out, okText) {
     var parts = [okText || 'Готово'];
     if (out && out.when) { parts.push(out.when); }
+    if (out && out.seat_no && out.status !== 'waitlist') { parts.push('место ' + out.seat_no); }
+    if (out && out.place && out.status === 'waitlist') { parts.push('резерв ' + out.place + '-й'); }
     if (out && out.promoted) { parts.push('в состав вошёл ' + out.promoted); }
     return parts.join(' · ');
   }
@@ -549,6 +552,63 @@ input:focus { border-color: var(--accent); outline: none; }
     };
     Object.keys(extra || {}).forEach(function (k) { body[k] = extra[k]; });
     post(path, body, btn, okText);
+  }
+
+  // inviteForm — «пригласить человека»: имя и, если нужно, номер места. В беседе
+  // это пишут как «11 Сергей Иванов», здесь — формой. Приглашать может любой
+  // участник, а не только администратор.
+  function inviteForm(g) {
+    var box = document.createElement('div');
+    var holder = document.createElement('div');
+    holder.className = 'edit-holder';
+
+    var toggle = button('Пригласить человека', 'ghost', function () {
+      if (holder.firstChild) {
+        holder.innerHTML = '';
+        toggle.textContent = 'Пригласить человека';
+        return;
+      }
+      holder.appendChild(fields());
+      toggle.textContent = 'Свернуть';
+    });
+
+    function fields() {
+      var inner = document.createElement('div');
+      var name = input('text', '', 'имя и фамилия, например Сергей Иванов');
+      var seat = input('number', '', 'место, если знаете');
+
+      var grid = document.createElement('div');
+      grid.className = 'grid';
+      grid.appendChild(field('гость', name));
+      grid.appendChild(field('место', seat));
+      inner.appendChild(grid);
+
+      var add = button('Записать гостя', '', function () {
+        var guest = name.value.trim();
+        if (!guest) {
+          toast('Напишите имя гостя');
+          name.focus();
+          return;
+        }
+        post('guest', {
+          event_id: g.id,
+          name: guest,
+          seat_no: Number(seat.value) || 0
+        }, add, 'Гость записан');
+      });
+      var row = document.createElement('div');
+      row.className = 'actions';
+      row.appendChild(add);
+      inner.appendChild(row);
+      return inner;
+    }
+
+    var row = document.createElement('div');
+    row.className = 'actions';
+    row.appendChild(toggle);
+    box.appendChild(row);
+    box.appendChild(holder);
+    return box;
   }
 
   // createCard — форма «Создать игру»: дата, время, место, название и число

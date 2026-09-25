@@ -243,6 +243,16 @@ func (f *fakeBookingStore) Create(_ context.Context, in booking.CreateInput) (bo
 	if f.createErr != nil {
 		return booking.Booking{}, f.createErr
 	}
+
+	// Запрошенное место занимается как есть, а занятое не отдаётся.
+	if in.SeatNo != 0 {
+		for _, b := range f.byEvent[in.EventID] {
+			if b.Status == booking.StatusConfirmed && b.SeatNo != nil && *b.SeatNo == in.SeatNo {
+				return booking.Booking{}, booking.ErrSeatTaken
+			}
+		}
+	}
+
 	f.created = append(f.created, in)
 
 	status := f.createStatus
@@ -258,6 +268,9 @@ func (f *fakeBookingStore) Create(_ context.Context, in booking.CreateInput) (bo
 	}
 	if status == booking.StatusConfirmed {
 		seat := 1 + len(f.confirmed(in.EventID))
+		if in.SeatNo != 0 {
+			seat = in.SeatNo
+		}
 		b.SeatNo = &seat
 	}
 
@@ -1710,7 +1723,7 @@ func TestBookInChatPostsSeatLineAndRewritesAnnouncement(t *testing.T) {
 	h.anns.has = true
 
 	user := chat.User{ID: 42, DisplayName: "Евгений Мёдов"}
-	b, err := h.svc.BookInChat(context.Background(), 2000000047, 1, 7, user)
+	b, err := h.svc.BookInChat(context.Background(), 2000000047, 1, 7, user, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1740,7 +1753,7 @@ func TestBookInChatIsIdempotent(t *testing.T) {
 		Booking: booking.Booking{ID: 5, EventID: 7, UserID: &uid, Status: booking.StatusConfirmed},
 	}}
 
-	b, err := h.svc.BookInChat(context.Background(), 2000000047, 1, 7, chat.User{ID: uid, DisplayName: "Евгений Мёдов"})
+	b, err := h.svc.BookInChat(context.Background(), 2000000047, 1, 7, chat.User{ID: uid, DisplayName: "Евгений Мёдов"}, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2013,6 +2026,182 @@ func TestAdminActionsAreRefusedToNonAdmins(t *testing.T) {
 	}
 	if len(h.books.cancelled) != 0 || len(h.books.cancelledAll) != 0 || len(h.msg.sent) != 0 {
 		t.Fatalf("bookings or messages: %+v %+v %+v", h.books.cancelled, h.books.cancelledAll, h.msg.sent)
+	}
+}
+
+// --- старинная запись по номеру места ---
+
+func TestParseSeatMessage(t *testing.T) {
+	cases := []struct {
+		text  string
+		seat  int
+		guest string
+		ok    bool
+	}{
+		{"3", 3, "", true},
+		{"11 Сергей Иванов", 11, "Сергей Иванов", true},
+		{"7 Иван", 7, "Иван", true},
+		{"5 Иванов-Петров", 5, "Иванов-Петров", true},
+		{"  3  ", 3, "", true},
+		// Не заявка: болтовня, счёт, ноль, число внутри фразы.
+		{"12 человек пришли", 0, "", false},
+		{"3:2", 0, "", false},
+		{"0", 0, "", false},
+		{"3 место", 0, "", false},
+		{"поставили 3", 0, "", false},
+		{"", 0, "", false},
+		{"10.5", 0, "", false},
+	}
+	for _, tc := range cases {
+		seat, guest, ok := parseSeatMessage(tc.text)
+		if ok != tc.ok || seat != tc.seat || guest != tc.guest {
+			t.Errorf("parseSeatMessage(%q) = %d, %q, %v; want %d, %q, %v",
+				tc.text, seat, guest, ok, tc.seat, tc.guest, tc.ok)
+		}
+	}
+}
+
+// «3» в беседе — заявка на третье место: бот записывает человека и уходит в чат
+// обычной строкой «3 - Иван Петров».
+func TestCallbackSeatNumberBooksTheSeat(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "3", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 1 {
+		t.Fatalf("created: %+v", h.books.created)
+	}
+	in := h.books.created[0]
+	if in.SeatNo != 3 || in.EventID != 7 {
+		t.Fatalf("booking: %+v", in)
+	}
+	if in.PlayerName != "Иван Петров" {
+		t.Errorf("name: %q", in.PlayerName)
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "3 - Иван Петров" {
+		t.Fatalf("line: %+v", h.msg.sent)
+	}
+	if len(h.msg.edits) != 1 {
+		t.Fatalf("the announcement must be rewritten: %+v", h.msg.edits)
+	}
+}
+
+// Занятое место: бот говорит, кто его держит, и какие места свободны.
+func TestCallbackSeatNumberTakenExplains(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	seat := 3
+	h.books.byEvent = map[int64][]booking.Booking{
+		7: {{ID: 9, EventID: 7, PlayerName: "Пётр", SeatNo: &seat, Status: booking.StatusConfirmed}},
+	}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "3", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 0 {
+		t.Fatalf("nothing must be booked: %+v", h.books.created)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want one answer, got %+v", h.msg.sent)
+	}
+	answer := h.msg.sent[0].Text
+	if !strings.Contains(answer, "Место 3 занято (Пётр)") {
+		t.Errorf("answer: %q", answer)
+	}
+	if !strings.Contains(answer, "Свободные: 1, 2, 4") {
+		t.Errorf("free seats must be named: %q", answer)
+	}
+}
+
+// Цифра без открытой игры и номер больше вместимости — не заявка: бот молчит и
+// ничего не записывает.
+func TestCallbackSeatNumberStaysSilentWhenItIsNotARequest(t *testing.T) {
+	t.Run("no game", func(t *testing.T) {
+		h := newHarness(t, true)
+
+		if code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "3", "")); code != http.StatusOK {
+			t.Fatalf("status: %d", code)
+		}
+		if len(h.books.created) != 0 || len(h.msg.sent) != 0 {
+			t.Fatalf("silent expected: %+v / %+v", h.books.created, h.msg.sent)
+		}
+	})
+
+	t.Run("seat out of range", func(t *testing.T) {
+		h := newHarness(t, true)
+		h.events.games = []event.EventSummary{{
+			Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+		}}
+
+		if code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "15", "")); code != http.StatusOK {
+			t.Fatalf("status: %d", code)
+		}
+		if len(h.books.created) != 0 || len(h.msg.sent) != 0 {
+			t.Fatalf("silent expected: %+v / %+v", h.books.created, h.msg.sent)
+		}
+	})
+}
+
+// «11 Сергей Иванов» — приглашение гостя, которого в беседе нет: запись без
+// профиля, а пригласивший остаётся тем, кому адресованы уведомления.
+func TestCallbackSeatNumberInvitesGuest(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "11 Сергей Иванов", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 1 {
+		t.Fatalf("created: %+v", h.books.created)
+	}
+	in := h.books.created[0]
+	if in.PlayerName != "Сергей Иванов" || in.SeatNo != 11 {
+		t.Fatalf("guest booking: %+v", in)
+	}
+	if in.UserID != nil {
+		t.Fatalf("a guest has no profile: %+v", in)
+	}
+	if in.BookedByUserID != h.users.user.ID {
+		t.Fatalf("the inviter must own the booking: %+v", in)
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "11 - Сергей Иванов" {
+		t.Fatalf("line: %+v", h.msg.sent)
+	}
+}
+
+// Уже записан, а просит другое место: бот говорит, где место человека.
+func TestCallbackSeatNumberWhenAlreadyBooked(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	seat := 5
+	h.books.active = []booking.BookingWithEvent{{
+		Booking: booking.Booking{ID: 3, EventID: 7, PlayerName: "Иван Петров", SeatNo: &seat, Status: booking.StatusConfirmed},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "3", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 0 {
+		t.Fatalf("a second booking must not appear: %+v", h.books.created)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "Вы уже записаны: место 5") {
+		t.Fatalf("answer: %+v", h.msg.sent)
 	}
 }
 

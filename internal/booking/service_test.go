@@ -168,6 +168,69 @@ func insertChat(t *testing.T, ctx context.Context, pool *pgxpool.Pool, title str
 	return id
 }
 
+// Запрошенное место занимается как есть: так в беседе пишут «3» или
+// «11 Сергей Иванов», и так выбирают место в приложении. Занятое место не
+// отдаём — об этом скажет ответ; освободившееся снова можно взять.
+func TestCreateWithRequestedSeat(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "Волейбол")
+	eventID := insertEvent(t, ctx, pool, chatID, 12)
+
+	evgeny := insertUser(t, ctx, pool, "Евгений")
+	first, err := svc.Create(ctx, booking.CreateInput{
+		EventID: eventID, PlayerName: "Евгений", SeatNo: 3, UserID: &evgeny, BookedByUserID: evgeny,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SeatNo == nil || *first.SeatNo != 3 {
+		t.Fatalf("seat: %v, want 3", first.SeatNo)
+	}
+
+	// Гость на конкретное место: имени достаточно, профиля у него нет.
+	guest, err := svc.Create(ctx, booking.CreateInput{
+		EventID: eventID, PlayerName: "Сергей Иванов", SeatNo: 11, BookedByUserID: evgeny,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if guest.SeatNo == nil || *guest.SeatNo != 11 {
+		t.Fatalf("guest seat: %v", guest.SeatNo)
+	}
+	if guest.UserID != nil {
+		t.Fatalf("a guest has no user: %+v", guest)
+	}
+
+	// Занятое место не отдаём.
+	petr := insertUser(t, ctx, pool, "Пётр")
+	if _, err := svc.Create(ctx, booking.CreateInput{
+		EventID: eventID, PlayerName: "Пётр", SeatNo: 3, UserID: &petr, BookedByUserID: petr,
+	}); !errors.Is(err, booking.ErrSeatTaken) {
+		t.Fatalf("want ErrSeatTaken, got %v", err)
+	}
+
+	// Номер вне вместимости — не место.
+	if _, err := svc.Create(ctx, booking.CreateInput{
+		EventID: eventID, PlayerName: "Пётр", SeatNo: 13, UserID: &petr, BookedByUserID: petr,
+	}); !errors.Is(err, booking.ErrSeatOutOfRange) {
+		t.Fatalf("want ErrSeatOutOfRange, got %v", err)
+	}
+
+	// Освободившееся место снова свободно: «3» снова можно взять.
+	if _, err := svc.Cancel(ctx, eventID, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	again, err := svc.Create(ctx, booking.CreateInput{
+		EventID: eventID, PlayerName: "Пётр", SeatNo: 3, UserID: &petr, BookedByUserID: petr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.SeatNo == nil || *again.SeatNo != 3 {
+		t.Fatalf("the freed seat must be taken again: %v", again.SeatNo)
+	}
+}
+
 func insertUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) int64 {
 	t.Helper()
 	var id int64

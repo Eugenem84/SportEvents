@@ -120,6 +120,8 @@ type fakeSyncer struct {
 	chatID    int64
 	user      chat.User
 	booked    []int64
+	bookSeat  int
+	bookGuest string
 	bookErr   error
 	bookRes   booking.Booking
 	cancel    booking.CancelResult
@@ -141,9 +143,10 @@ type fakeSyncer struct {
 	removeErr     error
 }
 
-func (f *fakeSyncer) BookInChat(_ context.Context, peerID, chatID, eventID int64, user chat.User) (booking.Booking, error) {
-	f.peerID, f.chatID, f.user = peerID, chatID, user
+func (f *fakeSyncer) BookInChat(_ context.Context, peerID, chatID, eventID int64, by chat.User, seat int, guest string) (booking.Booking, error) {
+	f.peerID, f.chatID, f.user = peerID, chatID, by
 	f.booked = append(f.booked, eventID)
+	f.bookSeat, f.bookGuest = seat, guest
 	return f.bookRes, f.bookErr
 }
 
@@ -348,6 +351,8 @@ func TestAppPageIsServed(t *testing.T) {
 		"Отменить игру",                // и отмена игры
 		"game/edit",                    // правка игры
 		"remove",                       // снятие участника
+		"Пригласить человека",          // приглашение гостя (любой участник)
+		"guest",                        // его ручка
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("page does not contain %q", want)
@@ -1065,6 +1070,106 @@ func TestAdminActionWithKeyIsNotFlagged(t *testing.T) {
 	}
 	if strings.Contains(h.logs.String(), "without sign check") {
 		t.Fatalf("the sign was verified, nothing to flag: %q", h.logs.String())
+	}
+}
+
+// --- приглашение человека ---
+
+// Гостя может записать любой участник, а не только администратор: так в беседе
+// и делают, просто написав «11 Сергей Иванов».
+func TestParticipantInvitesGuestFromTheApp(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.chats.admin = false
+	h.sync.bookRes = booking.Booking{
+		ID: 300, EventID: 7, PlayerName: "Сергей Иванов",
+		Status: booking.StatusConfirmed, SeatNo: intPtr(11),
+	}
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/guest?vk_user_id=42&vk_chat_id=47",
+		`{"event_id":7,"name":"Сергей Иванов","seat_no":11}`)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if len(h.sync.booked) != 1 || h.sync.booked[0] != 7 {
+		t.Fatalf("booked games: %+v", h.sync.booked)
+	}
+	if h.sync.bookGuest != "Сергей Иванов" || h.sync.bookSeat != 11 {
+		t.Fatalf("guest/seat: %q/%d", h.sync.bookGuest, h.sync.bookSeat)
+	}
+	if h.sync.user.ID != 7 {
+		t.Fatalf("the inviter must be the caller: %+v", h.sync.user)
+	}
+	for _, want := range []string{`"name":"Сергей Иванов"`, `"seat_no":11`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("answer %s does not contain %s", body, want)
+		}
+	}
+}
+
+// Без номера места гостя записывают на любое свободное: seat 0 значит «какое
+// найдётся».
+func TestGuestInviteWithoutSeat(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.sync.bookRes = booking.Booking{
+		ID: 301, EventID: 7, PlayerName: "Сергей", Status: booking.StatusConfirmed, SeatNo: intPtr(4),
+	}
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/guest?vk_user_id=42&vk_chat_id=47",
+		`{"event_id":7,"name":"Сергей"}`)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if h.sync.bookSeat != 0 {
+		t.Fatalf("seat: %d, want 0 (любое свободное)", h.sync.bookSeat)
+	}
+	if !strings.Contains(body, `"seat_no":4`) {
+		t.Errorf("answer: %s", body)
+	}
+}
+
+func TestGuestInviteRefusesTakenSeat(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.sync.bookErr = booking.ErrSeatTaken
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/guest?vk_user_id=42&vk_chat_id=47",
+		`{"event_id":7,"name":"Сергей","seat_no":1}`)
+	if code != http.StatusConflict {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if !strings.Contains(body, "занято") {
+		t.Errorf("answer: %s", body)
+	}
+}
+
+func TestGuestInviteNeedsAName(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+
+	code, _ := do(t, h.app, http.MethodPost, "/app/api/guest?vk_user_id=42&vk_chat_id=47",
+		`{"event_id":7,"name":"   "}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status: %d, want 400", code)
+	}
+	if len(h.sync.booked) != 0 {
+		t.Fatalf("nothing must be booked: %+v", h.sync.booked)
+	}
+}
+
+// Без бота гостя записать негде: строку в чат и анонс делает его адаптер.
+func TestGuestInviteWithoutBotExplains(t *testing.T) {
+	h := newHarnessWithoutBot(t)
+	seedGame(h)
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/guest?vk_user_id=42&vk_chat_id=47",
+		`{"event_id":7,"name":"Сергей"}`)
+	if code != http.StatusConflict {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if !strings.Contains(body, "бот не настроен") {
+		t.Errorf("answer: %s", body)
 	}
 }
 

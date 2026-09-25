@@ -95,11 +95,29 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Booking, error) {
 	if confirmed >= capacity {
 		status = StatusWaitlist
 	}
+	if in.SeatNo > capacity {
+		return Booking{}, ErrSeatOutOfRange
+	}
 
-	// Подтверждённая запись получает наименьший свободный номер места. Строку
-	// события мы уже держим под FOR UPDATE, поэтому номер не отберут параллельно.
+	// Подтверждённая запись получает либо запрошенное место, либо наименьший
+	// свободный номер. Строку события мы уже держим под FOR UPDATE, поэтому
+	// номер не отберут параллельно; уникальный индекс по (event_id, seat_no)
+	// ловит гонку, если она всё же случится.
 	var seat *int
-	if status == StatusConfirmed {
+	switch {
+	case status != StatusConfirmed:
+		// Резерв: место не выдаём.
+	case in.SeatNo != 0:
+		taken, err := seatTaken(ctx, tx, in.EventID, in.SeatNo)
+		if err != nil {
+			return Booking{}, err
+		}
+		if taken {
+			return Booking{}, ErrSeatTaken
+		}
+		requested := in.SeatNo
+		seat = &requested
+	default:
 		seat, err = freeSeat(ctx, tx, in.EventID, capacity)
 		if err != nil {
 			return Booking{}, err
@@ -127,6 +145,11 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Booking, error) {
 		in.EventID, in.PlayerName, phone, in.UserID, in.BookedByUserID, seat, string(status),
 	).Scan(&b.ID, &b.EventID, &b.PlayerName, &b.Phone, &b.UserID, &b.BookedByUserID, &b.SeatNo, &statusStr, &b.CreatedAt)
 	if isUniqueViolation(err) {
+		// Уникальных индексов два: активная запись пользователя и место. Второй
+		// срабатывает, когда место заняли между проверкой и вставкой.
+		if uniqueConstraint(err) == "bookings_event_id_seat_no_confirmed_uidx" {
+			return Booking{}, ErrSeatTaken
+		}
 		return Booking{}, ErrAlreadyBooked
 	}
 	if isForeignKey(err) {
@@ -444,7 +467,37 @@ func validateCreate(in CreateInput) error {
 	if in.BookedByUserID == 0 {
 		return ErrInvalid
 	}
+	if in.SeatNo < 0 {
+		return ErrInvalid
+	}
 	return nil
+}
+
+// seatTaken reports whether a confirmed booking already holds the seat. Резерв
+// места не занимает: у записей в очереди seat_no пуст.
+func seatTaken(ctx context.Context, tx pgx.Tx, eventID int64, seat int) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM bookings
+			WHERE event_id = $1 AND seat_no = $2 AND status = 'confirmed'
+		)`,
+		eventID, seat,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check seat: %w", err)
+	}
+	return exists, nil
+}
+
+// uniqueConstraint names the index a unique violation came from, so a taken seat
+// is told apart from a repeated booking.
+func uniqueConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return ""
+	}
+	return pgErr.ConstraintName
 }
 
 func isForeignKey(err error) bool {
