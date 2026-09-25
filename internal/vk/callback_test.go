@@ -476,8 +476,9 @@ func TestCallbackMessageNewStartWelcomes(t *testing.T) {
 	if !strings.Contains(h.msg.sent[0].Text, "Иван Петров") {
 		t.Fatalf("welcome must mention name: %q", h.msg.sent[0].Text)
 	}
-	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
-		t.Fatalf("welcome must carry keyboard: %q", h.msg.sent[0].Keyboard)
+	// Игр нет — кнопки записи не показываем: клавиатура пустая.
+	if strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
+		t.Fatalf("no game is open, so the reply must hide the sign-up buttons: %q", h.msg.sent[0].Keyboard)
 	}
 }
 
@@ -653,8 +654,13 @@ func TestCallbackConnectCreatesChatAndAdmin(t *testing.T) {
 	if !strings.Contains(h.msg.sent[0].Text, "Волейбол Иваново") {
 		t.Fatalf("reply must mention the chat title: %q", h.msg.sent[0].Text)
 	}
-	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
-		t.Fatalf("connected chat must get the keyboard: %q", h.msg.sent[0].Keyboard)
+	// Свежая беседа: игр ещё нет, поэтому кнопок нет, а текст объясняет, когда
+	// они появятся.
+	if strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
+		t.Fatalf("a fresh chat has no game, so no buttons: %q", h.msg.sent[0].Keyboard)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Иду") {
+		t.Fatalf("connect must tell when the buttons appear: %q", h.msg.sent[0].Text)
 	}
 }
 
@@ -879,8 +885,19 @@ func TestCallbackCreateGameByAdminPostsAnnouncement(t *testing.T) {
 	if in.Capacity != 8 || in.Title != defaultTitle {
 		t.Fatalf("input: %+v", in)
 	}
-	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "Состав (0/8)") {
-		t.Fatalf("announcement: %+v", h.msg.sent)
+	// Два сообщения: сам анонс со составом и строчка «Запись открыта», которая
+	// приносит кнопки «Иду» / «Не иду» под поле ввода.
+	if len(h.msg.sent) != 2 {
+		t.Fatalf("want the announcement and the notice, got %+v", h.msg.sent)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Состав (0/8)") {
+		t.Fatalf("announcement: %+v", h.msg.sent[0])
+	}
+	if !strings.Contains(h.msg.sent[1].Text, "Запись открыта") {
+		t.Fatalf("sign-up notice: %+v", h.msg.sent[1])
+	}
+	if !strings.Contains(h.msg.sent[1].Keyboard, "Иду") {
+		t.Fatalf("the notice must bring the buttons: %q", h.msg.sent[1].Keyboard)
 	}
 	if len(h.anns.saved) != 1 || h.anns.saved[0].MessageID == 0 {
 		t.Fatalf("announcement reference: %+v", h.anns.saved)
@@ -1234,6 +1251,29 @@ func TestCallbackCreateGameSkipsExisting(t *testing.T) {
 	}
 }
 
+// Кнопка старого анонса не записывает на прошедшую игру: запись на неё закрыта.
+func TestCallbackAttendPastGameIsRefused(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(-2 * time.Hour), Capacity: 12},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 905, AnnouncementCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 0 {
+		t.Fatalf("a past game must not take bookings: %+v", h.books.created)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("the chat must stay silent: %+v", h.msg.sent)
+	}
+	if !strings.Contains(snackbar(t, h), "Запись закрыта") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
+	}
+}
+
 // --- Phase 6: id сообщения анонса ---
 
 // Нажатие кнопки самого анонса доносит id этого сообщения: в беседе
@@ -1367,7 +1407,7 @@ func TestCallbackCreateGameLearnsAnnouncementIDFromChat(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
-	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "Состав") {
+	if len(h.msg.sent) != 2 || !strings.Contains(h.msg.sent[0].Text, "Состав") {
 		t.Fatalf("announcement: %+v", h.msg.sent)
 	}
 	if h.anns.ref.MessageID != 615 {
@@ -1388,7 +1428,7 @@ func TestCallbackCreateGameUnknownAnnouncementID(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
-	if len(h.msg.sent) != 1 {
+	if len(h.msg.sent) != 2 {
 		t.Fatalf("announcement must be posted: %+v", h.msg.sent)
 	}
 	if h.anns.ref.MessageID != 0 {
@@ -1693,12 +1733,15 @@ func TestPersistentKeyboardShape(t *testing.T) {
 	}
 }
 
-// Любой ответ бота без собственной клавиатуры несёт постоянную: иначе кнопки
-// пропадали бы из-под поля ввода после первого же сообщения.
-func TestRepliesCarryPersistentKeyboard(t *testing.T) {
+// Пока открыта игра, любой ответ бота несёт кнопки «Иду» / «Не иду»: иначе
+// они пропадали бы из-под поля ввода после первого же сообщения.
+func TestRepliesCarrySignUpButtonsWhileGameIsOpen(t *testing.T) {
 	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+	}}
 
-	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/my", ""))
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/мои", ""))
 	if code != http.StatusOK {
 		t.Fatalf("status: %d", code)
 	}
@@ -1706,6 +1749,23 @@ func TestRepliesCarryPersistentKeyboard(t *testing.T) {
 		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
 	}
 	if !strings.Contains(h.msg.sent[0].Keyboard, "Иду") {
-		t.Fatalf("reply must carry the persistent keyboard: %q", h.msg.sent[0].Keyboard)
+		t.Fatalf("reply must carry the sign-up buttons: %q", h.msg.sent[0].Keyboard)
+	}
+}
+
+// А когда открытых игр нет, кнопки убираются: пустая клавиатура скрывает их из
+// поля ввода, чтобы запись не висела там, где записываться некуда.
+func TestRepliesHideSignUpButtonsWhenNoGameIsOpen(t *testing.T) {
+	h := newHarness(t, true)
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/мои", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	if got := h.msg.sent[0].Keyboard; got != `{"buttons":[]}` {
+		t.Fatalf("want an empty keyboard, got %q", got)
 	}
 }

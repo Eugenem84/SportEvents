@@ -325,9 +325,9 @@ type parsedCommand struct {
 func (s *Service) handleCommand(ctx context.Context, c *commandCtx) error {
 	switch c.cmd {
 	case cmdStart:
-		return s.sendWelcome(ctx, c.peerID, c.user.DisplayName, c.chat.Title)
+		return s.sendWelcome(ctx, c.chat.ID, c.peerID, c.user.DisplayName, c.chat.Title)
 	case cmdConnect:
-		return s.sendText(ctx, c.peerID, fmt.Sprintf("Беседа «%s» уже подключена.", c.chat.Title), "")
+		return s.sendText(ctx, c.chat.ID, c.peerID, fmt.Sprintf("Беседа «%s» уже подключена.", c.chat.Title), "")
 	case cmdGames:
 		return s.handleGames(ctx, c)
 	case cmdCreateGame:
@@ -444,7 +444,7 @@ func (s *Service) rememberAnnouncementID(ctx context.Context, peerID int64, p Pa
 // time; afterwards they are read from chat_admins.
 func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
 	if !isConversation(msg.PeerID) {
-		return s.sendText(ctx, msg.PeerID,
+		return s.sendText(ctx, 0, msg.PeerID,
 			"Подключить можно только беседу: добавьте бота в беседу и напишите «подключить».", "")
 	}
 
@@ -459,12 +459,12 @@ func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
 		// chat) is an external failure the user can act on: answer instead
 		// of staying silent, and keep the real error in the log.
 		s.log.Printf("vk: cannot check admins of peer %d: %v", msg.PeerID, err)
-		return s.sendText(ctx, msg.PeerID,
+		return s.sendText(ctx, 0, msg.PeerID,
 			"Не удалось проверить права в беседе. Убедитесь, что бот добавлен в беседу и назначен администратором, и попробуйте ещё раз.", "")
 	}
 	if !isAdmin {
 		s.log.Printf("vk: connect denied for peer %d: user %d is not an admin", msg.PeerID, msg.FromID)
-		return s.sendText(ctx, msg.PeerID, "Подключить беседу может только её администратор.", "")
+		return s.sendText(ctx, 0, msg.PeerID, "Подключить беседу может только её администратор.", "")
 	}
 
 	title, err := s.convs.GetConversationTitle(ctx, msg.PeerID)
@@ -483,16 +483,19 @@ func (s *Service) handleConnect(ctx context.Context, msg messageNew) error {
 		return fmt.Errorf("connect chat: %w", err)
 	}
 	if !created {
-		return s.sendText(ctx, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
+		return s.sendText(ctx, ch.ID, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
 	}
 
-	kb, err := persistentKeyboard()
+	kb, err := s.chatKeyboard(ctx, ch.ID)
 	if err != nil {
 		return err
 	}
-	text := fmt.Sprintf("Беседа «%s» подключена.\n%s — администратор.\nКоманды: «Игры», «Мои записи», «Отмена записи».",
+	text := fmt.Sprintf("Беседа «%s» подключена.\n%s — администратор.\n\n"+
+		"Создайте игру: «/старт» (дата берётся из расписания, «/настройки» его задают). "+
+		"Пока идёт запись, под полем ввода появляются кнопки «Иду» и «Не иду», "+
+		"а состав живёт в анонсе игры.",
 		ch.Title, user.DisplayName)
-	return s.sendText(ctx, msg.PeerID, text, kb)
+	return s.sendText(ctx, ch.ID, msg.PeerID, text, kb)
 }
 
 // ensureUser resolves the VK user to an internal User, creating the
@@ -516,7 +519,7 @@ func (s *Service) handleGames(ctx context.Context, c *commandCtx) error {
 		return fmt.Errorf("list games: %w", err)
 	}
 	if len(games) == 0 {
-		return s.sendText(ctx, c.peerID,
+		return s.sendText(ctx, c.chat.ID, c.peerID,
 			"Ближайших игр нет. Администратор может создать игру: «создать игру 27.09 19:00 12».", "")
 	}
 
@@ -538,7 +541,7 @@ func (s *Service) handleGames(ctx context.Context, c *commandCtx) error {
 	if err != nil {
 		return err
 	}
-	return s.sendText(ctx, c.peerID, b.String(), kb)
+	return s.sendText(ctx, c.chat.ID, c.peerID, b.String(), kb)
 }
 
 // handleCreateGame creates a game and posts the announcement the whole chat
@@ -562,11 +565,8 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 	if existing, ok, err := s.findGameAt(ctx, c.chat.ID, startsAt); err != nil {
 		return err
 	} else if ok {
-		if err := s.announceGame(ctx, c, existing.Event); err != nil {
-			return err
-		}
-		return s.sendText(ctx, c.peerID, fmt.Sprintf(
-			"Игра на %s уже создана — обновил анонс с составом.", s.formatWhenShort(existing.StartsAt)), "")
+		return s.announceGame(ctx, c, existing.Event, fmt.Sprintf(
+			"Игра на %s уже создана — обновил анонс с составом.", s.formatWhenShort(existing.StartsAt)))
 	}
 
 	ev, err := s.events.Create(ctx, event.CreateInput{
@@ -579,14 +579,15 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 	if err != nil {
 		return fmt.Errorf("create event: %w", err)
 	}
-	return s.announceGame(ctx, c, ev)
+	return s.announceGame(ctx, c, ev, "")
 }
 
 // announceGame posts the announcement everyone signs up under and remembers
-// where it is. VK answers messages.send with 0 in a conversation, so the id
-// stays unknown until someone presses a button of the announcement itself;
-// until then the roster is not rewritten in place.
-func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Event) error {
+// where it is. note replaces the default "sign-ups are open" line. VK answers
+// messages.send with 0 in a conversation, so the id stays unknown until VK
+// names the last message or someone presses a button of the announcement
+// itself; until then the roster is not rewritten in place.
+func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Event, note string) error {
 	confirmed, waitlist, err := s.roster(ctx, ev.ID)
 	if err != nil {
 		return err
@@ -628,7 +629,17 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 			s.log.Printf("vk: cannot pin announcement of game %d: %v", ev.ID, err)
 		}
 	}
-	return nil
+
+	// Открытие записи — это и повод показать кнопки «Иду» / «Не иду» под полем
+	// ввода: клавиатуру беседы держит последнее сообщение бота.
+	if note == "" {
+		note = fmt.Sprintf("Запись открыта: %s.", s.formatWhenFull(ev.StartsAt))
+	}
+	signUp, err := persistentKeyboard()
+	if err != nil {
+		return err
+	}
+	return s.sendText(ctx, c.chat.ID, c.peerID, note, signUp)
 }
 
 // roster splits the bookings of an event into the lineup and the reserve.
@@ -796,7 +807,7 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 		return err
 	}
 	if !ok {
-		return s.notify(ctx, c, "Ближайших игр нет")
+		return s.notify(ctx, c, "Запись закрыта: открытых игр нет")
 	}
 
 	if existing, booked, err := s.findActiveBooking(ctx, c.user.ID, ev.ID); err != nil {
@@ -823,7 +834,7 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 		if err != nil {
 			return err
 		}
-		if err := s.sendText(ctx, c.peerID, fmt.Sprintf("резерв %d - %s", position, b.PlayerName), ""); err != nil {
+		if err := s.sendText(ctx, c.chat.ID, c.peerID, fmt.Sprintf("резерв %d - %s", position, b.PlayerName), ""); err != nil {
 			return err
 		}
 		s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
@@ -834,7 +845,7 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 	if b.SeatNo != nil {
 		seat = *b.SeatNo
 	}
-	if err := s.sendText(ctx, c.peerID, fmt.Sprintf("%d - %s", seat, b.PlayerName), ""); err != nil {
+	if err := s.sendText(ctx, c.chat.ID, c.peerID, fmt.Sprintf("%d - %s", seat, b.PlayerName), ""); err != nil {
 		return err
 	}
 	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
@@ -882,7 +893,7 @@ func (s *Service) cancelFor(ctx context.Context, c *commandCtx) error {
 		if c.vkEventID != "" {
 			return s.notify(ctx, c, "Вы не записаны")
 		}
-		return s.sendText(ctx, c.peerID, "Активной записи не нашёл. Посмотреть записи: «мои записи».", "")
+		return s.sendText(ctx, c.chat.ID, c.peerID, "Активной записи не нашёл. Посмотреть записи: «мои записи».", "")
 	}
 
 	res, err := s.bookings.Cancel(ctx, me.EventID, me.ID)
@@ -891,7 +902,7 @@ func (s *Service) cancelFor(ctx context.Context, c *commandCtx) error {
 			if c.vkEventID != "" {
 				return s.notify(ctx, c, "Запись уже отменена")
 			}
-			return s.sendText(ctx, c.peerID, "Запись уже отменена.", "")
+			return s.sendText(ctx, c.chat.ID, c.peerID, "Запись уже отменена.", "")
 		}
 		return fmt.Errorf("cancel booking: %w", err)
 	}
@@ -907,7 +918,7 @@ func (s *Service) cancelFor(ctx context.Context, c *commandCtx) error {
 		}
 		line += fmt.Sprintf("\n%d - %s из резерва", seat, res.Promoted.PlayerName)
 	}
-	if err := s.sendText(ctx, c.peerID, line, ""); err != nil {
+	if err := s.sendText(ctx, c.chat.ID, c.peerID, line, ""); err != nil {
 		return err
 	}
 	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, me.EventID)
@@ -985,7 +996,9 @@ func (s *Service) nearestBooking(ctx context.Context, c *commandCtx) (booking.Bo
 
 // targetGame is the game an unqualified press refers to: the payload's game, or
 // the nearest upcoming game of the chat — the persistent keyboard has no game
-// of its own, and a chat plays one game at a time in practice.
+// of its own, and a chat plays one game at a time in practice. A game that has
+// already started is not a target: кнопка старого анонса не должна записывать
+// на прошедшую игру.
 func (s *Service) targetGame(ctx context.Context, c *commandCtx) (event.Event, bool, error) {
 	if c.eventID != 0 {
 		ev, err := s.events.Get(ctx, c.chat.ID, c.eventID)
@@ -994,6 +1007,9 @@ func (s *Service) targetGame(ctx context.Context, c *commandCtx) (event.Event, b
 		}
 		if err != nil {
 			return event.Event{}, false, fmt.Errorf("get event: %w", err)
+		}
+		if !ev.StartsAt.After(s.now()) {
+			return event.Event{}, false, nil
 		}
 		return ev, true, nil
 	}
@@ -1031,7 +1047,7 @@ func (s *Service) handleMyBookings(ctx context.Context, c *commandCtx) error {
 		return fmt.Errorf("list user bookings: %w", err)
 	}
 	if len(mine) == 0 {
-		return s.sendText(ctx, c.peerID, "У вас нет активных записей. Ближайшие игры: «игры».", "")
+		return s.sendText(ctx, c.chat.ID, c.peerID, "У вас нет активных записей. Ближайшие игры: «игры».", "")
 	}
 
 	var b strings.Builder
@@ -1051,7 +1067,7 @@ func (s *Service) handleMyBookings(ctx context.Context, c *commandCtx) error {
 	if err != nil {
 		return err
 	}
-	return s.sendText(ctx, c.peerID, b.String(), kb)
+	return s.sendText(ctx, c.chat.ID, c.peerID, b.String(), kb)
 }
 
 // refreshAnnouncement rewrites the game announcement with the current roster.
@@ -1231,7 +1247,7 @@ func (s *Service) handleSlotAdd(ctx context.Context, c *commandCtx) error {
 		return err
 	}
 	if !c.hasSlot {
-		return s.sendText(ctx, c.peerID, "Пришлите день и время, например: «вс 10:00».", "")
+		return s.sendText(ctx, c.chat.ID, c.peerID, "Пришлите день и время, например: «вс 10:00».", "")
 	}
 
 	slot, err := s.schedule.Set(ctx, c.chat.ID, c.weekday, c.minutes)
@@ -1271,7 +1287,7 @@ func (s *Service) requireAdmin(ctx context.Context, c *commandCtx, refusal strin
 	if admin {
 		return true, nil
 	}
-	if err := s.sendText(ctx, c.peerID, refusal, ""); err != nil {
+	if err := s.sendText(ctx, c.chat.ID, c.peerID, refusal, ""); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -1295,7 +1311,7 @@ func (s *Service) refreshSettings(ctx context.Context, c *commandCtx, note strin
 		}
 		return nil
 	}
-	return s.sendText(ctx, c.peerID, text, kb)
+	return s.sendText(ctx, c.chat.ID, c.peerID, text, kb)
 }
 
 // renderSettings renders the schedule screen: what is set now, one button per
@@ -1330,12 +1346,13 @@ func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, str
 	return b.String(), kb, nil
 }
 
-// sendText replies in the chat. A caller without a keyboard of its own gets
-// the persistent keyboard: the one that stays under the input field, so the
-// buttons never scroll out of reach in a busy chat.
-func (s *Service) sendText(ctx context.Context, peerID int64, text, keyboard string) error {
+// sendText replies in the chat. A caller without a keyboard of its own gets the
+// chat keyboard: [Иду] [Не иду] while the chat has an upcoming game, and no
+// buttons at all when it has none (VK hides the chat keyboard on an empty one).
+// Живая беседа не должна держать кнопки записи, когда записываться некуда.
+func (s *Service) sendText(ctx context.Context, chatID, peerID int64, text, keyboard string) error {
 	if keyboard == "" {
-		kb, err := persistentKeyboard()
+		kb, err := s.chatKeyboard(ctx, chatID)
 		if err != nil {
 			return err
 		}
@@ -1347,8 +1364,26 @@ func (s *Service) sendText(ctx context.Context, peerID int64, text, keyboard str
 	return nil
 }
 
-func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, chatTitle string) error {
-	kb, err := persistentKeyboard()
+// chatKeyboard is what the chat input shows right now: the sign-up buttons while
+// a game is open, and an empty keyboard otherwise. chatID 0 means "unknown
+// chat" (e.g. a conversation that is not connected yet) — there is nothing to
+// sign up to, so the buttons stay hidden.
+func (s *Service) chatKeyboard(ctx context.Context, chatID int64) (string, error) {
+	if chatID != 0 {
+		games, err := s.events.ListUpcomingWithCounts(ctx, chatID, s.now().UTC(), 1)
+		if err != nil {
+			return "", fmt.Errorf("list games: %w", err)
+		}
+		if len(games) > 0 {
+			return persistentKeyboard()
+		}
+	}
+	kb := Keyboard{Buttons: [][]Button{}}
+	return kb.Marshal()
+}
+
+func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, displayName, chatTitle string) error {
+	kb, err := s.chatKeyboard(ctx, chatID)
 	if err != nil {
 		return err
 	}
@@ -1361,18 +1396,18 @@ func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, ch
 			"/старт — создать игру и анонс (администратор)\n"+
 			"/настройки — расписание: /настройки вс 10:00 (администратор)\n"+
 			"/помощь — эта справка\n\n"+
-			"Кнопки «Иду» и «Не иду» под полем ввода — для записи. Бот отвечает только "+
-			"на команды и кнопки, поэтому не мешает вашей переписке.",
+			"Бот отвечает только на команды и кнопки, поэтому не мешает вашей переписке. "+
+			"Кнопки «Иду» и «Не иду» появляются под полем ввода, пока открыта запись на игру.",
 		displayName, chatTitle)
-	return s.sendText(ctx, peerID, text, kb)
+	return s.sendText(ctx, chatID, peerID, text, kb)
 }
 
 // persistentKeyboard is the keyboard that stays under the chat input instead
 // of scrolling away with a message (VK: no "inline", no one_time). It carries
-// the two actions of the sign-up flow; the rest is admin slash commands and
-// the buttons of the pinned announcement. Buttons are callback buttons: VK
-// delivers a press as message_event, so pressing one posts nothing to the chat
-// by itself. Verified against the live community.
+// the two actions of the sign-up flow and is shown only while a game is open:
+// see chatKeyboard. Buttons are callback buttons: VK delivers a press as
+// message_event, so pressing one posts nothing to the chat by itself.
+// Verified against the live community.
 func persistentKeyboard() (string, error) {
 	kb := Keyboard{
 		Buttons: [][]Button{

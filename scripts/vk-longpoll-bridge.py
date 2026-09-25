@@ -42,6 +42,12 @@ def api(method, params):
         return json.load(r)
 
 
+def long_poll_server():
+    """Адрес Long Poll, ключ и текущий ts сообщества."""
+    resp = api("groups.getLongPollServer", {"group_id": GROUP})["response"]
+    return resp["server"], resp["key"], resp["ts"]
+
+
 def peer_of(update):
     """peer_id обновления: у message_new он внутри message, у message_event —
     прямо в объекте."""
@@ -67,17 +73,46 @@ def main():
     if not TOKEN or not GROUP:
         raise SystemExit("VK_TOKEN и VK_GROUP_ID обязательны (источник: .env)")
 
-    resp = api("groups.getLongPollServer", {"group_id": GROUP})["response"]
-    server, key, ts = resp["server"], resp["key"], resp["ts"]
+    server, key, ts = long_poll_server()
     print(f"long poll {server} ts={ts} peer={ONLY_PEER or 'все'} -> {TARGET}", flush=True)
 
+    heartbeat = time.time()
+    failures = 0
     while True:
         url = f"{server}?act=a_check&key={key}&ts={ts}&wait=25"
-        with urllib.request.urlopen(url, timeout=60) as r:
-            update = json.load(r)
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                update = json.load(r)
+            failures = 0
+        except Exception as e:  # noqa: BLE001 — мостик не должен падать
+            failures += 1
+            print(f"[{time.strftime('%H:%M:%S')}] long poll error ({failures}): {e}", flush=True)
+            time.sleep(3)
+            if failures >= 3:
+                # Сеть отвалилась надолго: берём новый сервер и ключ.
+                server, key, ts = long_poll_server()
+                print(f"[{time.strftime('%H:%M:%S')}] long poll заново {server} ts={ts}", flush=True)
+            continue
+
+        # VK отвечает {"failed": N}, когда ts устарел или ключ недействителен.
+        # Без этого обработчика мостик молча крутился бы на мёртвом ts.
+        if update.get("failed"):
+            why = update["failed"]
+            ts = update.get("ts", ts)
+            if why != 1:
+                server, key, ts = long_poll_server()
+            print(f"[{time.strftime('%H:%M:%S')}] long poll failed={why}, продолжаю с ts={ts}", flush=True)
+            continue
+
         ts = update.get("ts", ts)
 
+        if not update.get("updates") and time.time() - heartbeat > 300:
+            # Раз в пять минут видно, что мостик жив и опрашивает VK.
+            heartbeat = time.time()
+            print(f"[{time.strftime('%H:%M:%S')}] жив, ts={ts}", flush=True)
+
         for u in update.get("updates", []):
+            heartbeat = time.time()
             if u.get("type") not in FORWARD:
                 continue
             peer = peer_of(u)
