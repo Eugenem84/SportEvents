@@ -65,7 +65,14 @@ ssh dev-vps 'curl -sSI https://sportevent.dev.medovf2h.beget.tech/health'   # с
 1. Сообщество: «Управление → Работа с API → Callback API», URL
    `https://sportevent.dev.medovf2h.beget.tech/vk/callback`, версия API `5.199`
    (совпадает с `vkAPIVersion` в `internal/vk/client.go`).
-2. События: `message_new` и `message_event`.
+2. События: `message_new` и `message_event` — **во вкладке «Типы событий» раздела Callback API**
+   (это отдельная карта событий со своей кнопкой сохранения, не та, что в Long Poll API). Грабли,
+   проверено 25.09.2026: сервер может быть принят (`status: ok`), а события в нём — все `0`, и VK
+   не шлёт ничего. Смотреть и включать по API (у обоих методов обязателен `server_id` — id сервера
+   из `groups.getCallbackServers`):
+
+       curl -sG https://api.vk.com/method/groups.getCallbackSettings -d "access_token=$VK_TOKEN" -d "group_id=$VK_GROUP_ID" -d server_id=1 -d v=5.199
+       curl -sG https://api.vk.com/method/groups.setCallbackSettings -d "access_token=$VK_TOKEN" -d "group_id=$VK_GROUP_ID" -d server_id=1 -d message_new=1 -d message_event=1 -d v=5.199
 3. Строку подтверждения — в `VK_CONFIRMATION_TOKEN`, **беря её из сообщества заново**, а не из
    старого `.env`: VK меняет её при пересоздании сервера Callback API, и устаревшая строка выглядит
    рабочей (`confirmation` → `200`), но сохранение URL в сообществе падает с ошибкой. Взять её можно
@@ -83,7 +90,10 @@ ssh dev-vps 'curl -sSI https://sportevent.dev.medovf2h.beget.tech/health'   # с
    `messages.getConversationMembers` (проверка прав инициатора) и
    `messages.getConversationsById` (название беседы) вернут ошибку. Администратор беседы
    пишет боту «подключить»; в ответ приходит «Беседа «…» подключена». Токену нужен
-   доступ `messages` (тот же, что для отправки ответов).
+   доступ `messages` (тот же, что для отправки ответов). Те же права нужны, чтобы бот правил анонс
+   игры (`messages.edit`) и закреплял его (`messages.pin`): если бот в беседе не администратор,
+   VK отвечает `error 925`, бот пишет это в лог и продолжает работу — анонс тогда закрепляет
+   владелец вручную.
 
 ## Бэкап и восстановление
 

@@ -14,6 +14,12 @@ Callback API (group_id, type, event_id, object), поэтому приложен
 отправило через VKWebAppSendPayload, нужен ещё тип события app_payload и
 разрешение «Запуск приложения из сообщества» в настройках приложения.
 
+Защита от двойных ответов: перед запуском мостик спрашивает у VK
+groups.getCallbackServers и отказывается работать, если адрес Callback API в
+сообществе задан. Иначе VK несёт одни и те же события двумя каналами, и бот
+отвечает дважды — один раз со стенда, один раз с ноутбука. Осознанный обход
+(например, отладка на сообществе без Callback API) — BRIDGE_FORCE=1.
+
 Запуск:
 
     set -a; . ./.env; set +a
@@ -21,7 +27,8 @@ Callback API (group_id, type, event_id, object), поэтому приложен
 
 Переменные окружения: VK_TOKEN и VK_GROUP_ID (берутся из .env), BRIDGE_TARGET
 (по умолчанию http://localhost:8082/vk/callback), BRIDGE_PEER_ID — беседа, чьи
-события уходят в приложение (пусто — пересылать все обновления сообщества).
+события уходят в приложение (пусто — пересылать все обновления сообщества),
+BRIDGE_FORCE=1 — запуститься даже при заданном в сообществе адресе Callback API.
 """
 import json
 import os
@@ -48,6 +55,21 @@ def long_poll_server():
     """Адрес Long Poll, ключ и текущий ts сообщества."""
     resp = api("groups.getLongPollServer", {"group_id": GROUP})["response"]
     return resp["server"], resp["key"], resp["ts"]
+
+
+def callback_servers():
+    """Серверы Callback API сообщества: пары (url, status)."""
+    resp = api("groups.getCallbackServers", {"group_id": GROUP})["response"]
+    return [(s.get("url") or "", s.get("status") or "") for s in resp.get("items", [])]
+
+
+def callback_conflicts():
+    """Заданные адреса Callback API — повод не запускать мостик.
+
+    Если адрес есть, VK уже несёт события в Callback API, и опрос Long Poll
+    рядом заставит приложение обработать каждое событие дважды.
+    """
+    return [f"{url} ({status})" for url, status in callback_servers() if url]
 
 
 def peer_of(update):
@@ -81,6 +103,19 @@ def describe(update):
 def main():
     if not TOKEN or not GROUP:
         raise SystemExit("VK_TOKEN и VK_GROUP_ID обязательны (источник: .env)")
+
+    try:
+        conflicts = callback_conflicts()
+    except Exception as e:  # noqa: BLE001 — без VK API мостик всё равно не работает
+        raise SystemExit(f"не удалось прочитать настройки Callback API: {e}")
+
+    if conflicts and os.environ.get("BRIDGE_FORCE") != "1":
+        raise SystemExit(
+            "В сообществе задан адрес Callback API:\n  "
+            + "\n  ".join(conflicts)
+            + "\nVK доставляет события и туда, и в Long Poll, поэтому бот ответил бы дважды.\n"
+            "Для локальной отладки выключите Callback API в сообществе либо задайте BRIDGE_FORCE=1."
+        )
 
     server, key, ts = long_poll_server()
     print(f"long poll {server} ts={ts} peer={ONLY_PEER or 'все'} -> {TARGET}", flush=True)
