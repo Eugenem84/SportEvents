@@ -10,6 +10,7 @@ import (
 	"sportevents.local/internal/booking"
 	"sportevents.local/internal/chat"
 	"sportevents.local/internal/event"
+	"sportevents.local/internal/miniapp"
 	"sportevents.local/internal/postgres"
 	"sportevents.local/internal/schedule"
 	"sportevents.local/internal/vk"
@@ -42,6 +43,11 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler(pool))
+
+	// The diagnostic mini app page: VK opens https://<host>/app/ in a WebView
+	// and appends the launch parameters. The page reads nothing from the
+	// database, so it is mounted whether or not VK_* variables are configured.
+	mux.Handle("GET /app/", http.StripPrefix("/app", miniapp.Handler(os.Getenv("VK_GROUP_ID"))))
 
 	if svc, ok := newVKService(pool); ok {
 		mux.HandleFunc("POST /vk/callback", svc.HandleCallback)

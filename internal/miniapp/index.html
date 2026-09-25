@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<!--
+  Диагностическая страница мини-приложения SportEvents (маршрут GET /app/).
+
+  Зачем: проверить, что VK действительно открывает приложение из беседы, и
+  увидеть, что он передал в адресе запуска (vk_user_id, vk_platform, vk_chat_id,
+  sign) и какую форму показа выбрал. Данных беседы страница не знает и в базу
+  не пишет: только то, что пришло в URL и что ответил VK Bridge.
+
+  VK Bridge подключён локально, без CDN: static/vk-bridge.min.js —
+  @vkontakte/vk-bridge 2.15.0, MIT,
+  https://unpkg.com/@vkontakte/vk-bridge@2.15.0/dist/browser.min.js
+  sha256 0cdf89612cf18f12d5f39be5e5ea0aad6d1760ddb3964f31effb251d679d8178
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SportEvents — запуск мини-приложения</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 12px 12px calc(24px + env(safe-area-inset-bottom));
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #19191a; color: #e1e3e6; -webkit-text-size-adjust: 100%;
+}
+h1 { font-size: 17px; margin: 0 0 4px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #939393; margin: 0 0 8px; }
+p.hint { color: #818c99; font-size: 12px; margin: 0 0 12px; }
+section { background: #232324; border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td { padding: 3px 0; vertical-align: top; word-break: break-word; }
+td.k { color: #818c99; width: 44%; padding-right: 8px; }
+td.v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+td.v b { font-weight: 600; }
+.ok { color: #4bb34b; } .bad { color: #e64646; } .warn { color: #e8a02c; } .muted { color: #818c99; }
+button, input {
+  font: inherit; color: #e1e3e6; background: #2c2d2e; border: 1px solid #3f4041;
+  border-radius: 8px; padding: 8px 10px; width: 100%;
+}
+button { margin-top: 8px; text-align: center; }
+button:active { background: #3f4041; }
+input::placeholder { color: #6c6c6c; }
+.row { display: flex; gap: 8px; margin-top: 8px; }
+.row > * { margin-top: 0; }
+pre {
+  margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #c4c9cc;
+}
+</style>
+</head>
+<body>
+<h1>Запуск мини-приложения</h1>
+<p class="hint">SportEvents · диагностика запуска: что VK передал странице и как открыл её.</p>
+
+<section>
+  <h2>Итог</h2>
+  <table><tbody id="verdict"></tbody></table>
+</section>
+
+<section>
+  <h2>Параметры запуска (location.search)</h2>
+  <table><tbody id="params"></tbody></table>
+  <table style="margin-top:8px"><tbody id="paramsBridge"></tbody></table>
+</section>
+
+<section>
+  <h2>Окружение</h2>
+  <table><tbody id="env"></tbody></table>
+</section>
+
+<section>
+  <h2>VK Bridge</h2>
+  <table><tbody id="bridge"></tbody></table>
+  <button id="btnInit" type="button">Инициализировать (VKWebAppInit)</button>
+  <button id="btnLaunch" type="button">Параметры через bridge (VKWebAppGetLaunchParams)</button>
+  <button id="btnUser" type="button">Профиль (VKWebAppGetUserInfo)</button>
+  <div id="payloadForm">
+    <div class="row">
+      <input id="payloadGroup" type="text" inputmode="numeric" placeholder="group_id" value="{{.GroupID}}">
+      <input id="payloadText" type="text" placeholder="текст payload">
+    </div>
+    <button id="btnPayload" type="button">Отправить app_payload в сообщество</button>
+  </div>
+</section>
+
+<section>
+  <h2>Лог</h2>
+  <pre id="log"></pre>
+  <button id="btnCopy" type="button">Скопировать отчёт</button>
+</section>
+
+<script src="static/vk-bridge.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var bridge = window.vkBridge || null;
+  var params = new URLSearchParams(location.search);
+  var logLines = [];
+
+  var el = function (id) { return document.getElementById(id); };
+
+  function addLine(html) {
+    var tr = document.createElement('tr');
+    var cells = html.split('\u0001');
+    for (var i = 0; i < cells.length; i++) {
+      var td = document.createElement('td');
+      td.className = i === 0 ? 'k' : 'v';
+      td.innerHTML = cells[i];
+      tr.appendChild(td);
+    }
+    return tr;
+  }
+
+  function setRows(id, rows) {
+    var body = el(id);
+    body.innerHTML = '';
+    rows.forEach(function (row) { body.appendChild(addLine(row)); });
+  }
+
+  function esc(value) {
+    return String(value).replace(/[&<>"]/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch];
+    });
+  }
+
+  function log(message) {
+    logLines.push(message);
+    el('log').textContent = logLines.join('\n');
+  }
+
+  function stamp() {
+    var d = new Date();
+    return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  }
+
+  // call wraps bridge.send: outside VK the promise never settles, so every
+  // call gets a deadline and an explicit "no native client" answer.
+  function call(method, sendParams) {
+    if (!bridge) {
+      log('✗ ' + method + ': bridge недоступен — страница открыта не во ВКонтакте');
+      return Promise.reject(new Error('bridge недоступен'));
+    }
+
+    log('→ ' + method + (sendParams ? ' ' + JSON.stringify(sendParams) : ''));
+
+    var timeout = new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error('нет ответа за 8 с')); }, 8000);
+    });
+
+    return Promise.race([bridge.send(method, sendParams), timeout]).then(function (data) {
+      log('← ' + method + ': ' + JSON.stringify(data));
+      return data;
+    }).catch(function (error) {
+      var text = error && error.error_msg
+        ? error.error_msg + ' (код ' + error.error_code + ')'
+        : (error && error.message) || JSON.stringify(error);
+      log('✗ ' + method + ': ' + text);
+      throw error;
+    });
+  }
+
+  function ignore() {}
+
+  function value(v) {
+    return v === undefined || v === '' ? '<span class="muted">—</span>' : '<b>' + esc(v) + '</b>';
+  }
+
+  // knownParams gives the fields VK documents a human label; unknown keys are
+  // still shown as they came, because an unexpected parameter is exactly what
+  // this page exists to reveal.
+  var knownParams = [
+    ['vk_user_id', 'кто открыл приложение'],
+    ['vk_chat_id', 'беседа, из которой открыли'],
+    ['vk_peer_id', 'peer_id беседы'],
+    ['vk_platform', 'платформа запуска'],
+    ['vk_app_id', 'id приложения'],
+    ['vk_group_id', 'id сообщества'],
+    ['vk_viewer_group_role', 'роль в сообществе'],
+    ['vk_is_app_user', 'разрешение запускать приложение'],
+    ['vk_are_notifications_enabled', 'уведомления разрешены'],
+    ['vk_access_token_settings', 'права доступа'],
+    ['vk_language', 'язык'],
+    ['vk_ref', 'откуда перешли'],
+    ['vk_ts', 'метка времени запуска'],
+    ['sign', 'подпись параметров'],
+    ['exp', 'срок действия'],
+    ['api_id', 'id приложения (Одноклассники)'],
+    ['platform', 'платформа (Одноклассники)'],
+    ['user_id', 'пользователь (Одноклассники)']
+  ];
+
+  var fromURL = {};
+  params.forEach(function (v, k) { fromURL[k] = v; });
+  var fromBridge = {};
+  var profile = null;
+  var bridgeEvents = [];
+
+  function renderParams() {
+    var labels = {};
+    knownParams.forEach(function (pair) { labels[pair[0]] = pair[1]; });
+
+    var merged = Object.assign({}, fromURL, fromBridge);
+    var keys = Object.keys(merged).sort();
+    var rows = [];
+
+    if (!keys.length) {
+      rows.push('Параметры\u0001<b class="bad">пусто</b> <span class="muted">— запуск не из ВКонтакте</span>');
+    }
+
+    keys.forEach(function (key) {
+      var label = labels[key] ? ' <span class="muted">' + labels[key] + '</span>' : '';
+      var source = fromBridge[key] !== undefined ? 'bridge' : 'URL';
+      rows.push(esc(key) + label + '\u0001<b>' + esc(merged[key] === '' ? '(пусто)' : merged[key]) +
+        '</b> <span class="muted">' + source + '</span>');
+    });
+
+    setRows('params', rows);
+    setRows('paramsBridge', [
+      'location.search\u0001' + esc(location.search || '(пусто)'),
+      'location.hash\u0001' + esc(location.hash || '(пусто)')
+    ]);
+  }
+
+  function renderVerdict() {
+    var merged = Object.assign({}, fromURL, fromBridge);
+    var ratio = screen.height ? Math.round((window.innerHeight / screen.height) * 100) : 0;
+    var shape = ratio && ratio < 90
+      ? '<b class="warn">похоже на шторку</b>'
+      : '<b>похоже на полный экран</b>';
+
+    setRows('verdict', [
+      'Открыто во ВКонтакте\u0001' + (bridge
+        ? '<b class="ok">да</b>'
+        : '<b class="bad">нет</b> <span class="muted">(bridge недоступен)</span>'),
+      'Платформа\u0001' + value(merged.vk_platform),
+      'Пользователь\u0001' + value(merged.vk_user_id) + (profile && profile.first_name
+        ? ' <span class="muted">' + esc(profile.first_name + ' ' + profile.last_name) + '</span>'
+        : ''),
+      'Беседа\u0001' + (merged.vk_chat_id
+        ? '<b class="ok">' + esc(merged.vk_chat_id) + '</b>'
+        : '<b class="warn">нет</b> <span class="muted">(запуск не из беседы)</span>'),
+      'Подпись sign\u0001' + (merged.sign
+        ? '<b class="ok">есть</b> <span class="muted">' + esc(String(merged.sign).length) + ' символов</span>'
+        : '<b class="bad">нет</b>'),
+      'Окно / экран\u0001' + window.innerWidth + '×' + window.innerHeight + ' / ' +
+        screen.width + '×' + screen.height + ' (' + ratio + '%) — ' + shape
+    ]);
+  }
+
+  function renderEnv() {
+    var vv = window.visualViewport;
+    setRows('env', [
+      'Адрес\u0001' + esc(location.origin + location.pathname),
+      'User-Agent\u0001' + esc(navigator.userAgent),
+      'Окно\u0001' + window.innerWidth + '×' + window.innerHeight + (vv
+        ? ' <span class="muted">(visual viewport ' + Math.round(vv.width) + '×' + Math.round(vv.height) + ')</span>'
+        : ''),
+      'Экран\u0001' + screen.width + '×' + screen.height + ', dpr ' + (window.devicePixelRatio || 1),
+      'Язык\u0001' + esc(navigator.language || '—'),
+      'События от VK\u0001' + bridgeEvents.length
+    ]);
+  }
+
+  function renderBridge() {
+    var last = bridgeEvents.length ? bridgeEvents[bridgeEvents.length - 1] : '';
+    setRows('bridge', [
+      'window.vkBridge\u0001' + (bridge
+        ? '<b class="ok">есть</b>'
+        : '<b class="bad">нет</b> <span class="muted">— откройте страницу во ВКонтакте</span>'),
+      'Профиль\u0001' + (profile
+        ? '<b>' + esc(profile.first_name + ' ' + profile.last_name) + '</b> <span class="muted">id ' +
+          esc(profile.id) + '</span>'
+        : '<span class="muted">не получен</span>'),
+      'Последнее событие\u0001' + (last ? esc(last) : '<span class="muted">пока нет</span>')
+    ]);
+  }
+
+  function boot() {
+    renderParams();
+    renderEnv();
+    renderBridge();
+    renderVerdict();
+    wireButtons();
+
+    log('страница открыта: ' + location.href);
+
+    if (!bridge) {
+      log('✗ VK Bridge недоступен — вне ВКонтакте это нормально: адрес проверяйте в браузере, bridge — в приложении');
+      return;
+    }
+
+    // Everything VK sends to the page (config, insets, view hide and restore)
+    // is logged as is: on a phone this is how the form VK chose for the mini
+    // app becomes visible.
+    bridge.subscribe(function (event) {
+      var detail = event.detail || {};
+      var line = detail.type || 'unknown';
+      if (detail.data) { line += ' ' + JSON.stringify(detail.data); }
+      bridgeEvents.push(line);
+      log('← событие ' + line);
+      renderBridge();
+      renderEnv();
+    });
+
+    call('VKWebAppInit').then(ignore, ignore);
+    call('VKWebAppGetLaunchParams').then(function (data) {
+      fromBridge = data || {};
+      renderParams();
+      renderVerdict();
+    }, ignore);
+    call('VKWebAppGetUserInfo').then(function (data) {
+      profile = data;
+      renderBridge();
+      renderVerdict();
+    }, ignore);
+  }
+
+  function wireButtons() {
+    el('btnInit').addEventListener('click', function () {
+      call('VKWebAppInit').then(ignore, ignore);
+    });
+
+    el('btnLaunch').addEventListener('click', function () {
+      call('VKWebAppGetLaunchParams').then(function (data) {
+        fromBridge = data || {};
+        renderParams();
+        renderVerdict();
+      }, ignore);
+    });
+
+    el('btnUser').addEventListener('click', function () {
+      call('VKWebAppGetUserInfo').then(function (data) {
+        profile = data;
+        renderBridge();
+        renderVerdict();
+      }, ignore);
+    });
+
+    // VKWebAppSendPayload is the "mini app talks to the bot" path: VK delivers
+    // an app_payload event to the community (Callback API or Long Poll), and
+    // the payload is what our handler would read. Не беседа, а сообщество.
+    el('btnPayload').addEventListener('click', function () {
+      var groupID = Number(el('payloadGroup').value);
+      if (!groupID) {
+        log('✗ app_payload: укажите group_id сообщества (это VK_GROUP_ID)');
+        return;
+      }
+      var payload = { source: 'miniapp-smoke', ts: Date.now() };
+      var text = el('payloadText').value.trim();
+      if (text) { payload.text = text; }
+      call('VKWebAppSendPayload', { group_id: groupID, payload: payload }).then(function () {
+        log('! app_payload отправлен: сообщество получит событие app_payload (нужен Callback API или Long Poll)');
+      }, ignore);
+    });
+
+    el('btnCopy').addEventListener('click', copyReport);
+  }
+
+  function copyReport() {
+    var report = [
+      'SportEvents: отчёт о запуске мини-приложения',
+      'Адрес: ' + location.href,
+      'User-Agent: ' + navigator.userAgent,
+      'Экран: ' + screen.width + '×' + screen.height + ', окно ' + window.innerWidth + '×' + window.innerHeight,
+      '--- лог ---'
+    ].concat(logLines).join('\n');
+
+    if (!navigator.clipboard) {
+      log('буфер обмена недоступен — выделите лог вручную');
+      return;
+    }
+    navigator.clipboard.writeText(report).then(function () {
+      log('отчёт скопирован в буфер обмена');
+    }, function () {
+      log('скопировать не удалось — выделите лог вручную');
+    });
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>
