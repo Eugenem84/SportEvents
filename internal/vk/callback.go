@@ -87,7 +87,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// VK retries events it did not get a confident answer for. The same
 	// event_id must be processed once: a retry is logged and skipped.
-	if cb.EventID != "" && s.events.mark(cb.EventID) {
+	if cb.EventID != "" && s.dedup.mark(cb.EventID) {
 		s.log.Printf("vk: duplicate event %q (%s), skipping", cb.EventID, cb.Type)
 	} else {
 		s.dispatch(r.Context(), cb)

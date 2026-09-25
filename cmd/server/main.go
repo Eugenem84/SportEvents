@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"os"
 
+	"sportevents.local/internal/announce"
+	"sportevents.local/internal/booking"
 	"sportevents.local/internal/chat"
+	"sportevents.local/internal/event"
 	"sportevents.local/internal/postgres"
 	"sportevents.local/internal/vk"
 
@@ -65,12 +68,21 @@ func newVKService(pool *pgxpool.Pool) (*vk.Service, bool) {
 	client := vk.NewClient(token, os.Getenv("VK_GROUP_ID"))
 	chats := chat.NewService(pool)
 	// The VK client is both the messenger and the source of conversation
-	// metadata; the chat store resolves and registers external channels.
+	// metadata; chat, event, booking and announcement services are the
+	// application layer the bot drives.
 	return vk.NewService(vk.Config{
 		ConfirmationToken: confirmation,
 		Secret:            os.Getenv("VK_SECRET"),
 		GroupID:           os.Getenv("VK_GROUP_ID"),
-	}, client, chats, chats, client), true
+	}, vk.Deps{
+		Messenger: client,
+		Chats:     chats,
+		Users:     chats,
+		Convs:     client,
+		Events:    event.NewService(pool),
+		Bookings:  booking.NewService(pool),
+		Announces: announce.NewService(pool),
+	}), true
 }
 
 func healthHandler(pool *pgxpool.Pool) http.HandlerFunc {

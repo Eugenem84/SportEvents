@@ -78,6 +78,32 @@ func (c *Client) SendMessage(ctx context.Context, peerID int64, text, keyboard s
 	return msgID, nil
 }
 
+// EditMessage edits a message the community sent earlier (messages.edit).
+// This is how the game announcement keeps the roster in one message instead
+// of posting a new one on every booking. It returns the edited message id.
+func (c *Client) EditMessage(ctx context.Context, peerID, messageID int64, text, keyboard string) (int64, error) {
+	params := url.Values{}
+	params.Set("peer_id", strconv.FormatInt(peerID, 10))
+	params.Set("message_id", strconv.FormatInt(messageID, 10))
+	params.Set("message", text)
+	if keyboard != "" {
+		params.Set("keyboard", keyboard)
+	}
+
+	raw, err := c.call(ctx, "messages.edit", params)
+	if err != nil {
+		return 0, err
+	}
+	var ok int
+	if err := json.Unmarshal(raw, &ok); err != nil {
+		return 0, fmt.Errorf("parse messages.edit response: %w", err)
+	}
+	if ok != 1 {
+		return 0, fmt.Errorf("messages.edit: unexpected response %d", ok)
+	}
+	return messageID, nil
+}
+
 // AnswerMessageEvent acknowledges a callback-button press
 // (messages.sendMessageEventAnswer) so the pressed button stops showing the
 // loading state. eventData, when non-empty, is the JSON action to run on the

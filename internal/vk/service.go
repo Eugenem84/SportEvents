@@ -2,19 +2,29 @@ package vk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"sportevents.local/internal/announce"
+	"sportevents.local/internal/booking"
 	"sportevents.local/internal/chat"
+	"sportevents.local/internal/event"
 )
 
 // Messenger talks to the VK Bot API. *Client implements it.
 type Messenger interface {
 	SendMessage(ctx context.Context, peerID int64, text, keyboard string) (int64, error)
+	// EditMessage rewrites a message the community sent earlier: the game
+	// announcement keeps the roster of participants in one message instead of
+	// posting a new one on every booking.
+	EditMessage(ctx context.Context, peerID, messageID int64, text, keyboard string) (int64, error)
 	// AnswerMessageEvent acknowledges a callback-button press so the pressed
 	// button stops showing the loading state in VK clients. eventData is the
 	// optional JSON action to run on the client (e.g. a toast) and may be
@@ -30,6 +40,9 @@ type ChatStore interface {
 	// Connect binds the external conversation to an internal Chat and
 	// returns it with created=false when it was already connected.
 	Connect(ctx context.Context, in chat.ConnectInput) (chat.Chat, bool, error)
+	// IsChatAdmin reports whether the user administers the Chat. Rights are
+	// read from chat_admins; the VK API is asked only at connect time.
+	IsChatAdmin(ctx context.Context, chatID, userID int64) (bool, error)
 }
 
 // ConversationInfo reads the VK conversation metadata needed at connect
@@ -48,6 +61,29 @@ type UserStore interface {
 	FindOrCreateUserByExternalID(ctx context.Context, platform, externalUserID, displayName string) (chat.User, error)
 }
 
+// EventStore is the event side of the bot: creating games and listing them
+// with their counters.
+type EventStore interface {
+	Create(ctx context.Context, in event.CreateInput) (event.Event, error)
+	Get(ctx context.Context, chatID, eventID int64) (event.Event, error)
+	ListUpcomingWithCounts(ctx context.Context, chatID int64, from time.Time, limit int) ([]event.EventSummary, error)
+}
+
+// BookingStore is the booking side of the bot: who is in the lineup, who is
+// in the reserve, and what a cancellation did to them.
+type BookingStore interface {
+	Create(ctx context.Context, in booking.CreateInput) (booking.Booking, error)
+	Cancel(ctx context.Context, eventID, bookingID int64) (booking.CancelResult, error)
+	ListByEvent(ctx context.Context, eventID int64, statuses ...booking.Status) ([]booking.Booking, error)
+	ListActiveByUser(ctx context.Context, userID int64, from time.Time) ([]booking.BookingWithEvent, error)
+}
+
+// AnnounceStore remembers the chat message that announces a game.
+type AnnounceStore interface {
+	Save(ctx context.Context, ref announce.Ref) error
+	Get(ctx context.Context, eventID int64, platform string) (announce.Ref, bool, error)
+}
+
 // Config carries the community settings for the callback endpoint.
 type Config struct {
 	// ConfirmationToken is the string VK expects back for a
@@ -59,7 +95,29 @@ type Config struct {
 	// GroupID is the community id; when non-empty, events from other
 	// communities are rejected.
 	GroupID string
+	// Location is the timezone games are shown in. Times are stored in UTC;
+	// V1 renders them in one fixed zone per chat (ARCHITECTURE §7), and a
+	// fixed offset keeps the bot working in a container without tzdata.
+	Location *time.Location
 }
+
+// Deps are the collaborators of the VK adapter. A struct keeps NewService
+// readable now that the bot also talks to events and bookings.
+type Deps struct {
+	Messenger Messenger
+	Chats     ChatStore
+	Users     UserStore
+	Convs     ConversationInfo
+	Events    EventStore
+	Bookings  BookingStore
+	Announces AnnounceStore
+	// Now returns the current time. Tests pin it, so "tomorrow 19:00" means
+	// something in assertions.
+	Now func() time.Time
+}
+
+// defaultLocation is Moscow time: V1 assumes one city per chat.
+var defaultLocation = time.FixedZone("MSK", 3*60*60)
 
 // Service handles VK Callback API events. It depends on interfaces only,
 // so it is testable without PostgreSQL or the real VK API.
@@ -67,30 +125,48 @@ type Service struct {
 	confirmationToken string
 	secret            string
 	groupID           int64
+	loc               *time.Location
 
 	messenger Messenger
 	chats     ChatStore
 	users     UserStore
 	convs     ConversationInfo
+	events    EventStore
+	bookings  BookingStore
+	announces AnnounceStore
+	now       func() time.Time
 
-	// events deduplicates VK callback events by their event_id, so a retry of
-	// the same event is not processed twice.
-	events *eventDedup
+	// dedup remembers recently handled VK event ids, so a retry of the same
+	// event is not processed twice.
+	dedup *eventDedup
 
 	log *log.Logger
 }
 
-func NewService(cfg Config, messenger Messenger, chats ChatStore, users UserStore, convs ConversationInfo) *Service {
+func NewService(cfg Config, deps Deps) *Service {
 	gid, _ := strconv.ParseInt(strings.TrimSpace(cfg.GroupID), 10, 64)
+	loc := cfg.Location
+	if loc == nil {
+		loc = defaultLocation
+	}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Service{
 		confirmationToken: strings.TrimSpace(cfg.ConfirmationToken),
 		secret:            cfg.Secret,
 		groupID:           gid,
-		messenger:         messenger,
-		chats:             chats,
-		users:             users,
-		convs:             convs,
-		events:            newEventDedup(callbackDedupTTL),
+		loc:               loc,
+		messenger:         deps.Messenger,
+		chats:             deps.Chats,
+		users:             deps.Users,
+		convs:             deps.Convs,
+		events:            deps.Events,
+		bookings:          deps.Bookings,
+		announces:         deps.Announces,
+		now:               now,
+		dedup:             newEventDedup(callbackDedupTTL),
 		log:               log.Default(),
 	}
 }
@@ -101,6 +177,23 @@ const (
 	cmdMyBookings    = "my"
 	cmdCancelBooking = "cancel"
 	cmdConnect       = "connect"
+	// cmdCreateGame creates a game and posts its announcement (admins only).
+	cmdCreateGame = "create"
+	// cmdBook signs the pressed user up for one game (payload carries the id).
+	cmdBook = "book"
+	// cmdSkip is the "Пропускаю" button: it cancels the user's booking.
+	cmdSkip = "skip"
+)
+
+const (
+	// gamesLimit caps the "игры" list: a chat screen shows a handful of games,
+	// not the whole season.
+	gamesLimit = 10
+	// defaultCapacity, defaultTitle and defaultHour are what "создать игру"
+	// without arguments produces.
+	defaultCapacity = 12
+	defaultTitle    = "Волейбол"
+	defaultHour     = 19
 )
 
 // conversationPeerIDMin is the lowest peer_id of a VK group conversation.
@@ -123,7 +216,7 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 	if err != nil {
 		return fmt.Errorf("find chat: %w", err)
 	}
-	cmd := s.commandOf(msg.Text, msg.Payload)
+	cmd, eventID := s.parseCommand(msg.Text, msg.Payload)
 
 	// An unconnected conversation is not a Chat yet: the connection
 	// request is the only command that can act on it.
@@ -139,20 +232,50 @@ func (s *Service) handleMessageNew(ctx context.Context, msg messageNew) error {
 	if err != nil {
 		return err
 	}
+	return s.handleCommand(ctx, commandCtx{
+		peerID:  msg.PeerID,
+		chat:    *ch,
+		user:    user,
+		cmd:     cmd,
+		eventID: eventID,
+		text:    msg.Text,
+	})
+}
 
-	switch cmd {
+// commandCtx is everything one command needs: the external peer, the internal
+// Chat and User it belongs to, and the parsed command with its optional event.
+type commandCtx struct {
+	peerID  int64
+	chat    chat.Chat
+	user    chat.User
+	cmd     string
+	eventID int64
+	text    string
+}
+
+// handleCommand runs one command. Both message_new (typed text and text
+// buttons) and message_event (callback buttons) end up here, so the two
+// transports cannot drift apart.
+func (s *Service) handleCommand(ctx context.Context, c commandCtx) error {
+	switch c.cmd {
 	case cmdStart:
-		return s.sendWelcome(ctx, msg.PeerID, user.DisplayName, ch.Title)
+		return s.sendWelcome(ctx, c.peerID, c.user.DisplayName, c.chat.Title)
 	case cmdConnect:
-		return s.sendText(ctx, msg.PeerID, fmt.Sprintf("Беседа «%s» уже подключена.", ch.Title), "")
+		return s.sendText(ctx, c.peerID, fmt.Sprintf("Беседа «%s» уже подключена.", c.chat.Title), "")
 	case cmdGames:
-		return s.sendText(ctx, msg.PeerID, "Список игр появится на следующем этапе.", "")
+		return s.handleGames(ctx, c)
+	case cmdCreateGame:
+		return s.handleCreateGame(ctx, c)
+	case cmdBook:
+		return s.handleBook(ctx, c)
+	case cmdSkip:
+		return s.handleSkip(ctx, c)
 	case cmdMyBookings:
-		return s.sendText(ctx, msg.PeerID, "Ваши записи появятся на следующем этапе.", "")
+		return s.handleMyBookings(ctx, c)
 	case cmdCancelBooking:
-		return s.sendText(ctx, msg.PeerID, "Отмена записи появится на следующем этапе.", "")
+		return s.handleCancel(ctx, c)
 	default:
-		return s.sendText(ctx, msg.PeerID, "Не понял команду. Напишите /start.", "")
+		return s.sendText(ctx, c.peerID, "Не понял команду. Напишите «игры» или /start.", "")
 	}
 }
 
@@ -181,18 +304,14 @@ func (s *Service) handleMessageEvent(ctx context.Context, ev messageEvent) error
 		return err
 	}
 
-	switch s.commandOf("", ev.Payload) {
-	case cmdStart:
-		return s.sendWelcome(ctx, ev.PeerID, user.DisplayName, ch.Title)
-	case cmdGames:
-		return s.sendText(ctx, ev.PeerID, "Список игр появится на следующем этапе.", "")
-	case cmdMyBookings:
-		return s.sendText(ctx, ev.PeerID, "Ваши записи появятся на следующем этапе.", "")
-	case cmdCancelBooking:
-		return s.sendText(ctx, ev.PeerID, "Отмена записи появится на следующем этапе.", "")
-	default:
-		return s.sendText(ctx, ev.PeerID, "Не понял команду. Напишите /start.", "")
-	}
+	cmd, eventID := ParsePayload(ev.Payload)
+	return s.handleCommand(ctx, commandCtx{
+		peerID:  ev.PeerID,
+		chat:    *ch,
+		user:    user,
+		cmd:     cmd,
+		eventID: eventID,
+	})
 }
 
 // handleConnect registers the conversation as an internal Chat. Only a VK
@@ -266,6 +385,395 @@ func (s *Service) ensureUser(ctx context.Context, vkID int64) (chat.User, error)
 	return s.users.FindOrCreateUserByExternalID(ctx, chat.PlatformVK, strconv.FormatInt(vkID, 10), name)
 }
 
+// handleGames lists the upcoming games of the chat with their free slots and
+// a button per game: signing up is one press from here.
+func (s *Service) handleGames(ctx context.Context, c commandCtx) error {
+	games, err := s.events.ListUpcomingWithCounts(ctx, c.chat.ID, s.now().UTC(), gamesLimit)
+	if err != nil {
+		return fmt.Errorf("list games: %w", err)
+	}
+	if len(games) == 0 {
+		return s.sendText(ctx, c.peerID,
+			"Ближайших игр нет. Администратор может создать игру: «создать игру 27.09 19:00 12».", "")
+	}
+
+	var b strings.Builder
+	b.WriteString("Ближайшие игры:\n")
+	rows := make([][]Button, 0, len(games))
+	for i, g := range games {
+		fmt.Fprintf(&b, "\n%d) %s — %s\n", i+1, g.Title, s.formatWhen(g.StartsAt))
+		fmt.Fprintf(&b, "   свободно %d из %d", g.Free, g.Capacity)
+		if g.Waitlist > 0 {
+			fmt.Fprintf(&b, ", в резерве %d", g.Waitlist)
+		}
+		b.WriteString("\n")
+		rows = append(rows, []Button{
+			TextButton("Записаться: "+g.Title, EventCommandPayload(cmdBook, g.ID), ColorPrimary),
+		})
+	}
+	kb, err := (Keyboard{Inline: true, Buttons: rows}).Marshal()
+	if err != nil {
+		return err
+	}
+	return s.sendText(ctx, c.peerID, b.String(), kb)
+}
+
+// handleCreateGame creates a game and posts the announcement the whole chat
+// signs up under. Only a chat administrator may do it.
+func (s *Service) handleCreateGame(ctx context.Context, c commandCtx) error {
+	admin, err := s.chats.IsChatAdmin(ctx, c.chat.ID, c.user.ID)
+	if err != nil {
+		return fmt.Errorf("check chat admin: %w", err)
+	}
+	if !admin {
+		return s.sendText(ctx, c.peerID, "Создавать игры может только администратор беседы.", "")
+	}
+
+	draft := parseCreateGame(c.text, s.now(), s.loc)
+	ev, err := s.events.Create(ctx, event.CreateInput{
+		ChatID:   c.chat.ID,
+		StartsAt: draft.startsAt,
+		Title:    draft.title,
+		Location: draft.location,
+		Capacity: draft.capacity,
+	})
+	if err != nil {
+		return fmt.Errorf("create event: %w", err)
+	}
+
+	// The announcement is the message everyone signs up under: remember its
+	// id so later changes rewrite this message instead of posting a new one.
+	text, kb, err := s.renderAnnouncement(ev, nil, nil)
+	if err != nil {
+		return err
+	}
+	msgID, err := s.messenger.SendMessage(ctx, c.peerID, text, kb)
+	if err != nil {
+		return fmt.Errorf("send announcement: %w", err)
+	}
+	if err := s.announces.Save(ctx, announce.Ref{
+		EventID:        ev.ID,
+		Platform:       chat.PlatformVK,
+		ExternalChatID: strconv.FormatInt(c.peerID, 10),
+		MessageID:      msgID,
+	}); err != nil {
+		return fmt.Errorf("save announcement: %w", err)
+	}
+	return nil
+}
+
+// renderAnnouncement renders a game message: who is in the lineup, who is in
+// the reserve, and the buttons to sign up or skip. Once the last slot is
+// taken the button becomes "В резерв" — the same booking call, because the
+// store decides between confirmed and waitlist.
+func (s *Service) renderAnnouncement(ev event.Event, confirmed, waitlist []booking.Booking) (string, string, error) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s — %s\n", ev.Title, s.formatWhen(ev.StartsAt))
+	if strings.TrimSpace(ev.Location) != "" {
+		fmt.Fprintf(&b, "Место: %s\n", ev.Location)
+	}
+	fmt.Fprintf(&b, "\nСостав (%d/%d):\n", len(confirmed), ev.Capacity)
+	if len(confirmed) == 0 {
+		b.WriteString("— пока никого\n")
+	}
+	for i, bk := range confirmed {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, bk.PlayerName)
+	}
+	if len(waitlist) > 0 {
+		fmt.Fprintf(&b, "\nРезерв (%d):\n", len(waitlist))
+		for i, bk := range waitlist {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, bk.PlayerName)
+		}
+	}
+
+	label := "Записаться"
+	if len(confirmed) >= ev.Capacity {
+		label = "В резерв"
+	}
+	kb := Keyboard{Inline: true, Buttons: [][]Button{
+		{TextButton(label, EventCommandPayload(cmdBook, ev.ID), ColorPrimary)},
+		{TextButton("Пропускаю", EventCommandPayload(cmdSkip, ev.ID), ColorSecondary)},
+	}}
+	raw, err := kb.Marshal()
+	if err != nil {
+		return "", "", err
+	}
+	return b.String(), raw, nil
+}
+
+// formatWhen renders a game time the way a chat reads it: "сегодня 19:00",
+// "завтра 19:00" or "27.09 в 19:00" for anything further out.
+func (s *Service) formatWhen(t time.Time) string {
+	local := t.In(s.loc)
+	today := s.now().In(s.loc)
+	day := local.Format("02.01")
+	switch {
+	case sameDay(local, today):
+		day = "сегодня"
+	case sameDay(local, today.AddDate(0, 0, 1)):
+		day = "завтра"
+	}
+	return fmt.Sprintf("%s в %s", day, local.Format("15:04"))
+}
+
+func sameDay(a, b time.Time) bool {
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
+}
+
+// handleBook signs the user up for one game. booking.Create decides between
+// the lineup and the reserve, so a full game puts the user in the reserve.
+func (s *Service) handleBook(ctx context.Context, c commandCtx) error {
+	if c.eventID == 0 {
+		return s.sendText(ctx, c.peerID, "Выберите игру: напишите «игры» и нажмите «Записаться» под нужной игрой.", "")
+	}
+	ev, err := s.events.Get(ctx, c.chat.ID, c.eventID)
+	if err != nil {
+		if errors.Is(err, event.ErrNotFound) {
+			return s.sendText(ctx, c.peerID, "Такой игры не нашёл — возможно, она уже прошла.", "")
+		}
+		return fmt.Errorf("get event: %w", err)
+	}
+
+	b, err := s.bookings.Create(ctx, booking.CreateInput{
+		EventID:        ev.ID,
+		PlayerName:     c.user.DisplayName,
+		UserID:         &c.user.ID,
+		BookedByUserID: c.user.ID,
+	})
+	switch {
+	case errors.Is(err, booking.ErrAlreadyBooked):
+		return s.sendText(ctx, c.peerID, "Вы уже записаны на эту игру.", "")
+	case err != nil:
+		return fmt.Errorf("create booking: %w", err)
+	}
+
+	reply := fmt.Sprintf("Вы записаны: «%s» — %s.", ev.Title, s.formatWhen(ev.StartsAt))
+	if b.Status == booking.StatusWaitlist {
+		reply = fmt.Sprintf("Мест нет — вы в резерве: «%s» — %s.", ev.Title, s.formatWhen(ev.StartsAt))
+	}
+	if err := s.sendText(ctx, c.peerID, reply, ""); err != nil {
+		return err
+	}
+	return s.refreshAnnouncement(ctx, c.chat.ID, c.peerID, ev.ID)
+}
+
+// handleSkip is the "Пропускаю" button: it cancels the user's booking for the
+// game in the payload.
+func (s *Service) handleSkip(ctx context.Context, c commandCtx) error {
+	return s.cancelBooking(ctx, c, "Вы не записаны на эту игру.")
+}
+
+// handleCancel is «отмена» typed by hand: it works when the user has exactly
+// one active booking, otherwise the buttons of «мои записи» are the way.
+func (s *Service) handleCancel(ctx context.Context, c commandCtx) error {
+	return s.cancelBooking(ctx, c, "Активной записи не нашёл. Посмотреть записи: «мои записи».")
+}
+
+// cancelBooking cancels the caller's booking and reports what happened,
+// including who took the freed slot: a promotion is never silent
+// (ARCHITECTURE §16).
+func (s *Service) cancelBooking(ctx context.Context, c commandCtx, notFound string) error {
+	b, ok, err := s.findActiveBooking(ctx, c.user.ID, c.eventID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return s.sendText(ctx, c.peerID, notFound, "")
+	}
+
+	res, err := s.bookings.Cancel(ctx, b.EventID, b.ID)
+	if err != nil {
+		if errors.Is(err, booking.ErrNotFound) || errors.Is(err, booking.ErrNotActive) {
+			return s.sendText(ctx, c.peerID, "Запись уже отменена.", "")
+		}
+		return fmt.Errorf("cancel booking: %w", err)
+	}
+
+	reply := fmt.Sprintf("Запись на «%s» отменена.", b.EventTitle)
+	if res.Promoted != nil {
+		reply += fmt.Sprintf("\nМесто занял %s из резерва.", res.Promoted.PlayerName)
+	}
+	if err := s.sendText(ctx, c.peerID, reply, ""); err != nil {
+		return err
+	}
+	return s.refreshAnnouncement(ctx, c.chat.ID, c.peerID, b.EventID)
+}
+
+// findActiveBooking returns the caller's active booking for the event in the
+// payload. Without an event id a single active booking is used.
+func (s *Service) findActiveBooking(ctx context.Context, userID, eventID int64) (booking.BookingWithEvent, bool, error) {
+	mine, err := s.bookings.ListActiveByUser(ctx, userID, s.now().UTC())
+	if err != nil {
+		return booking.BookingWithEvent{}, false, fmt.Errorf("list user bookings: %w", err)
+	}
+	if eventID == 0 {
+		if len(mine) == 1 {
+			return mine[0], true, nil
+		}
+		return booking.BookingWithEvent{}, false, nil
+	}
+	for _, b := range mine {
+		if b.EventID == eventID {
+			return b, true, nil
+		}
+	}
+	return booking.BookingWithEvent{}, false, nil
+}
+
+// handleMyBookings lists the caller's active bookings with a cancel button
+// per booking.
+func (s *Service) handleMyBookings(ctx context.Context, c commandCtx) error {
+	mine, err := s.bookings.ListActiveByUser(ctx, c.user.ID, s.now().UTC())
+	if err != nil {
+		return fmt.Errorf("list user bookings: %w", err)
+	}
+	if len(mine) == 0 {
+		return s.sendText(ctx, c.peerID, "У вас нет активных записей. Ближайшие игры: «игры».", "")
+	}
+
+	var b strings.Builder
+	b.WriteString("Ваши записи:\n")
+	rows := make([][]Button, 0, len(mine))
+	for _, m := range mine {
+		status := "в составе"
+		if m.Status == booking.StatusWaitlist {
+			status = "в резерве"
+		}
+		fmt.Fprintf(&b, "\n• %s — %s (%s)\n", m.EventTitle, s.formatWhen(m.EventStartsAt), status)
+		rows = append(rows, []Button{
+			TextButton("Отменить: "+m.EventTitle, EventCommandPayload(cmdCancelBooking, m.EventID), ColorNegative),
+		})
+	}
+	kb, err := (Keyboard{Inline: true, Buttons: rows}).Marshal()
+	if err != nil {
+		return err
+	}
+	return s.sendText(ctx, c.peerID, b.String(), kb)
+}
+
+// refreshAnnouncement rewrites the game announcement with the current roster.
+// A game never announced in this chat has no reference, and then there is
+// nothing to update: the reply that triggered the call already told the user
+// what changed.
+func (s *Service) refreshAnnouncement(ctx context.Context, chatID, peerID, eventID int64) error {
+	ref, ok, err := s.announces.Get(ctx, eventID, chat.PlatformVK)
+	if err != nil {
+		return fmt.Errorf("get announcement: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+
+	ev, err := s.events.Get(ctx, chatID, eventID)
+	if err != nil {
+		return fmt.Errorf("get event: %w", err)
+	}
+
+	all, err := s.bookings.ListByEvent(ctx, eventID, booking.StatusConfirmed, booking.StatusWaitlist)
+	if err != nil {
+		return fmt.Errorf("list bookings: %w", err)
+	}
+	var confirmed, waitlist []booking.Booking
+	for _, b := range all {
+		if b.Status == booking.StatusConfirmed {
+			confirmed = append(confirmed, b)
+		} else {
+			waitlist = append(waitlist, b)
+		}
+	}
+
+	text, kb, err := s.renderAnnouncement(ev, confirmed, waitlist)
+	if err != nil {
+		return err
+	}
+	if _, err := s.messenger.EditMessage(ctx, peerID, ref.MessageID, text, kb); err != nil {
+		return fmt.Errorf("edit announcement: %w", err)
+	}
+	return nil
+}
+
+// gameDraft is what "создать игру" produces: tomorrow at 19:00, 12 мест,
+// «Волейбол» — adjusted by whatever the administrator typed.
+type gameDraft struct {
+	startsAt time.Time
+	title    string
+	location string
+	capacity int
+}
+
+var (
+	// timeRE matches "19:00" (and "19.00").
+	timeRE = regexp.MustCompile(`\b([01]?\d|2[0-3])[:.](\d{2})\b`)
+	// dateRE matches "27.09" and "27.09.2026".
+	dateRE = regexp.MustCompile(`\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b`)
+	// capacityRE matches a lone number: "12" or "12 мест".
+	capacityRE = regexp.MustCompile(`\b(\d{1,3})\b`)
+)
+
+// commandWords carry no title in "создать игру …" and are dropped from it.
+var commandWords = []string{
+	"создать", "создай", "создание", "новую", "новый", "игру", "игра", "игры",
+	"мест", "места", "человек", "чел", "на", "в", "и",
+}
+
+// parseCreateGame reads "создать игру [ДД.ММ[.ГГГГ]] [ЧЧ:ММ] [N мест]".
+// Anything left after the recognised parts becomes the title, and a missing
+// part falls back to a default — "создать игру" alone already creates a game.
+//
+// The bare number rule means a title with a number in it ("зал 3") is read as
+// the capacity: the documented way to pass it is "… 12 мест".
+func parseCreateGame(text string, now time.Time, loc *time.Location) gameDraft {
+	draft := gameDraft{title: defaultTitle, capacity: defaultCapacity}
+
+	rest := strings.ToLower(text)
+	day := now.In(loc).AddDate(0, 0, 1)
+	hour, minute := defaultHour, 0
+
+	if m := timeRE.FindStringSubmatch(rest); m != nil {
+		hour, _ = strconv.Atoi(m[1])
+		minute, _ = strconv.Atoi(m[2])
+		rest = strings.Replace(rest, m[0], " ", 1)
+	}
+	if m := dateRE.FindStringSubmatch(rest); m != nil {
+		dayNum, _ := strconv.Atoi(m[1])
+		month, _ := strconv.Atoi(m[2])
+		year := day.Year()
+		if m[3] != "" {
+			year, _ = strconv.Atoi(m[3])
+		}
+		if dayNum >= 1 && dayNum <= 31 && month >= 1 && month <= 12 {
+			day = time.Date(year, time.Month(month), dayNum, 0, 0, 0, 0, loc)
+		}
+		rest = strings.Replace(rest, m[0], " ", 1)
+	}
+	if m := capacityRE.FindStringSubmatch(rest); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			draft.capacity = n
+		}
+		rest = strings.Replace(rest, m[0], " ", 1)
+	}
+
+	draft.startsAt = time.Date(day.Year(), day.Month(), day.Day(), hour, minute, 0, 0, loc).UTC()
+	if title := titleOf(rest); title != "" {
+		draft.title = title
+	}
+	return draft
+}
+
+// titleOf keeps the words a human typed as the game name and drops the
+// command words around them.
+func titleOf(rest string) string {
+	fields := strings.Fields(rest)
+	kept := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if slices.Contains(commandWords, f) {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return strings.Join(kept, " ")
+}
+
 func (s *Service) sendText(ctx context.Context, peerID int64, text, keyboard string) error {
 	if _, err := s.messenger.SendMessage(ctx, peerID, text, keyboard); err != nil {
 		return fmt.Errorf("send message: %w", err)
@@ -278,12 +786,20 @@ func (s *Service) sendWelcome(ctx context.Context, peerID int64, displayName, ch
 	if err != nil {
 		return err
 	}
-	text := fmt.Sprintf("Привет, %s!\nЭто бот записи на игры чата «%s».\nКоманды появятся на следующих этапах.", displayName, chatTitle)
+	text := fmt.Sprintf(
+		"Привет, %s!\nЭто бот записи на игры чата «%s».\n\n"+
+			"Команды:\n"+
+			"• «игры» — ближайшие игры и запись\n"+
+			"• «мои записи» — ваши записи\n"+
+			"• «отмена» — отменить свою запись\n"+
+			"• «создать игру 27.09 19:00 12» — новая игра и анонс в беседу (только администратор)",
+		displayName, chatTitle)
 	return s.sendText(ctx, peerID, text, kb)
 }
 
-// defaultKeyboard is the placeholder keyboard for Phase 4. The buttons
-// send text commands; real booking actions arrive in later phases.
+// defaultKeyboard is the always-available set of buttons. "Создать игру" is
+// offered to everyone: a member who is not an administrator gets a clear
+// refusal instead of a hidden feature.
 func defaultKeyboard() (string, error) {
 	kb := Keyboard{
 		Inline: true,
@@ -293,32 +809,45 @@ func defaultKeyboard() (string, error) {
 				TextButton("Мои записи", CommandPayload(cmdMyBookings), ColorSecondary),
 			},
 			{
-				TextButton("Отмена записи", CommandPayload(cmdCancelBooking), ColorNegative),
+				TextButton("Создать игру", CommandPayload(cmdCreateGame), ColorPositive),
 			},
 		},
 	}
 	return kb.Marshal()
 }
 
-// commandOf maps a message text and/or a button payload to a command.
-func (s *Service) commandOf(text, payload string) string {
-	if cmd := PayloadCommand(payload); cmd != "" {
-		return cmd
+// parseCommand maps a message text and/or a button payload to a command and
+// an optional event id. A payload always wins: it carries the button's intent
+// together with the game it belongs to, while the text is only what the user
+// happened to type. Text checks run from the most specific phrase down, so
+// «создать игру» is not mistaken for «игры» and «мои записи» is not mistaken
+// for «записаться».
+func (s *Service) parseCommand(text, payload string) (string, int64) {
+	if cmd, eventID := ParsePayload(payload); cmd != "" {
+		return cmd, eventID
 	}
 	t := strings.ToLower(strings.TrimSpace(text))
 	switch {
 	case t == "/start" || t == "start" || t == "начать":
-		return cmdStart
+		return cmdStart, 0
 	case strings.Contains(t, "подключ"):
-		return cmdConnect
+		return cmdConnect, 0
+	case strings.Contains(t, "созда"):
+		return cmdCreateGame, 0
+	case strings.Contains(t, "мои запис"):
+		return cmdMyBookings, 0
+	case strings.Contains(t, "пропуск"):
+		return cmdSkip, 0
+	case strings.Contains(t, "отмен") || strings.Contains(t, "отпис"):
+		return cmdCancelBooking, 0
+	case strings.Contains(t, "резерв"):
+		return cmdBook, 0
+	case strings.Contains(t, "записат") || strings.Contains(t, "запиши"):
+		return cmdBook, 0
 	case strings.Contains(t, "игр"):
-		return cmdGames
-	case strings.Contains(t, "запис"):
-		return cmdMyBookings
-	case strings.Contains(t, "отмен"):
-		return cmdCancelBooking
+		return cmdGames, 0
 	}
-	return ""
+	return "", 0
 }
 
 const (

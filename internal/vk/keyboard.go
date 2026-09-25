@@ -46,9 +46,17 @@ func TextButton(label, payload string, color ButtonColor) Button {
 // CommandPayload wraps a command name into the JSON payload VK forwards
 // with the button press.
 func CommandPayload(command string) string {
+	return EventCommandPayload(command, 0)
+}
+
+// EventCommandPayload is the payload of a button that acts on a specific
+// game: the command plus the internal event id. The label of such a button
+// carries no state, so the same "Записаться" can appear under every game.
+func EventCommandPayload(command string, eventID int64) string {
 	raw, err := json.Marshal(struct {
 		Command string `json:"command"`
-	}{command})
+		EventID int64  `json:"event_id,omitempty"`
+	}{command, eventID})
 	if err != nil {
 		return "{}"
 	}
@@ -58,13 +66,21 @@ func CommandPayload(command string) string {
 // PayloadCommand reads the command out of a VK payload string. An empty or
 // unparseable payload yields an empty command.
 func PayloadCommand(payload string) string {
+	command, _ := ParsePayload(payload)
+	return command
+}
+
+// ParsePayload reads the command and the optional event id out of a VK
+// payload string. An empty or unparseable payload yields zero values.
+func ParsePayload(payload string) (command string, eventID int64) {
 	var p struct {
 		Command string `json:"command"`
+		EventID int64  `json:"event_id"`
 	}
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
-		return ""
+		return "", 0
 	}
-	return p.Command
+	return p.Command, p.EventID
 }
 
 // Marshal returns the keyboard as the JSON string VK expects in the
