@@ -3,6 +3,7 @@ package vk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,13 @@ type fakeMessenger struct {
 	answers  []answeredEvent
 	pinned   []int64
 	userName string
+	// editErr makes EditMessage fail: обновление анонса не должно ломать
+	// действие человека, который нажал кнопку.
+	editErr error
+	// sendZero imitates VK: в беседе messages.send отвечает 0 вместо id, и
+	// тогда id последнего своего сообщения читается из беседы (lastCMID).
+	sendZero bool
+	lastCMID int64
 }
 
 type sentMessage struct {
@@ -54,10 +62,20 @@ type answeredEvent struct {
 
 func (f *fakeMessenger) SendMessage(_ context.Context, peerID int64, text, keyboard string) (int64, error) {
 	f.sent = append(f.sent, sentMessage{PeerID: peerID, Text: text, Keyboard: keyboard})
+	if f.sendZero {
+		return 0, nil
+	}
 	return int64(len(f.sent)), nil
 }
 
+func (f *fakeMessenger) LastOwnConversationMessageID(_ context.Context, peerID int64) (int64, error) {
+	return f.lastCMID, nil
+}
+
 func (f *fakeMessenger) EditMessage(_ context.Context, peerID, messageID int64, text, keyboard string) (int64, error) {
+	if f.editErr != nil {
+		return 0, f.editErr
+	}
 	f.edits = append(f.edits, editedMessage{PeerID: peerID, MessageID: messageID, Text: text, Keyboard: keyboard})
 	return messageID, nil
 }
@@ -1205,8 +1223,179 @@ func TestCallbackCreateGameSkipsExisting(t *testing.T) {
 	if len(h.events.created) != 0 {
 		t.Fatal("the same game must not be announced twice")
 	}
-	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "уже создана") {
-		t.Fatalf("reply: %+v", h.msg.sent)
+	if len(h.msg.sent) != 2 {
+		t.Fatalf("want the announcement and the note, got %+v", h.msg.sent)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Состав") {
+		t.Fatalf("the announcement must be posted again: %+v", h.msg.sent[0])
+	}
+	if !strings.Contains(h.msg.sent[1].Text, "уже создана") {
+		t.Fatalf("note: %+v", h.msg.sent[1])
+	}
+}
+
+// --- Phase 6: id сообщения анонса ---
+
+// Нажатие кнопки самого анонса доносит id этого сообщения: в беседе
+// messages.send отвечает 0, поэтому только так бот узнаёт, что переписывать.
+func TestCallbackAnnouncementPressLearnsMessageID(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+	}}
+	// Анонс отправлен, но VK вернул 0: id пока неизвестен.
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047"}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 777, AnnouncementCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.anns.ref.MessageID != 777 {
+		t.Fatalf("the announcement id must be remembered: %+v", h.anns.saved)
+	}
+	if len(h.msg.pinned) != 1 || h.msg.pinned[0] != 777 {
+		t.Fatalf("the announcement must be pinned once its id is known: %+v", h.msg.pinned)
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "1 - Иван Петров" {
+		t.Fatalf("seat line: %+v", h.msg.sent)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 777 {
+		t.Fatalf("announcement must be rewritten with the learned id: %+v", h.msg.edits)
+	}
+}
+
+// Известный id не подменяется нажатием на другое сообщение: анонс всегда один
+// и тот же, иначе состав начал бы обновлять чужую переписку.
+func TestCallbackAnnouncementIDNotOverwritten(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 777, AnnouncementCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.anns.saved) != 0 {
+		t.Fatalf("the known id must stay: %+v", h.anns.saved)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 615 {
+		t.Fatalf("announcement must keep its message: %+v", h.msg.edits)
+	}
+}
+
+// Анонс живёт в своей беседе: id, пришедший из чужой, не подходит.
+func TestCallbackAnnouncementIDFromAnotherChatIgnored(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000999"}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 777, AnnouncementCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.anns.ref.MessageID != 0 {
+		t.Fatalf("another chat must not hand the id over: %+v", h.anns.saved)
+	}
+}
+
+// Кнопка из списка игр не считается анонсом: её нажатие не должно связывать id
+// этого сообщения с анонсом.
+func TestCallbackGamesListPressDoesNotLearnAnnouncementID(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047"}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 777, EventCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if h.anns.ref.MessageID != 0 {
+		t.Fatalf("a list button must not claim the announcement id: %+v", h.anns.saved)
+	}
+}
+
+// Неудача с обновлением анонса не отменяет запись: человек уже записан, и ему
+// отвечают обычной строчкой и всплывашкой.
+func TestCallbackAnnouncementEditFailureKeepsBooking(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
+	h.anns.has = true
+	h.msg.editErr = errors.New("vk: 15 Access denied")
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 900, EventCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 1 {
+		t.Fatalf("the booking must happen: %+v", h.books.created)
+	}
+	if len(h.msg.sent) != 1 || h.msg.sent[0].Text != "1 - Иван Петров" {
+		t.Fatalf("seat line: %+v", h.msg.sent)
+	}
+	if !strings.Contains(snackbar(t, h), "Вы записаны: место 1") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
+	}
+}
+
+// В беседе VK отвечает на messages.send нулём: id анонса бот читает из самой
+// беседы (последнее сообщение — только что отправленный анонс) и запоминает, а
+// заодно пробует закрепить его.
+func TestCallbackCreateGameLearnsAnnouncementIDFromChat(t *testing.T) {
+	h := newHarness(t, true)
+	h.msg.sendZero = true
+	h.msg.lastCMID = 615
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/старт", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "Состав") {
+		t.Fatalf("announcement: %+v", h.msg.sent)
+	}
+	if h.anns.ref.MessageID != 615 {
+		t.Fatalf("the announcement id must be read from the chat: %+v", h.anns.saved)
+	}
+	if len(h.msg.pinned) != 1 || h.msg.pinned[0] != 615 {
+		t.Fatalf("the announcement must be pinned: %+v", h.msg.pinned)
+	}
+}
+
+// Если id прочитать не удалось, анонс всё равно отправлен: id выучится по
+// нажатию на кнопку самого анонса.
+func TestCallbackCreateGameUnknownAnnouncementID(t *testing.T) {
+	h := newHarness(t, true)
+	h.msg.sendZero = true // lastCMID остаётся нулевым
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/старт", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("announcement must be posted: %+v", h.msg.sent)
+	}
+	if h.anns.ref.MessageID != 0 {
+		t.Fatalf("the id stays unknown: %+v", h.anns.saved)
+	}
+	if len(h.msg.pinned) != 0 {
+		t.Fatalf("there is nothing to pin: %+v", h.msg.pinned)
 	}
 }
 
@@ -1245,6 +1434,31 @@ func TestCallbackSettingsScreenForAdmin(t *testing.T) {
 	}
 	if cmd, _ := ParsePayload(btn.Action.Payload); cmd != cmdSlotRemove {
 		t.Fatalf("first button: %q", btn.Action.Payload)
+	}
+}
+
+// Экран настроек, открытый кнопкой, переписывает то самое сообщение: иначе в
+// беседе копился бы новый экран на каждое нажатие.
+func TestCallbackSettingsButtonRewritesItsMessage(t *testing.T) {
+	h := newHarness(t, true)
+	h.sched.slots = []schedule.Slot{{ChatID: 1, Weekday: 0, Minutes: 10 * 60}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 85, CommandPayload(cmdSettings)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("a press must not post a new screen: %+v", h.msg.sent)
+	}
+	if len(h.msg.edits) != 1 || h.msg.edits[0].MessageID != 85 {
+		t.Fatalf("edits: %+v", h.msg.edits)
+	}
+	if !strings.Contains(h.msg.edits[0].Text, "Сейчас: вс 10:00") {
+		t.Fatalf("screen: %q", h.msg.edits[0].Text)
+	}
+	if strings.HasPrefix(h.msg.edits[0].Text, "\n") {
+		t.Fatalf("the screen must not start with an empty note line: %q", h.msg.edits[0].Text)
 	}
 }
 

@@ -56,8 +56,12 @@ func NewClient(token, groupID string, opts ...ClientOption) *Client {
 }
 
 // SendMessage sends a text message to a peer (user or conversation) and
-// returns the VK message id. random_id makes repeated sends of the same
+// returns the id VK reports. random_id makes repeated sends of the same
 // logical message idempotent within VK's dedup window.
+//
+// В беседе VK отвечает 0: у сообщения там нет отдельного id, есть только
+// conversation_message_id, который выдают события нажатий (message_event).
+// Поэтому id анонса бот узнаёт при первом нажатии на его же кнопку.
 func (c *Client) SendMessage(ctx context.Context, peerID int64, text, keyboard string) (int64, error) {
 	params := url.Values{}
 	params.Set("peer_id", strconv.FormatInt(peerID, 10))
@@ -78,25 +82,41 @@ func (c *Client) SendMessage(ctx context.Context, peerID int64, text, keyboard s
 	return msgID, nil
 }
 
+// targetMessageParam names the message to act on: VK различает беседу и личный
+// диалог. В беседе сообщение адресуется только conversation_message_id
+// (message_id там не существует и VK отвечает 15 Access denied), в диалоге —
+// обычным message_id.
+func targetMessageParam(params url.Values, peerID, messageID int64) {
+	if isConversation(peerID) {
+		params.Set("conversation_message_id", strconv.FormatInt(messageID, 10))
+		return
+	}
+	params.Set("message_id", strconv.FormatInt(messageID, 10))
+}
+
 // PinMessage pins a message in the conversation (messages.pin), so the game
 // announcement with the roster stays at the top of the chat instead of
-// scrolling away. VK allows this for chat administrators; when it is not
-// allowed the caller logs it and the announcement still works.
+// scrolling away. VK allows this to the owner of the conversation: сообществу,
+// которое лишь администратор чужой беседы, VK отвечает 925. The caller logs
+// the refusal and the announcement keeps working.
 func (c *Client) PinMessage(ctx context.Context, peerID, messageID int64) error {
 	params := url.Values{}
 	params.Set("peer_id", strconv.FormatInt(peerID, 10))
-	params.Set("message_id", strconv.FormatInt(messageID, 10))
+	targetMessageParam(params, peerID, messageID)
 
 	raw, err := c.call(ctx, "messages.pin", params)
 	if err != nil {
 		return err
 	}
-	var ok int
-	if err := json.Unmarshal(raw, &ok); err != nil {
+	var pinned struct {
+		ConversationMessageID int64 `json:"conversation_message_id"`
+		ID                    int64 `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &pinned); err != nil {
 		return fmt.Errorf("parse messages.pin response: %w", err)
 	}
-	if ok != 1 {
-		return fmt.Errorf("messages.pin: unexpected response %d", ok)
+	if pinned.ConversationMessageID == 0 && pinned.ID == 0 {
+		return fmt.Errorf("messages.pin: unexpected response %s", string(raw))
 	}
 	return nil
 }
@@ -107,7 +127,7 @@ func (c *Client) PinMessage(ctx context.Context, peerID, messageID int64) error 
 func (c *Client) EditMessage(ctx context.Context, peerID, messageID int64, text, keyboard string) (int64, error) {
 	params := url.Values{}
 	params.Set("peer_id", strconv.FormatInt(peerID, 10))
-	params.Set("message_id", strconv.FormatInt(messageID, 10))
+	targetMessageParam(params, peerID, messageID)
 	params.Set("message", text)
 	if keyboard != "" {
 		params.Set("keyboard", keyboard)
@@ -228,6 +248,57 @@ func (c *Client) GetConversationTitle(ctx context.Context, peerID int64) (string
 		return "", fmt.Errorf("messages.getConversationsById: empty title for peer %d", peerID)
 	}
 	return title, nil
+}
+
+// LastOwnConversationMessageID returns the conversation_message_id of the last
+// message the community itself posted to a conversation.
+//
+// В беседе messages.send отвечает 0 вместо id, поэтому единственный способ
+// узнать, куда легло только что отправленное сообщение, — прочитать саму
+// беседу: берём id последнего сообщения и проверяем, что оно наше (человек мог
+// успеть написать в промежутке). Ноль означает «не удалось определить»: тогда
+// id анонса выучится по нажатию на его же кнопку.
+func (c *Client) LastOwnConversationMessageID(ctx context.Context, peerID int64) (int64, error) {
+	params := url.Values{}
+	params.Set("peer_ids", strconv.FormatInt(peerID, 10))
+
+	raw, err := c.call(ctx, "messages.getConversationsById", params)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Items []struct {
+			LastConversationMessageID int64 `json:"last_conversation_message_id"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return 0, fmt.Errorf("parse messages.getConversationsById response: %w", err)
+	}
+	if len(resp.Items) == 0 || resp.Items[0].LastConversationMessageID == 0 {
+		return 0, nil
+	}
+	cmid := resp.Items[0].LastConversationMessageID
+
+	raw, err = c.call(ctx, "messages.getByConversationMessageId", url.Values{
+		"peer_id":                  {strconv.FormatInt(peerID, 10)},
+		"conversation_message_ids": {strconv.FormatInt(cmid, 10)},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var msgs struct {
+		Items []struct {
+			FromID int64 `json:"from_id"`
+			Out    int   `json:"out"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &msgs); err != nil {
+		return 0, fmt.Errorf("parse messages.getByConversationMessageId response: %w", err)
+	}
+	if len(msgs.Items) == 0 || msgs.Items[0].Out != 1 || msgs.Items[0].FromID != -c.groupID {
+		return 0, nil
+	}
+	return cmid, nil
 }
 
 // IsConversationAdmin reports whether userID administers the conversation

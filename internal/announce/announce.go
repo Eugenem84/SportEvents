@@ -17,6 +17,12 @@ import (
 var ErrInvalid = errors.New("invalid announcement ref")
 
 // Ref points at the message that announces an event in an external chat.
+//
+// MessageID is the id VK expects when the message is addressed: в беседе это
+// conversation_message_id. Zero means the id is not known yet — сообщество
+// получает 0 в ответ на messages.send в беседу, и id анонса узнаётся при
+// первом нажатии на кнопку самого анонса. Пока id неизвестен, анонс просто
+// не переписывается.
 type Ref struct {
 	EventID        int64
 	Platform       string
@@ -34,10 +40,11 @@ func NewService(pool *pgxpool.Pool) *Service {
 }
 
 // Save remembers the announcement message of an event. The last message wins:
-// announcing the same event again replaces the reference.
+// announcing the same event again replaces the reference. A zero MessageID is
+// allowed and means "the message exists, its id is not known yet".
 func (s *Service) Save(ctx context.Context, ref Ref) error {
 	if ref.EventID == 0 || strings.TrimSpace(ref.Platform) == "" ||
-		strings.TrimSpace(ref.ExternalChatID) == "" || ref.MessageID == 0 {
+		strings.TrimSpace(ref.ExternalChatID) == "" || ref.MessageID < 0 {
 		return ErrInvalid
 	}
 

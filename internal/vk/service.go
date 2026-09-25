@@ -26,6 +26,10 @@ type Messenger interface {
 	// announcement keeps the roster of participants in one message instead of
 	// posting a new one on every booking.
 	EditMessage(ctx context.Context, peerID, messageID int64, text, keyboard string) (int64, error)
+	// LastOwnConversationMessageID names the id of the last message the
+	// community posted to a conversation. В беседе messages.send отвечает 0,
+	// поэтому id только что отправленного анонса читается из самой беседы.
+	LastOwnConversationMessageID(ctx context.Context, peerID int64) (int64, error)
 	// PinMessage pins a message at the top of the conversation, so the
 	// announcement with the roster does not scroll away.
 	PinMessage(ctx context.Context, peerID, messageID int64) error
@@ -393,9 +397,44 @@ func (s *Service) handleMessageEvent(ctx context.Context, ev messageEvent) error
 		vkUserID:  ev.UserID,
 		vkEventID: ev.EventID,
 	}
+	// Нажатие на кнопку самого анонса — единственный способ узнать id этого
+	// сообщения в беседе: messages.send отвечает там 0. Запоминаем его, чтобы
+	// дальше переписывать анонс на месте.
+	s.rememberAnnouncementID(ctx, ev.PeerID, parsed, ev.ConversationMessageID)
 	err = s.handleCommand(ctx, c)
 	answered = c.answered
 	return err
+}
+
+// rememberAnnouncementID fills in the id of the announcement message once a
+// press on the announcement itself reports it. Nothing is overwritten: only a
+// reference whose id is still unknown learns it, and only from the chat that
+// reference belongs to.
+func (s *Service) rememberAnnouncementID(ctx context.Context, peerID int64, p Payload, messageID int64) {
+	if !p.Announce || p.EventID == 0 || messageID == 0 {
+		return
+	}
+	ref, ok, err := s.announces.Get(ctx, p.EventID, chat.PlatformVK)
+	if err != nil {
+		s.log.Printf("vk: get announcement of game %d: %v", p.EventID, err)
+		return
+	}
+	external := strconv.FormatInt(peerID, 10)
+	if !ok || ref.MessageID != 0 || ref.ExternalChatID != external {
+		return
+	}
+	ref.MessageID = messageID
+	if err := s.announces.Save(ctx, ref); err != nil {
+		s.log.Printf("vk: remember announcement message of game %d: %v", p.EventID, err)
+		return
+	}
+
+	// Только теперь анонс можно закрепить: при отправке VK не называет id
+	// сообщения в беседе. Закрепление разрешено владельцу беседы, остальным VK
+	// отвечает 925 — это не ошибка записи, поэтому просто пишем в лог.
+	if err := s.messenger.PinMessage(ctx, peerID, messageID); err != nil {
+		s.log.Printf("vk: cannot pin announcement of game %d: %v", p.EventID, err)
+	}
 }
 
 // handleConnect registers the conversation as an internal Chat. Only a VK
@@ -518,12 +557,16 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 	}
 
 	// A scheduled game is created by a single press, so a second press must
-	// not announce the same game twice.
+	// not announce the same game twice: the existing announcement is simply
+	// posted again, with the current roster.
 	if existing, ok, err := s.findGameAt(ctx, c.chat.ID, startsAt); err != nil {
 		return err
 	} else if ok {
+		if err := s.announceGame(ctx, c, existing.Event); err != nil {
+			return err
+		}
 		return s.sendText(ctx, c.peerID, fmt.Sprintf(
-			"Игра на %s уже создана — записывайтесь по анонсу выше.", s.formatWhenShort(existing.StartsAt)), "")
+			"Игра на %s уже создана — обновил анонс с составом.", s.formatWhenShort(existing.StartsAt)), "")
 	}
 
 	ev, err := s.events.Create(ctx, event.CreateInput{
@@ -536,16 +579,37 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 	if err != nil {
 		return fmt.Errorf("create event: %w", err)
 	}
+	return s.announceGame(ctx, c, ev)
+}
 
-	// The announcement is the message everyone signs up under: remember its
-	// id so later changes rewrite this message instead of posting a new one.
-	text, kb, err := s.renderAnnouncement(ev, nil, nil)
+// announceGame posts the announcement everyone signs up under and remembers
+// where it is. VK answers messages.send with 0 in a conversation, so the id
+// stays unknown until someone presses a button of the announcement itself;
+// until then the roster is not rewritten in place.
+func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Event) error {
+	confirmed, waitlist, err := s.roster(ctx, ev.ID)
+	if err != nil {
+		return err
+	}
+
+	text, kb, err := s.renderAnnouncement(ev, confirmed, waitlist)
 	if err != nil {
 		return err
 	}
 	msgID, err := s.messenger.SendMessage(ctx, c.peerID, text, kb)
 	if err != nil {
 		return fmt.Errorf("send announcement: %w", err)
+	}
+	if msgID == 0 {
+		// VK не называет id сообщения в беседе: читаем id последнего сообщения
+		// беседы — только что отправленный анонс и есть последнее.
+		last, err := s.messenger.LastOwnConversationMessageID(ctx, c.peerID)
+		switch {
+		case err != nil:
+			s.log.Printf("vk: cannot read the announcement id of game %d: %v", ev.ID, err)
+		default:
+			msgID = last
+		}
 	}
 	if err := s.announces.Save(ctx, announce.Ref{
 		EventID:        ev.ID,
@@ -556,12 +620,31 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 		return fmt.Errorf("save announcement: %w", err)
 	}
 
-	// Закрепляем анонс: состав и кнопки остаются на виду у всей беседы, а не
-	// уезжают вверх с перепиской. Если VK не разрешит — работаем дальше.
-	if err := s.messenger.PinMessage(ctx, c.peerID, msgID); err != nil {
-		s.log.Printf("vk: cannot pin announcement of game %d: %v", ev.ID, err)
+	// Пробуем закрепить анонс, чтобы состав не уезжал вверх вместе с
+	// перепиской. VK разрешает это владельцу беседы; сообществу, которое в
+	// беседе лишь администратор, он отвечает 925 — тогда просто живём дальше.
+	if msgID != 0 {
+		if err := s.messenger.PinMessage(ctx, c.peerID, msgID); err != nil {
+			s.log.Printf("vk: cannot pin announcement of game %d: %v", ev.ID, err)
+		}
 	}
 	return nil
+}
+
+// roster splits the bookings of an event into the lineup and the reserve.
+func (s *Service) roster(ctx context.Context, eventID int64) (confirmed, waitlist []booking.Booking, err error) {
+	all, err := s.bookings.ListByEvent(ctx, eventID, booking.StatusConfirmed, booking.StatusWaitlist)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list bookings: %w", err)
+	}
+	for _, b := range all {
+		if b.Status == booking.StatusConfirmed {
+			confirmed = append(confirmed, b)
+		} else {
+			waitlist = append(waitlist, b)
+		}
+	}
+	return confirmed, waitlist, nil
 }
 
 // gameStart decides when the game starts: an explicit date in the text wins,
@@ -649,9 +732,12 @@ func (s *Service) renderAnnouncement(ev event.Event, confirmed, waitlist []booki
 		fmt.Fprintf(&b, "\nРезерв (%d): %s\n", len(waitlist), reserveLine(waitlist))
 	}
 
+	// Кнопки анонса несут признак announce: их нажатие сообщает id самого
+	// анонса, без этого бот не смог бы переписать его на месте (в беседе
+	// messages.send отвечает 0 вместо id).
 	kb := Keyboard{Inline: true, Buttons: [][]Button{
-		{CallbackButton("Иду", EventCommandPayload(cmdAttend, ev.ID), ColorPositive)},
-		{CallbackButton("Не иду", EventCommandPayload(cmdSkip, ev.ID), ColorNegative)},
+		{CallbackButton("Иду", AnnouncementCommandPayload(cmdAttend, ev.ID), ColorPositive)},
+		{CallbackButton("Не иду", AnnouncementCommandPayload(cmdSkip, ev.ID), ColorNegative)},
 	}}
 	raw, err := kb.Marshal()
 	if err != nil {
@@ -740,9 +826,7 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 		if err := s.sendText(ctx, c.peerID, fmt.Sprintf("резерв %d - %s", position, b.PlayerName), ""); err != nil {
 			return err
 		}
-		if err := s.refreshAnnouncement(ctx, c.chat.ID, c.peerID, ev.ID); err != nil {
-			return err
-		}
+		s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 		return s.notify(ctx, c, fmt.Sprintf("Мест нет — вы в резерве (%d-й)", position))
 	}
 
@@ -753,9 +837,7 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 	if err := s.sendText(ctx, c.peerID, fmt.Sprintf("%d - %s", seat, b.PlayerName), ""); err != nil {
 		return err
 	}
-	if err := s.refreshAnnouncement(ctx, c.chat.ID, c.peerID, ev.ID); err != nil {
-		return err
-	}
+	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 	return s.notify(ctx, c, fmt.Sprintf("✅ Вы записаны: место %d", seat))
 }
 
@@ -828,9 +910,7 @@ func (s *Service) cancelFor(ctx context.Context, c *commandCtx) error {
 	if err := s.sendText(ctx, c.peerID, line, ""); err != nil {
 		return err
 	}
-	if err := s.refreshAnnouncement(ctx, c.chat.ID, c.peerID, me.EventID); err != nil {
-		return err
-	}
+	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, me.EventID)
 	return s.notify(ctx, c, "Запись отменена")
 }
 
@@ -977,13 +1057,15 @@ func (s *Service) handleMyBookings(ctx context.Context, c *commandCtx) error {
 // refreshAnnouncement rewrites the game announcement with the current roster.
 // A game never announced in this chat has no reference, and then there is
 // nothing to update: the reply that triggered the call already told the user
-// what changed.
+// what changed. The same goes for an announcement whose id the bot does not
+// know yet (VK answers messages.send with 0 in a conversation): the id arrives
+// with the first press on the announcement's own button.
 func (s *Service) refreshAnnouncement(ctx context.Context, chatID, peerID, eventID int64) error {
 	ref, ok, err := s.announces.Get(ctx, eventID, chat.PlatformVK)
 	if err != nil {
 		return fmt.Errorf("get announcement: %w", err)
 	}
-	if !ok {
+	if !ok || ref.MessageID == 0 {
 		return nil
 	}
 
@@ -992,17 +1074,9 @@ func (s *Service) refreshAnnouncement(ctx context.Context, chatID, peerID, event
 		return fmt.Errorf("get event: %w", err)
 	}
 
-	all, err := s.bookings.ListByEvent(ctx, eventID, booking.StatusConfirmed, booking.StatusWaitlist)
+	confirmed, waitlist, err := s.roster(ctx, eventID)
 	if err != nil {
-		return fmt.Errorf("list bookings: %w", err)
-	}
-	var confirmed, waitlist []booking.Booking
-	for _, b := range all {
-		if b.Status == booking.StatusConfirmed {
-			confirmed = append(confirmed, b)
-		} else {
-			waitlist = append(waitlist, b)
-		}
+		return err
 	}
 
 	text, kb, err := s.renderAnnouncement(ev, confirmed, waitlist)
@@ -1013,6 +1087,16 @@ func (s *Service) refreshAnnouncement(ctx context.Context, chatID, peerID, event
 		return fmt.Errorf("edit announcement: %w", err)
 	}
 	return nil
+}
+
+// refreshAnnouncementLogged updates the announcement and only writes a failure
+// to the log: the booking itself already happened and was reported, so a stale
+// announcement must not turn into an error for the person who pressed the
+// button.
+func (s *Service) refreshAnnouncementLogged(ctx context.Context, chatID, peerID, eventID int64) {
+	if err := s.refreshAnnouncement(ctx, chatID, peerID, eventID); err != nil {
+		s.log.Printf("vk: refresh announcement of game %d: %v", eventID, err)
+	}
 }
 
 // gameDraft is what "создать игру" produces: tomorrow at 19:00, 12 мест,
@@ -1126,17 +1210,16 @@ func titleOf(rest string) string {
 	return strings.Join(kept, " ")
 }
 
-// handleSettings shows the schedule screen of the chat.
+// handleSettings shows the schedule screen of the chat. When it was opened by a
+// button, the screen rewrites the very message the button was pressed on (VK
+// tells us its id), so the chat keeps one live settings message instead of a
+// pile of them; a typed command posts a new one.
 func (s *Service) handleSettings(ctx context.Context, c *commandCtx) error {
 	ok, err := s.requireAdmin(ctx, c, settingsRefusal)
 	if err != nil || !ok {
 		return err
 	}
-	text, kb, err := s.renderSettings(ctx, c.chat)
-	if err != nil {
-		return err
-	}
-	return s.sendText(ctx, c.peerID, text, kb)
+	return s.refreshSettings(ctx, c, "")
 }
 
 // handleSlotAdd records one weekday of the schedule. The weekday and the time
@@ -1202,7 +1285,9 @@ func (s *Service) refreshSettings(ctx context.Context, c *commandCtx, note strin
 	if err != nil {
 		return err
 	}
-	text = note + "\n\n" + text
+	if note != "" {
+		text = note + "\n\n" + text
+	}
 
 	if c.messageID != 0 {
 		if _, err := s.messenger.EditMessage(ctx, c.peerID, c.messageID, text, kb); err != nil {

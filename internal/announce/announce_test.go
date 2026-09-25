@@ -60,6 +60,36 @@ func TestSaveReplacesExisting(t *testing.T) {
 	}
 }
 
+// Нулевой MessageID — это «анонс есть, id пока неизвестен»: в беседе VK
+// отвечает 0 на messages.send, и id приходит с первым нажатием на сам анонс.
+func TestSaveUnknownMessageID(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	eventID := insertEvent(t, ctx, pool)
+
+	if err := svc.Save(ctx, announce.Ref{EventID: eventID, Platform: "vk", ExternalChatID: "2000000002"}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := svc.Get(ctx, eventID, "vk")
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if got.MessageID != 0 {
+		t.Fatalf("unknown id must stay zero, got %d", got.MessageID)
+	}
+
+	// Нажатие на кнопку анонса доносит id — и он заменяет неизвестный.
+	if err := svc.Save(ctx, announce.Ref{EventID: eventID, Platform: "vk", ExternalChatID: "2000000002", MessageID: 85}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err = svc.Get(ctx, eventID, "vk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MessageID != 85 {
+		t.Fatalf("want the learned id, got %d", got.MessageID)
+	}
+}
+
 func TestGetUnknownPlatform(t *testing.T) {
 	ctx, svc, pool := setup(t)
 	eventID := insertEvent(t, ctx, pool)
@@ -85,7 +115,7 @@ func TestSaveInvalid(t *testing.T) {
 		"no event":    {Platform: "vk", ExternalChatID: "10", MessageID: 5},
 		"no platform": {EventID: 1, ExternalChatID: "10", MessageID: 5},
 		"no channel":  {EventID: 1, Platform: "vk", MessageID: 5},
-		"no message":  {EventID: 1, Platform: "vk", ExternalChatID: "10"},
+		"bad message": {EventID: 1, Platform: "vk", ExternalChatID: "10", MessageID: -1},
 	}
 	for name, ref := range cases {
 		if err := svc.Save(context.Background(), ref); !errors.Is(err, announce.ErrInvalid) {

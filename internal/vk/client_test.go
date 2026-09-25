@@ -3,10 +3,12 @@ package vk
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -313,6 +315,122 @@ func TestIsConversationAdminRejectsUnexpectedFlag(t *testing.T) {
 	c := NewClient("tok", "123", WithBaseURL(srv.URL))
 	if _, err := c.IsConversationAdmin(context.Background(), 2_000_000_047, 555); err == nil {
 		t.Fatal("want error for an unexpected is_admin value")
+	}
+}
+
+// В беседе сообщение адресуется только conversation_message_id: message_id там
+// не существует, и VK отвечает 15 Access denied. В личном диалоге — наоборот.
+func TestEditMessageTargetsChatByConversationMessageID(t *testing.T) {
+	cases := []struct {
+		name     string
+		peerID   int64
+		wantKey  string
+		wantMiss string
+	}{
+		{name: "conversation", peerID: 2_000_000_002, wantKey: "conversation_message_id", wantMiss: "message_id"},
+		{name: "direct message", peerID: 157109497, wantKey: "message_id", wantMiss: "conversation_message_id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got url.Values
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+				got, _ = url.ParseQuery(string(raw))
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"response":1}`))
+			}))
+			defer srv.Close()
+
+			c := NewClient("tok", "123", WithBaseURL(srv.URL))
+			if _, err := c.EditMessage(context.Background(), tc.peerID, 615, "Состав", ""); err != nil {
+				t.Fatal(err)
+			}
+			if got.Get(tc.wantKey) != "615" {
+				t.Fatalf("%s: %q, want 615", tc.wantKey, got.Get(tc.wantKey))
+			}
+			if got.Get(tc.wantMiss) != "" {
+				t.Fatalf("%s must not be sent, got %q", tc.wantMiss, got.Get(tc.wantMiss))
+			}
+		})
+	}
+}
+
+// messages.pin отвечает объектом закреплённого сообщения, а не 1: ответ без
+// объекта и без ошибки считается неудачей, иначе закрепление молча не работает.
+func TestPinMessageParsesPinnedObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		params, _ := url.ParseQuery(string(raw))
+		if params.Get("conversation_message_id") != "615" {
+			t.Errorf("conversation_message_id: %q", params.Get("conversation_message_id"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":{"conversation_message_id":615,"id":615}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	if err := c.PinMessage(context.Background(), 2_000_000_002, 615); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// id своего сообщения в беседе читается из беседы: messages.send отвечает 0.
+func TestLastOwnConversationMessageID(t *testing.T) {
+	cases := []struct {
+		name    string
+		last    int64
+		fromID  int64
+		out     int
+		wantCMI int64
+	}{
+		{name: "our message", last: 615, fromID: -241346632, out: 1, wantCMI: 615},
+		{name: "someone wrote after us", last: 616, fromID: 555, out: 0, wantCMI: 0},
+		{name: "no messages", last: 0, wantCMI: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+				params, _ := url.ParseQuery(string(raw))
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "getConversationsById"):
+					fmt.Fprintf(w, `{"response":{"count":1,"items":[{"last_message_id":7,"last_conversation_message_id":%d}]}}`, tc.last)
+				case strings.HasSuffix(r.URL.Path, "getByConversationMessageId"):
+					if params.Get("conversation_message_ids") != strconv.FormatInt(tc.last, 10) {
+						t.Errorf("conversation_message_ids: %q", params.Get("conversation_message_ids"))
+					}
+					fmt.Fprintf(w, `{"response":{"count":1,"items":[{"from_id":%d,"out":%d,"conversation_message_id":%d}]}}`,
+						tc.fromID, tc.out, tc.last)
+				default:
+					t.Errorf("unexpected method: %s", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			c := NewClient("tok", "241346632", WithBaseURL(srv.URL))
+			got, err := c.LastOwnConversationMessageID(context.Background(), 2_000_000_002)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.wantCMI {
+				t.Fatalf("cmid: want %d, got %d", tc.wantCMI, got)
+			}
+		})
+	}
+}
+
+func TestPinMessageEmptyResponseFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"response":0}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("tok", "123", WithBaseURL(srv.URL))
+	if err := c.PinMessage(context.Background(), 2_000_000_002, 615); err == nil {
+		t.Fatal("a response without a pinned message must be an error")
 	}
 }
 
