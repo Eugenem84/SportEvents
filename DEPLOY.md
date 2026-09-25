@@ -66,13 +66,19 @@ ssh dev-vps 'curl -sSI https://sportevent.dev.medovf2h.beget.tech/health'   # с
    `https://sportevent.dev.medovf2h.beget.tech/vk/callback`, версия API `5.199`
    (совпадает с `vkAPIVersion` в `internal/vk/client.go`).
 2. События: `message_new` и `message_event`.
-3. Строку подтверждения из этого же раздела — в `VK_CONFIRMATION_TOKEN`; если включён
-   секретный ключ, его значение — в `VK_SECRET`.
+3. Строку подтверждения — в `VK_CONFIRMATION_TOKEN`, **беря её из сообщества заново**, а не из
+   старого `.env`: VK меняет её при пересоздании сервера Callback API, и устаревшая строка выглядит
+   рабочей (`confirmation` → `200`), но сохранение URL в сообществе падает с ошибкой. Взять её можно
+   в панели («Работа с API → Callback API») или из API:
+   `curl -G https://api.vk.com/method/groups.getCallbackConfirmationCode -d "access_token=$VK_TOKEN" -d "group_id=$VK_GROUP_ID" -d v=5.199`.
+   Если включён секретный ключ, его значение — в `VK_SECRET`. После правки `.env` приложение
+   пересоздать (см. «Проверка» выше).
 4. Проверка: `bash smoke.sh` (раздел 2) — ответ на `{"type":"confirmation"}` должен совпасть
-   со строкой из `.env`, событие с чужим `group_id` — получить `403`, а своё событие
-   (`message_new`, `out=1`) — `200 ok`. Если в сообществе включён секретный ключ, дополнительно
-   проверяется отказ по чужому `secret` (`403`); при пустом `VK_SECRET` эта проверка не делается —
-   приложение обязано принимать события без ключа.
+   со строкой из `.env` **и** с той, что ожидает VK (сверка через `groups.getCallbackConfirmationCode`;
+   при недоступном VK API проверка пропускается), событие с чужим `group_id` — получить `403`,
+   а своё событие (`message_new`, `out=1`) — `200 ok`. Если в сообществе включён секретный ключ,
+   дополнительно проверяется отказ по чужому `secret` (`403`); при пустом `VK_SECRET` эта проверка
+   не делается — приложение обязано принимать события без ключа.
 5. Подключение беседы: бот должен состоять в беседе **администратором** — иначе
    `messages.getConversationMembers` (проверка прав инициатора) и
    `messages.getConversationsById` (название беседы) вернут ошибку. Администратор беседы
