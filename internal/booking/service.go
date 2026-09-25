@@ -245,6 +245,48 @@ func (s *Service) Cancel(ctx context.Context, eventID, bookingID int64) (CancelR
 	return result, nil
 }
 
+// CancelAllForEvent cancels every active booking of an event — the lineup and
+// the reserve — and reports how many were cancelled. It is what a called-off
+// game needs: nobody stays «записан» on a game that will not happen. Seats are
+// kept as they were (the announcement still shows who was in), and nobody is
+// promoted from the reserve: the whole game is off.
+func (s *Service) CancelAllForEvent(ctx context.Context, eventID int64) (int, error) {
+	if eventID == 0 {
+		return 0, ErrInvalid
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Блокируем событие: пока идёт отмена, новая запись не должна проскочить в
+	// уже отменяемую игру.
+	var lockedID int64
+	err = tx.QueryRow(ctx, `SELECT id FROM events WHERE id = $1 FOR UPDATE`, eventID).Scan(&lockedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrEventNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lock event: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE bookings
+		SET status = 'cancelled'
+		WHERE event_id = $1 AND status IN ('confirmed', 'waitlist')`,
+		eventID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("cancel bookings of event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // Get returns a booking scoped to an event, mirroring how the Event
 // service scopes an event to a chat.
 func (s *Service) Get(ctx context.Context, eventID, bookingID int64) (Booking, error) {

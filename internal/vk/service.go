@@ -69,12 +69,14 @@ type UserStore interface {
 	FindOrCreateUserByExternalID(ctx context.Context, platform, externalUserID, displayName string) (chat.User, error)
 }
 
-// EventStore is the event side of the bot: creating games and listing them
-// with their counters.
+// EventStore is the event side of the bot: creating games, listing them with
+// their counters, and calling a game off.
 type EventStore interface {
 	Create(ctx context.Context, in event.CreateInput) (event.Event, error)
 	Get(ctx context.Context, chatID, eventID int64) (event.Event, error)
 	ListUpcomingWithCounts(ctx context.Context, chatID int64, from time.Time, limit int) ([]event.EventSummary, error)
+	// Cancel calls a game off; ErrAlreadyCancelled means it was off already.
+	Cancel(ctx context.Context, chatID, eventID int64) (event.Event, error)
 }
 
 // BookingStore is the booking side of the bot: who is in the lineup, who is
@@ -82,6 +84,9 @@ type EventStore interface {
 type BookingStore interface {
 	Create(ctx context.Context, in booking.CreateInput) (booking.Booking, error)
 	Cancel(ctx context.Context, eventID, bookingID int64) (booking.CancelResult, error)
+	// CancelAllForEvent drops every active booking of an event: a called-off
+	// game must not leave people «записанными».
+	CancelAllForEvent(ctx context.Context, eventID int64) (int, error)
 	ListByEvent(ctx context.Context, eventID int64, statuses ...booking.Status) ([]booking.Booking, error)
 	ListActiveByUser(ctx context.Context, userID int64, from time.Time) ([]booking.BookingWithEvent, error)
 }
@@ -198,6 +203,8 @@ const (
 	cmdConnect       = "connect"
 	// cmdCreateGame creates a game and posts its announcement (admins only).
 	cmdCreateGame = "create"
+	// cmdCancelGame cancels a whole game and drops its bookings (admins only).
+	cmdCancelGame = "cancel_game"
 	// cmdAttend is the "Иду" button: sign up for the nearest game (or for the
 	// game in the payload).
 	cmdAttend = "attend"
@@ -217,7 +224,7 @@ const (
 // settingsRefusal and gamesRefusal answer members who are not chat admins.
 const (
 	settingsRefusal = "Настройки расписания может менять только администратор беседы."
-	gamesRefusal    = "Создавать игры может только администратор беседы."
+	gamesRefusal    = "Создавать и отменять игры может только администратор беседы."
 )
 
 const (
@@ -332,6 +339,8 @@ func (s *Service) handleCommand(ctx context.Context, c *commandCtx) error {
 		return s.handleGames(ctx, c)
 	case cmdCreateGame:
 		return s.handleCreateGame(ctx, c)
+	case cmdCancelGame:
+		return s.handleCancelGame(ctx, c)
 	case cmdBook, cmdAttend:
 		return s.handleAttend(ctx, c)
 	case cmdSkip:
@@ -582,13 +591,134 @@ func (s *Service) handleCreateGame(ctx context.Context, c *commandCtx) error {
 	return s.announceGame(ctx, c, ev, "")
 }
 
+// handleCancelGame calls a whole game off (admins only): the game stops taking
+// bookings, the bookings of everyone are dropped, and the announcement in the
+// chat turns into a cancelled one with no buttons under it. Without arguments
+// the nearest upcoming game goes; a date, a weekday or a time in the text picks
+// another one, and a button (the settings screen) names its game in the payload.
+func (s *Service) handleCancelGame(ctx context.Context, c *commandCtx) error {
+	ok, err := s.requireAdmin(ctx, c, gamesRefusal)
+	if err != nil || !ok {
+		return err
+	}
+
+	ev, ok, err := s.gameToCancel(ctx, c)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return s.noGameToCancel(ctx, c)
+	}
+
+	cancelled, err := s.events.Cancel(ctx, c.chat.ID, ev.ID)
+	switch {
+	case errors.Is(err, event.ErrAlreadyCancelled):
+		if c.vkEventID != "" {
+			return s.notify(ctx, c, "Игра уже отменена")
+		}
+		return s.sendText(ctx, c.chat.ID, c.peerID,
+			fmt.Sprintf("Игра на %s уже отменена.", s.formatWhenShort(ev.StartsAt)), "")
+	case err != nil:
+		return fmt.Errorf("cancel event: %w", err)
+	}
+
+	// Снимаем все записи: игра не состоится, «записанным» на неё оставаться
+	// нельзя. Из резерва при этом никто не поднимается — поднимать некуда.
+	removed, err := s.bookings.CancelAllForEvent(ctx, cancelled.ID)
+	if err != nil {
+		return fmt.Errorf("cancel bookings: %w", err)
+	}
+
+	line := fmt.Sprintf("❌ Игра на %s отменена.", s.formatWhenShort(cancelled.StartsAt))
+	switch {
+	case removed == 1:
+		line += " Снял одну запись."
+	case removed > 1:
+		line += fmt.Sprintf(" Снял записи: %d.", removed)
+	}
+	if err := s.sendText(ctx, c.chat.ID, c.peerID, line, ""); err != nil {
+		return err
+	}
+	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, cancelled.ID)
+	return s.notify(ctx, c, "Игра отменена")
+}
+
+// gameToCancel picks the game «отмена игры» refers to: the game of a pressed
+// button, otherwise the game matching the date, weekday or time in the text, and
+// with nothing to match — the nearest upcoming one.
+func (s *Service) gameToCancel(ctx context.Context, c *commandCtx) (event.Event, bool, error) {
+	if c.eventID != 0 {
+		ev, err := s.events.Get(ctx, c.chat.ID, c.eventID)
+		if errors.Is(err, event.ErrNotFound) {
+			return event.Event{}, false, nil
+		}
+		if err != nil {
+			return event.Event{}, false, fmt.Errorf("get event: %w", err)
+		}
+		return ev, true, nil
+	}
+
+	draft := parseCreateGame(c.text, s.now(), s.loc)
+	games, err := s.events.ListUpcomingWithCounts(ctx, c.chat.ID, s.now().UTC(), gamesLimit)
+	if err != nil {
+		return event.Event{}, false, fmt.Errorf("list games: %w", err)
+	}
+	if len(games) == 0 {
+		return event.Event{}, false, nil
+	}
+	if !draft.dateSet && draft.weekday < 0 {
+		return games[0].Event, true, nil
+	}
+	for _, g := range games {
+		local := g.StartsAt.In(s.loc)
+		switch {
+		case draft.dateSet && g.StartsAt.Equal(draft.startsAt):
+			return g.Event, true, nil
+		case draft.weekday >= 0 && int(local.Weekday()) == draft.weekday &&
+			sameClock(local, draft.startsAt.In(s.loc), draft.timeSet):
+			return g.Event, true, nil
+		}
+	}
+	return event.Event{}, false, nil
+}
+
+// mentionsGame reports whether the words after a slash command point at a game
+// rather than at the caller's own booking: «/отмена игру», «/отмена игры».
+func mentionsGame(args string) bool {
+	args = strings.ToLower(strings.TrimSpace(args))
+	for _, w := range strings.Fields(args) {
+		if strings.HasPrefix(w, "игр") || w == "event" || w == "game" {
+			return true
+		}
+	}
+	return false
+}
+
+// sameClock reports whether two times have the same time of day. want=false
+// means the time was not typed, and then any time of that day matches.
+func sameClock(a, b time.Time, want bool) bool {
+	if !want {
+		return true
+	}
+	return a.Hour() == b.Hour() && a.Minute() == b.Minute()
+}
+
+// noGameToCancel answers when there is nothing to call off.
+func (s *Service) noGameToCancel(ctx context.Context, c *commandCtx) error {
+	if c.vkEventID != "" {
+		return s.notify(ctx, c, "Открытых игр нет")
+	}
+	return s.sendText(ctx, c.chat.ID, c.peerID,
+		"Открытых игр для отмены не нашёл. Ближайшие игры: «/игры».", "")
+}
+
 // announceGame posts the announcement everyone signs up under and remembers
 // where it is. note replaces the default "sign-ups are open" line. VK answers
 // messages.send with 0 in a conversation, so the id stays unknown until VK
 // names the last message or someone presses a button of the announcement
 // itself; until then the roster is not rewritten in place.
 func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Event, note string) error {
-	confirmed, waitlist, err := s.roster(ctx, ev.ID)
+	confirmed, waitlist, err := s.roster(ctx, ev)
 	if err != nil {
 		return err
 	}
@@ -642,20 +772,40 @@ func (s *Service) announceGame(ctx context.Context, c *commandCtx, ev event.Even
 	return s.sendText(ctx, c.chat.ID, c.peerID, note, signUp)
 }
 
-// roster splits the bookings of an event into the lineup and the reserve.
-func (s *Service) roster(ctx context.Context, eventID int64) (confirmed, waitlist []booking.Booking, err error) {
-	all, err := s.bookings.ListByEvent(ctx, eventID, booking.StatusConfirmed, booking.StatusWaitlist)
+// roster returns the lineup and the reserve of a game. Для отменённой игры
+// записи уже сняты, но состав всё равно нужен: номер места помнит, кто был в
+// составе, а остальные были в резерве — люди должны видеть, на кого игра
+// была рассчитана.
+func (s *Service) roster(ctx context.Context, ev event.Event) (confirmed, waitlist []booking.Booking, err error) {
+	statuses := []booking.Status{booking.StatusConfirmed, booking.StatusWaitlist}
+	if ev.Status == event.StatusCancelled {
+		statuses = append(statuses, booking.StatusCancelled)
+	}
+	all, err := s.bookings.ListByEvent(ctx, ev.ID, statuses...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list bookings: %w", err)
 	}
+	confirmed, waitlist = splitRoster(all, ev.Status == event.StatusCancelled)
+	return confirmed, waitlist, nil
+}
+
+// splitRoster splits bookings into the lineup and the reserve. eventCancelled
+// means every booking is already cancelled: in that case the seat number tells
+// who was in the lineup, and the rest were in the reserve.
+func splitRoster(all []booking.Booking, eventCancelled bool) (confirmed, waitlist []booking.Booking) {
 	for _, b := range all {
-		if b.Status == booking.StatusConfirmed {
+		switch {
+		case b.Status == booking.StatusConfirmed:
 			confirmed = append(confirmed, b)
-		} else {
+		case b.Status == booking.StatusWaitlist:
+			waitlist = append(waitlist, b)
+		case eventCancelled && b.SeatNo != nil:
+			confirmed = append(confirmed, b)
+		case eventCancelled:
 			waitlist = append(waitlist, b)
 		}
 	}
-	return confirmed, waitlist, nil
+	return confirmed, waitlist
 }
 
 // gameStart decides when the game starts: an explicit date in the text wins,
@@ -705,6 +855,10 @@ func (s *Service) findGameAt(ctx context.Context, chatID int64, t time.Time) (ev
 // «свободно», so the numbering never shifts), the free-slot counter and the
 // reserve in queue order. The buttons act on this very game.
 func (s *Service) renderAnnouncement(ev event.Event, confirmed, waitlist []booking.Booking) (string, string, error) {
+	if ev.Status == event.StatusCancelled {
+		return s.renderCancelledAnnouncement(ev, confirmed, waitlist)
+	}
+
 	bySeat := make(map[int]string, len(confirmed))
 	for _, bk := range confirmed {
 		if bk.SeatNo != nil {
@@ -750,6 +904,52 @@ func (s *Service) renderAnnouncement(ev event.Event, confirmed, waitlist []booki
 		{CallbackButton("Иду", AnnouncementCommandPayload(cmdAttend, ev.ID), ColorPositive)},
 		{CallbackButton("Не иду", AnnouncementCommandPayload(cmdSkip, ev.ID), ColorNegative)},
 	}}
+	raw, err := kb.Marshal()
+	if err != nil {
+		return "", "", err
+	}
+	return b.String(), raw, nil
+}
+
+// renderCancelledAnnouncement renders a game that was called off: what it was,
+// that it will not happen, and who had signed up — people need to see that. The
+// buttons are dropped from the message (an empty inline keyboard removes them):
+// there is nothing left to sign up for.
+func (s *Service) renderCancelledAnnouncement(ev event.Event, confirmed, waitlist []booking.Booking) (string, string, error) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "❌ %s — %s\n", ev.Title, s.formatWhenFull(ev.StartsAt))
+	if strings.TrimSpace(ev.Location) != "" {
+		fmt.Fprintf(&b, "Место: %s\n", ev.Location)
+	}
+	b.WriteString("\nИгра отменена.\n")
+
+	if len(confirmed) > 0 {
+		bySeat := make(map[int]string, len(confirmed))
+		for _, bk := range confirmed {
+			if bk.SeatNo != nil {
+				bySeat[*bk.SeatNo] = bk.PlayerName
+			}
+		}
+		fmt.Fprintf(&b, "Записаны были (%d): ", len(confirmed))
+		written := 0
+		for seat := 1; seat <= ev.Capacity && written < len(confirmed); seat++ {
+			name, taken := bySeat[seat]
+			if !taken {
+				continue
+			}
+			if written > 0 {
+				b.WriteString(" · ")
+			}
+			fmt.Fprintf(&b, "%d. %s", seat, name)
+			written++
+		}
+		b.WriteString("\n")
+	}
+	if len(waitlist) > 0 {
+		fmt.Fprintf(&b, "Резерв был (%d): %s\n", len(waitlist), reserveLine(waitlist))
+	}
+
+	kb := Keyboard{Inline: true, Buttons: [][]Button{}}
 	raw, err := kb.Marshal()
 	if err != nil {
 		return "", "", err
@@ -807,6 +1007,9 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 		return err
 	}
 	if !ok {
+		if reason := s.closedReason(ctx, c); reason != "" {
+			return s.notify(ctx, c, reason)
+		}
 		return s.notify(ctx, c, "Запись закрыта: открытых игр нет")
 	}
 
@@ -850,6 +1053,27 @@ func (s *Service) handleAttend(ctx context.Context, c *commandCtx) error {
 	}
 	s.refreshAnnouncementLogged(ctx, c.chat.ID, c.peerID, ev.ID)
 	return s.notify(ctx, c, fmt.Sprintf("✅ Вы записаны: место %d", seat))
+}
+
+// closedReason explains why the game of a pressed button cannot be joined: it
+// was called off or it has already started. An empty answer means the press had
+// no game of its own (the buttons under the input field), and then the generic
+// «запись закрыта» fits.
+func (s *Service) closedReason(ctx context.Context, c *commandCtx) string {
+	if c.eventID == 0 {
+		return ""
+	}
+	ev, err := s.events.Get(ctx, c.chat.ID, c.eventID)
+	if err != nil {
+		return ""
+	}
+	switch {
+	case ev.Status == event.StatusCancelled:
+		return "Игра отменена"
+	case !ev.StartsAt.After(s.now()):
+		return "Игра уже прошла"
+	}
+	return ""
 }
 
 // alreadyBooked answers a repeat "Иду": the lineup keeps its seat, the reserve
@@ -1008,6 +1232,11 @@ func (s *Service) targetGame(ctx context.Context, c *commandCtx) (event.Event, b
 		if err != nil {
 			return event.Event{}, false, fmt.Errorf("get event: %w", err)
 		}
+		// Отменённая игра не цель: кнопка старого анонса не должна записывать
+		// туда, куда уже не записываются.
+		if ev.Status != event.StatusScheduled {
+			return event.Event{}, false, nil
+		}
 		if !ev.StartsAt.After(s.now()) {
 			return event.Event{}, false, nil
 		}
@@ -1090,7 +1319,7 @@ func (s *Service) refreshAnnouncement(ctx context.Context, chatID, peerID, event
 		return fmt.Errorf("get event: %w", err)
 	}
 
-	confirmed, waitlist, err := s.roster(ctx, eventID)
+	confirmed, waitlist, err := s.roster(ctx, ev)
 	if err != nil {
 		return err
 	}
@@ -1328,7 +1557,19 @@ func (s *Service) renderSettings(ctx context.Context, ch chat.Chat) (string, str
 	fmt.Fprintf(&b, "Сейчас: %s\n\n", schedule.Describe(slots))
 	b.WriteString("Время указывается в поясе чата. Чтобы задать или изменить день, пришлите «/настройки вс 10:00», убрать — «/настройки убрать сб».")
 
-	rows := make([][]Button, 0, len(slots)+1)
+	rows := make([][]Button, 0, len(slots)+2)
+	// Отмена игры стоит рядом с расписанием: это тот же экран администратора, и
+	// ближайшая игра всегда видна здесь же.
+	games, err := s.events.ListUpcomingWithCounts(ctx, ch.ID, s.now().UTC(), 1)
+	if err != nil {
+		return "", "", fmt.Errorf("list games: %w", err)
+	}
+	if len(games) > 0 {
+		rows = append(rows, []Button{
+			CallbackButton("❌ Отменить игру: "+s.formatWhenShort(games[0].StartsAt),
+				EventCommandPayload(cmdCancelGame, games[0].ID), ColorNegative),
+		})
+	}
 	for _, slot := range slots {
 		label := fmt.Sprintf("%s %s ✕", schedule.LongWeekday(slot.Weekday), slot.At())
 		rows = append(rows, []Button{
@@ -1394,6 +1635,7 @@ func (s *Service) sendWelcome(ctx context.Context, chatID, peerID int64, display
 			"/мои — ваши записи\n"+
 			"/отмена — отменить свою запись\n"+
 			"/старт — создать игру и анонс (администратор)\n"+
+			"/отменить игру — отменить игру и снять записи (администратор)\n"+
 			"/настройки — расписание: /настройки вс 10:00 (администратор)\n"+
 			"/помощь — эта справка\n\n"+
 			"Бот отвечает только на команды и кнопки, поэтому не мешает вашей переписке. "+
@@ -1456,7 +1698,14 @@ func (s *Service) parseCommand(text, payload string, connected bool) parsedComma
 	case "my", "мои", "моизаписи":
 		return parsedCommand{cmd: cmdMyBookings}
 	case "cancel", "отмена":
+		// «/отмена игру» и «/отмена игры» — отмена игры администратором,
+		// «/отмена» без слова про игру — отмена своей записи.
+		if mentionsGame(args) {
+			return parsedCommand{cmd: cmdCancelGame}
+		}
 		return parsedCommand{cmd: cmdCancelBooking}
+	case "отменить", "убрать", "cancelgame", "cancelevent":
+		return parsedCommand{cmd: cmdCancelGame}
 	case "create", "создать", "старт":
 		return parsedCommand{cmd: cmdCreateGame}
 	case "settings", "настройки":

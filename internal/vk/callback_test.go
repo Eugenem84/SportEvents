@@ -136,6 +136,9 @@ type fakeEventStore struct {
 	games   []event.EventSummary
 	created []event.CreateInput
 	getErr  error
+	// cancelled lists the games Cancel was called on with success.
+	cancelled []int64
+	cancelErr error
 }
 
 func (f *fakeEventStore) Create(_ context.Context, in event.CreateInput) (event.Event, error) {
@@ -147,6 +150,7 @@ func (f *fakeEventStore) Create(_ context.Context, in event.CreateInput) (event.
 		Title:    in.Title,
 		Location: in.Location,
 		Capacity: in.Capacity,
+		Status:   event.StatusScheduled,
 	}, nil
 }
 
@@ -163,7 +167,34 @@ func (f *fakeEventStore) Get(_ context.Context, chatID, eventID int64) (event.Ev
 }
 
 func (f *fakeEventStore) ListUpcomingWithCounts(_ context.Context, chatID int64, from time.Time, limit int) ([]event.EventSummary, error) {
-	return f.games, nil
+	out := make([]event.EventSummary, 0, len(f.games))
+	for _, g := range f.games {
+		if g.Status == event.StatusCancelled {
+			continue
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+// Cancel marks the game as called off, the way the domain does, and reports
+// ErrAlreadyCancelled for a game that was off already.
+func (f *fakeEventStore) Cancel(_ context.Context, chatID, eventID int64) (event.Event, error) {
+	if f.cancelErr != nil {
+		return event.Event{}, f.cancelErr
+	}
+	for i := range f.games {
+		if f.games[i].ID != eventID {
+			continue
+		}
+		if f.games[i].Status == event.StatusCancelled {
+			return f.games[i].Event, event.ErrAlreadyCancelled
+		}
+		f.games[i].Status = event.StatusCancelled
+		f.cancelled = append(f.cancelled, eventID)
+		return f.games[i].Event, nil
+	}
+	return event.Event{}, event.ErrNotFound
 }
 
 type fakeBookingStore struct {
@@ -171,6 +202,7 @@ type fakeBookingStore struct {
 	active       []booking.BookingWithEvent
 	created      []booking.CreateInput
 	cancelled    []int64
+	cancelledAll []int64
 	promote      *booking.Booking
 	createErr    error
 	createStatus booking.Status
@@ -227,6 +259,21 @@ func (f *fakeBookingStore) Cancel(_ context.Context, eventID, bookingID int64) (
 		res.Promoted = f.promote
 	}
 	return res, nil
+}
+
+// CancelAllForEvent drops the active bookings of the event, the way the domain
+// does when a game is called off.
+func (f *fakeBookingStore) CancelAllForEvent(_ context.Context, eventID int64) (int, error) {
+	removed := 0
+	for i := range f.byEvent[eventID] {
+		if f.byEvent[eventID][i].Status == booking.StatusCancelled {
+			continue
+		}
+		f.byEvent[eventID][i].Status = booking.StatusCancelled
+		removed++
+	}
+	f.cancelledAll = append(f.cancelledAll, eventID)
+	return removed, nil
 }
 
 func (f *fakeBookingStore) ListByEvent(_ context.Context, eventID int64, statuses ...booking.Status) ([]booking.Booking, error) {
@@ -842,7 +889,7 @@ func firstButton(t *testing.T, raw string) Button {
 func TestCallbackGamesListsFreeSlotsAndButtons(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event:     event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event:     event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 		Confirmed: 11,
 		Waitlist:  2,
 		Free:      1,
@@ -938,7 +985,7 @@ func snackbar(t *testing.T, h *harness) string {
 func TestCallbackAttendPostsSeatLineAndSnackbar(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
 	h.anns.has = true
@@ -969,7 +1016,7 @@ func TestCallbackAttendPostsSeatLineAndSnackbar(t *testing.T) {
 func TestCallbackAttendFullGameGoesToReserve(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event:     event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 1},
+		Event:     event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 1, Status: event.StatusScheduled},
 		Confirmed: 1,
 		Free:      0,
 	}}
@@ -993,7 +1040,7 @@ func TestCallbackAttendFullGameGoesToReserve(t *testing.T) {
 func TestCallbackAnnouncementShowsSeatsAndReserve(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 3},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 3, Status: event.StatusScheduled},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 555}
 	h.anns.has = true
@@ -1031,7 +1078,7 @@ func TestCallbackAnnouncementShowsSeatsAndReserve(t *testing.T) {
 func TestCallbackSkipPostsMinusLineAndPromotion(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	seat := 3
 	h.books.active = []booking.BookingWithEvent{{
@@ -1255,7 +1302,7 @@ func TestCallbackCreateGameSkipsExisting(t *testing.T) {
 func TestCallbackAttendPastGameIsRefused(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(-2 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(-2 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 
 	code, _ := postJSON(t, h.svc.HandleCallback,
@@ -1269,8 +1316,183 @@ func TestCallbackAttendPastGameIsRefused(t *testing.T) {
 	if len(h.msg.sent) != 0 {
 		t.Fatalf("the chat must stay silent: %+v", h.msg.sent)
 	}
-	if !strings.Contains(snackbar(t, h), "Запись закрыта") {
+	if !strings.Contains(snackbar(t, h), "Игра уже прошла") {
 		t.Fatalf("snackbar: %q", snackbar(t, h))
+	}
+}
+
+// --- Phase 6: отмена игры ---
+
+// Отмена игры администратором: игра перестаёт принимать записи, все записи
+// снимаются, в беседу уходит строка, а анонс перерисовывается без кнопок.
+func TestCallbackCancelGameDropsBookingsAndButtons(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+	seat1, seat2 := 1, 2
+	h.books.byEvent = map[int64][]booking.Booking{7: {
+		{ID: 1, EventID: 7, PlayerName: "Иван", SeatNo: &seat1, Status: booking.StatusConfirmed},
+		{ID: 2, EventID: 7, PlayerName: "Пётр", SeatNo: &seat2, Status: booking.StatusConfirmed},
+	}}
+	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
+	h.anns.has = true
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 906, EventCommandPayload(cmdCancelGame, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.cancelled) != 1 || h.events.cancelled[0] != 7 {
+		t.Fatalf("cancel: %+v", h.events.cancelled)
+	}
+	if len(h.books.cancelledAll) != 1 || h.books.cancelledAll[0] != 7 {
+		t.Fatalf("bookings must be dropped: %+v", h.books.cancelledAll)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "Игра на сб, 26.09, 12:00 отменена") {
+		t.Fatalf("chat line: %+v", h.msg.sent)
+	}
+	if !strings.Contains(h.msg.sent[0].Text, "Снял записи: 2") {
+		t.Fatalf("chat line must count the dropped bookings: %q", h.msg.sent[0].Text)
+	}
+	// Игр больше нет — кнопки записи убираются из поля ввода.
+	if got := h.msg.sent[0].Keyboard; got != `{"buttons":[]}` {
+		t.Fatalf("want an empty keyboard, got %q", got)
+	}
+	if len(h.msg.edits) != 1 {
+		t.Fatalf("the announcement must be rewritten: %+v", h.msg.edits)
+	}
+	edit := h.msg.edits[0]
+	for _, want := range []string{"❌", "Игра отменена.", "Записаны были (2): 1. Иван · 2. Пётр"} {
+		if !strings.Contains(edit.Text, want) {
+			t.Fatalf("cancelled announcement must contain %q:\n%s", want, edit.Text)
+		}
+	}
+	if edit.Keyboard != `{"inline":true,"buttons":[]}` {
+		t.Fatalf("the buttons must be dropped: %q", edit.Keyboard)
+	}
+	if !strings.Contains(snackbar(t, h), "Игра отменена") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
+	}
+}
+
+// «/отмена игры» текстом отменяет ближайшую игру.
+func TestCallbackCancelGameByTextCancelsNearest(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{
+		{Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled}},
+		{Event: event.Event{ID: 8, Title: "Волейбол", StartsAt: harnessNow().Add(72 * time.Hour), Capacity: 12, Status: event.StatusScheduled}},
+	}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/отмена игры", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.cancelled) != 1 || h.events.cancelled[0] != 7 {
+		t.Fatalf("the nearest game must go first: %+v", h.events.cancelled)
+	}
+}
+
+// «/отменить игру 27.09 10:00» отменяет именно ту игру, а не ближайшую.
+func TestCallbackCancelGameByDate(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{
+		{Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled}},
+		{Event: event.Event{ID: 8, Title: "Волейбол", StartsAt: time.Date(2026, 9, 27, 10, 0, 0, 0, defaultLocation), Capacity: 12, Status: event.StatusScheduled}},
+	}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/отменить игру 27.09 10:00", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.cancelled) != 1 || h.events.cancelled[0] != 8 {
+		t.Fatalf("the game of that date must go: %+v", h.events.cancelled)
+	}
+}
+
+// Отмена игры — только для администратора беседы.
+func TestCallbackCancelGameDeniedForNonAdmin(t *testing.T) {
+	h := newHarness(t, true)
+	h.chats.isAdmin = false
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/отмена игры", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.cancelled) != 0 {
+		t.Fatalf("a member must not cancel games: %+v", h.events.cancelled)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "администратор") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+// Отменённая игра не принимает записи, и отменять её повторно нечего.
+func TestCallbackCancelGameTwice(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusCancelled},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/отмена игры", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.events.cancelled) != 0 {
+		t.Fatalf("nothing must be cancelled twice: %+v", h.events.cancelled)
+	}
+	if len(h.msg.sent) != 1 || !strings.Contains(h.msg.sent[0].Text, "не нашёл") {
+		t.Fatalf("reply: %+v", h.msg.sent)
+	}
+}
+
+// Нажатие «Иду» на отменённой игре: в чат ничего, человеку — объяснение.
+func TestCallbackAttendCancelledGameIsRefused(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusCancelled},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback,
+		eventEnvelope(2000000047, 555, 907, AnnouncementCommandPayload(cmdAttend, 7)))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.books.created) != 0 {
+		t.Fatalf("a cancelled game must not take bookings: %+v", h.books.created)
+	}
+	if len(h.msg.sent) != 0 {
+		t.Fatalf("the chat must stay silent: %+v", h.msg.sent)
+	}
+	if !strings.Contains(snackbar(t, h), "Игра отменена") {
+		t.Fatalf("snackbar: %q", snackbar(t, h))
+	}
+}
+
+// Экран настроек даёт администратору кнопку отмены ближайшей игры.
+func TestCallbackSettingsOffersCancelGameButton(t *testing.T) {
+	h := newHarness(t, true)
+	h.events.games = []event.EventSummary{{
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
+	}}
+
+	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/настройки", ""))
+	if code != http.StatusOK {
+		t.Fatalf("status: %d", code)
+	}
+	if len(h.msg.sent) != 1 {
+		t.Fatalf("want 1 reply, got %d", len(h.msg.sent))
+	}
+	btn := firstButton(t, h.msg.sent[0].Keyboard)
+	cmd, eventID := ParsePayload(btn.Action.Payload)
+	if cmd != cmdCancelGame || eventID != 7 {
+		t.Fatalf("first button must cancel the game: %q", btn.Action.Payload)
+	}
+	if !strings.Contains(btn.Action.Label, "Отменить игру") {
+		t.Fatalf("label: %q", btn.Action.Label)
 	}
 }
 
@@ -1281,7 +1503,7 @@ func TestCallbackAttendPastGameIsRefused(t *testing.T) {
 func TestCallbackAnnouncementPressLearnsMessageID(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	// Анонс отправлен, но VK вернул 0: id пока неизвестен.
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047"}
@@ -1311,7 +1533,7 @@ func TestCallbackAnnouncementPressLearnsMessageID(t *testing.T) {
 func TestCallbackAnnouncementIDNotOverwritten(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
 	h.anns.has = true
@@ -1333,7 +1555,7 @@ func TestCallbackAnnouncementIDNotOverwritten(t *testing.T) {
 func TestCallbackAnnouncementIDFromAnotherChatIgnored(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000999"}
 	h.anns.has = true
@@ -1353,7 +1575,7 @@ func TestCallbackAnnouncementIDFromAnotherChatIgnored(t *testing.T) {
 func TestCallbackGamesListPressDoesNotLearnAnnouncementID(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047"}
 	h.anns.has = true
@@ -1373,7 +1595,7 @@ func TestCallbackGamesListPressDoesNotLearnAnnouncementID(t *testing.T) {
 func TestCallbackAnnouncementEditFailureKeepsBooking(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 	h.anns.ref = announce.Ref{EventID: 7, Platform: chat.PlatformVK, ExternalChatID: "2000000047", MessageID: 615}
 	h.anns.has = true
@@ -1601,6 +1823,10 @@ func TestParseCommand(t *testing.T) {
 		{name: "slash help", text: "/помощь", connected: true, wantCmd: cmdStart},
 		{name: "slash latin help", text: "/help", connected: true, wantCmd: cmdStart},
 		{name: "slash russian", text: "/игры", connected: true, wantCmd: cmdGames},
+		{name: "slash cancel booking", text: "/отмена", connected: true, wantCmd: cmdCancelBooking},
+		{name: "slash cancel game russian", text: "/отмена игры", connected: true, wantCmd: cmdCancelGame},
+		{name: "slash cancel game latin", text: "/cancelgame", connected: true, wantCmd: cmdCancelGame},
+		{name: "slash otmenit igru", text: "/отменить игру", connected: true, wantCmd: cmdCancelGame},
 		{name: "unknown slash", text: "/pizza", connected: true, wantCmd: ""},
 
 		{name: "plain games is conversation", text: "игры", connected: true, wantCmd: ""},
@@ -1738,7 +1964,7 @@ func TestPersistentKeyboardShape(t *testing.T) {
 func TestRepliesCarrySignUpButtonsWhileGameIsOpen(t *testing.T) {
 	h := newHarness(t, true)
 	h.events.games = []event.EventSummary{{
-		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12},
+		Event: event.Event{ID: 7, Title: "Волейбол", StartsAt: harnessNow().Add(24 * time.Hour), Capacity: 12, Status: event.StatusScheduled},
 	}}
 
 	code, _ := postJSON(t, h.svc.HandleCallback, msgEnvelope(2000000047, 555, "/мои", ""))

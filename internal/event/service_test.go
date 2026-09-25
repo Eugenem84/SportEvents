@@ -168,6 +168,53 @@ func TestSetCapacity(t *testing.T) {
 	}
 }
 
+// Отмена игры: статус меняется, игра пропадает из предстоящих, а повторная
+// отмена честно сообщает, что игра уже отменена.
+func TestCancelEvent(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "Волейбол")
+	ev := mustCreate(t, svc, ctx, event.CreateInput{
+		ChatID:   chatID,
+		StartsAt: time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC),
+		Title:    "Волейбол",
+		Capacity: 12,
+	})
+	if ev.Status != event.StatusScheduled {
+		t.Fatalf("a new game must be scheduled, got %q", ev.Status)
+	}
+
+	cancelled, err := svc.Cancel(ctx, chatID, ev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != event.StatusCancelled {
+		t.Fatalf("status: %q", cancelled.Status)
+	}
+
+	got, err := svc.Get(ctx, chatID, ev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != event.StatusCancelled {
+		t.Fatalf("the game must stay cancelled: %+v", got)
+	}
+
+	upcoming, err := svc.ListUpcomingWithCounts(ctx, chatID, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(upcoming) != 0 {
+		t.Fatalf("a cancelled game is not upcoming: %+v", upcoming)
+	}
+
+	if _, err := svc.Cancel(ctx, chatID, ev.ID); !errors.Is(err, event.ErrAlreadyCancelled) {
+		t.Fatalf("want ErrAlreadyCancelled, got %v", err)
+	}
+	if _, err := svc.Cancel(ctx, chatID+9999, ev.ID); !errors.Is(err, event.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for another chat, got %v", err)
+	}
+}
+
 func setup(t *testing.T) (context.Context, *event.Service, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()

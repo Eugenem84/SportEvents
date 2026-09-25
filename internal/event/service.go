@@ -30,7 +30,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Event, error) {
 	const q = `
 		INSERT INTO events (chat_id, starts_at, title, location, capacity)
 		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, chat_id, starts_at, title, location, capacity, created_at`
+		RETURNING id, chat_id, starts_at, title, location, capacity, status, created_at`
 
 	var e Event
 	err := s.pool.QueryRow(ctx, q,
@@ -39,7 +39,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Event, error) {
 		in.Title,
 		in.Location,
 		in.Capacity,
-	).Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.CreatedAt)
+	).Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.Status, &e.CreatedAt)
 	if isForeignKey(err) {
 		return Event{}, ErrChatNotFound
 	}
@@ -51,18 +51,47 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Event, error) {
 
 func (s *Service) Get(ctx context.Context, chatID, eventID int64) (Event, error) {
 	const q = `
-		SELECT id, chat_id, starts_at, title, location, capacity, created_at
+		SELECT id, chat_id, starts_at, title, location, capacity, status, created_at
 		FROM events
 		WHERE id = $1 AND chat_id = $2`
 
 	var e Event
 	err := s.pool.QueryRow(ctx, q, eventID, chatID).
-		Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.CreatedAt)
+		Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.Status, &e.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Event{}, ErrNotFound
 	}
 	if err != nil {
 		return Event{}, fmt.Errorf("get event: %w", err)
+	}
+	return e, nil
+}
+
+// Cancel calls a game off. The event keeps its bookings and its announcement in
+// the chat — people must still see what happened — but it takes no more
+// bookings and disappears from the upcoming lists. Calling off an already
+// cancelled game reports ErrAlreadyCancelled together with the event, so the
+// caller can say «уже отменена» instead of pretending it worked.
+func (s *Service) Cancel(ctx context.Context, chatID, eventID int64) (Event, error) {
+	const q = `
+		UPDATE events
+		SET status = 'cancelled'
+		WHERE id = $1 AND chat_id = $2 AND status = 'scheduled'
+		RETURNING id, chat_id, starts_at, title, location, capacity, status, created_at`
+
+	var e Event
+	err := s.pool.QueryRow(ctx, q, eventID, chatID).
+		Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.Status, &e.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Ничего не обновилось: либо такой игры нет, либо она уже отменена.
+		existing, getErr := s.Get(ctx, chatID, eventID)
+		if getErr != nil {
+			return Event{}, getErr
+		}
+		return existing, ErrAlreadyCancelled
+	}
+	if err != nil {
+		return Event{}, fmt.Errorf("cancel event: %w", err)
 	}
 	return e, nil
 }
@@ -73,9 +102,9 @@ func (s *Service) ListUpcoming(ctx context.Context, chatID int64, from time.Time
 	}
 
 	const q = `
-		SELECT id, chat_id, starts_at, title, location, capacity, created_at
+		SELECT id, chat_id, starts_at, title, location, capacity, status, created_at
 		FROM events
-		WHERE chat_id = $1 AND starts_at >= $2
+		WHERE chat_id = $1 AND starts_at >= $2 AND status = 'scheduled'
 		ORDER BY starts_at ASC, id ASC
 		LIMIT $3`
 
@@ -88,7 +117,7 @@ func (s *Service) ListUpcoming(ctx context.Context, chatID int64, from time.Time
 	var out []Event
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.Status, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		out = append(out, e)
@@ -107,19 +136,19 @@ func (s *Service) ListUpcoming(ctx context.Context, chatID int64, from time.Time
 // the chat renders "свободных мест"; free slots are never stored.
 //
 // One query, one row per event: the chat may render a dozen events at once,
-// so counting per event would be N+1.
+// so counting per event would be N+1. Called-off games are not upcoming.
 func (s *Service) ListUpcomingWithCounts(ctx context.Context, chatID int64, from time.Time, limit int) ([]EventSummary, error) {
 	if limit <= 0 {
 		limit = defaultUpcomingLimit
 	}
 
 	const q = `
-		SELECT e.id, e.chat_id, e.starts_at, e.title, e.location, e.capacity, e.created_at,
+		SELECT e.id, e.chat_id, e.starts_at, e.title, e.location, e.capacity, e.status, e.created_at,
 		       count(b.id) FILTER (WHERE b.status = 'confirmed')::int AS confirmed,
 		       count(b.id) FILTER (WHERE b.status = 'waitlist')::int  AS waitlist
 		FROM events e
 		LEFT JOIN bookings b ON b.event_id = e.id
-		WHERE e.chat_id = $1 AND e.starts_at >= $2
+		WHERE e.chat_id = $1 AND e.starts_at >= $2 AND e.status = 'scheduled'
 		GROUP BY e.id
 		ORDER BY e.starts_at ASC, e.id ASC
 		LIMIT $3`
@@ -134,7 +163,7 @@ func (s *Service) ListUpcomingWithCounts(ctx context.Context, chatID int64, from
 	for rows.Next() {
 		var e EventSummary
 		if err := rows.Scan(
-			&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.CreatedAt,
+			&e.ID, &e.ChatID, &e.StartsAt, &e.Title, &e.Location, &e.Capacity, &e.Status, &e.CreatedAt,
 			&e.Confirmed, &e.Waitlist,
 		); err != nil {
 			return nil, fmt.Errorf("scan event summary: %w", err)

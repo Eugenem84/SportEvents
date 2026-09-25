@@ -10,6 +10,22 @@ var (
 	ErrChatNotFound           = errors.New("chat not found")
 	ErrInvalid                = errors.New("invalid event")
 	ErrCapacityBelowConfirmed = errors.New("capacity below confirmed count")
+	// ErrAlreadyCancelled reports that the game was called off earlier: the
+	// caller tells the administrator instead of cancelling twice.
+	ErrAlreadyCancelled = errors.New("event already cancelled")
+)
+
+// Status is an event lifecycle state. Values must match the CHECK constraint
+// on events.status in the database.
+type Status string
+
+const (
+	// StatusScheduled is a game people can sign up for.
+	StatusScheduled Status = "scheduled"
+	// StatusCancelled is a game the administrator called off. It stays in the
+	// database — its bookings and its announcement point at it — but it takes
+	// no more bookings and is not listed as upcoming.
+	StatusCancelled Status = "cancelled"
 )
 
 type Event struct {
@@ -19,6 +35,7 @@ type Event struct {
 	Title     string
 	Location  string
 	Capacity  int
+	Status    Status
 	CreatedAt time.Time
 }
 

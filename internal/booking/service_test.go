@@ -210,6 +210,58 @@ func mustCreate(t *testing.T, svc *booking.Service, ctx context.Context, eventID
 
 // --- Cancel / promotion ---
 
+// Отмена игры снимает и записи: «записанным» на отменённую игру оставаться
+// нельзя, а «мои записи» больше её не показывают.
+func TestCancelAllForEvent(t *testing.T) {
+	ctx, svc, pool := setup(t)
+	chatID := insertChat(t, ctx, pool, "Волейбол")
+	ev := insertEvent(t, ctx, pool, chatID, 4)
+	player := insertUser(t, ctx, pool, "Пётр")
+	organizer := insertUser(t, ctx, pool, "Организатор")
+
+	// Трое гостей в составе и одна именная запись — она же четвёртое место.
+	mustCreate(t, svc, ctx, ev, organizer, "гость 1")
+	mustCreate(t, svc, ctx, ev, organizer, "гость 2")
+	mustCreate(t, svc, ctx, ev, organizer, "гость 3")
+	if _, err := svc.Create(ctx, booking.CreateInput{
+		EventID: ev, PlayerName: "Пётр", UserID: &player, BookedByUserID: player,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := svc.CancelAllForEvent(ctx, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 4 {
+		t.Fatalf("removed: want 4, got %d", removed)
+	}
+
+	active, err := svc.ListByEvent(ctx, ev, booking.StatusConfirmed, booking.StatusWaitlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("no active bookings must remain: %+v", active)
+	}
+	mine, err := svc.ListActiveByUser(ctx, player, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mine) != 0 {
+		t.Fatalf("a cancelled game must leave «мои записи»: %+v", mine)
+	}
+
+	// Повторный вызов ничего не снимает и не падает.
+	again, err := svc.CancelAllForEvent(ctx, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != 0 {
+		t.Fatalf("second cancel: want 0, got %d", again)
+	}
+}
+
 func TestCancelPromotesFIFO(t *testing.T) {
 	ctx, svc, pool := setup(t)
 	chatID := insertChat(t, ctx, pool, "A")
