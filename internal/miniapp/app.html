@@ -41,7 +41,8 @@ a { color: var(--accent); text-decoration: none; }
 /* шапка: кто я и в какой беседе */
 .top {
   position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px;
-  padding: calc(10px + env(safe-area-inset-top)) 0 10px; background: var(--bg);
+  margin: 0 -12px; padding: calc(10px + env(safe-area-inset-top)) 12px 10px;
+  background: var(--bg); border-bottom: 1px solid rgba(128, 128, 128, .14);
 }
 .top-text { flex: 1; min-width: 0; }
 .top-text .who-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -52,7 +53,10 @@ a { color: var(--accent); text-decoration: none; }
 .icon:active { background: var(--card); }
 
 /* карточки */
-.card { background: var(--card); border-radius: 14px; padding: 12px; margin-bottom: 10px; }
+.card {
+  background: var(--card); border-radius: 14px; padding: 12px; margin-bottom: 10px;
+  border: 1px solid rgba(128, 128, 128, .16);
+}
 .card h2 { font-size: 16px; margin: 0; font-weight: 600; }
 .card.notice { color: var(--muted); }
 .card.warn { color: var(--warn); }
@@ -95,8 +99,9 @@ a { color: var(--accent); text-decoration: none; }
 .btn {
   flex: 1; border: 0; border-radius: 10px; padding: 11px 14px; font: inherit; font-weight: 600;
   color: #fff; background: var(--accent); cursor: pointer;
+  transition: opacity .15s ease, transform .1s ease;
 }
-.btn:active { opacity: .85; }
+.btn:active { opacity: .85; transform: scale(.99); }
 .btn[disabled] { opacity: .5; }
 .btn.bad { background: transparent; color: var(--bad); box-shadow: inset 0 0 0 1.5px var(--bad); }
 
@@ -117,7 +122,6 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
   border: 0; border-radius: 999px; padding: 6px 12px; margin: 6px 6px 0 0; cursor: pointer;
 }
 .btn.ghost { background: var(--card-2); color: var(--text); font-weight: 500; }
-.edit-holder { margin-top: 4px; }
 /* «×» рядом с человеком: снять с игры (только администратору) */
 .x {
   flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; border: 0;
@@ -132,6 +136,38 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
 .sk { border-radius: 6px; background: var(--card-2); height: 14px; margin: 8px 0; }
 .sk.sk-1 { width: 55%; }
 .sk.sk-2 { width: 85%; }
+
+/* нижняя панель действий: «Добавить человека» и «Создать игру» — кнопками,
+   а не постоянными формами на экране */
+.toolbar { display: flex; gap: 8px; margin: 2px 0 12px; }
+.toolbar .btn { padding: 12px 14px; }
+
+/* модальные окна: форма открывается поверх экрана и закрывается после ответа */
+body.modal-open { overflow: hidden; }
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end;
+  justify-content: center; background: rgba(0, 0, 0, .5);
+  -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
+  opacity: 0; transition: opacity .18s ease;
+}
+.modal-backdrop.show { opacity: 1; }
+.modal {
+  width: 100%; max-width: 520px; max-height: 92vh; overflow-y: auto;
+  background: var(--card); color: var(--text);
+  border-radius: 18px 18px 0 0;
+  padding: 14px 14px calc(16px + env(safe-area-inset-bottom));
+  box-shadow: 0 -12px 40px rgba(0, 0, 0, .45);
+  transform: translateY(24px); transition: transform .2s ease;
+}
+.modal-backdrop.show .modal { transform: translateY(0); }
+@media (min-width: 560px) {
+  .modal-backdrop { align-items: center; padding: 16px; }
+  .modal { border-radius: 18px; }
+}
+.modal-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.modal-head h3 { flex: 1; margin: 0; font-size: 17px; font-weight: 600; }
+.modal-text { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.modal .grid { margin-top: 10px; }
 
 /* всплывашка про результат действия */
 .toast {
@@ -243,6 +279,111 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
     toastTimer = window.setTimeout(function () { toastBox.classList.remove('show'); }, TOAST_MS);
   }
 
+  // --- модальные окна ---
+  // Формы не живут на экране постоянно: их открывает кнопка, а после успеха
+  // окно закрывается, и экран перерисовывается из свежего состояния.
+
+  var activeModal = null;
+
+  function openModal(title, content) {
+    closeModal();
+
+    var backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+
+    var sheet = document.createElement('div');
+    sheet.className = 'modal';
+
+    var head = document.createElement('div');
+    head.className = 'modal-head';
+    var heading = document.createElement('h3');
+    heading.textContent = title;
+    head.appendChild(heading);
+
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'icon';
+    close.setAttribute('aria-label', 'Закрыть');
+    close.textContent = '✕';
+    close.addEventListener('click', closeModal);
+    head.appendChild(close);
+    sheet.appendChild(head);
+
+    if (typeof content === 'string') {
+      var text = document.createElement('p');
+      text.className = 'modal-text';
+      text.textContent = content;
+      sheet.appendChild(text);
+    } else if (content) {
+      sheet.appendChild(content);
+    }
+
+    backdrop.appendChild(sheet);
+    // Тап по затемнению закрывает окно; тап по самому окну — нет.
+    backdrop.addEventListener('click', function (e) {
+      if (e.target === backdrop) { closeModal(); }
+    });
+
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+    activeModal = backdrop;
+    window.requestAnimationFrame(function () { backdrop.classList.add('show'); });
+    return sheet;
+  }
+
+  function closeModal() {
+    if (!activeModal) { return; }
+    var backdrop = activeModal;
+    activeModal = null;
+    backdrop.classList.remove('show');
+    document.body.classList.remove('modal-open');
+    window.setTimeout(function () {
+      if (backdrop.parentNode) { backdrop.parentNode.removeChild(backdrop); }
+    }, 180);
+  }
+
+  // confirmModal заменяет window.confirm: то же подтверждение, но в стиле
+  // приложения и без системного окна WebView.
+  function confirmModal(text, confirmLabel, onConfirm) {
+    var box = document.createElement('div');
+    var p = document.createElement('p');
+    p.className = 'modal-text';
+    p.textContent = text;
+    box.appendChild(p);
+
+    var row = document.createElement('div');
+    row.className = 'actions';
+    row.appendChild(button('Отмена', 'ghost', closeModal));
+    row.appendChild(button(confirmLabel, 'bad', function () {
+      closeModal();
+      onConfirm();
+    }));
+    box.appendChild(row);
+    return box;
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { closeModal(); }
+  });
+
+  // toolbar — действия внизу списка игр: приглашение доступно каждому, создание
+  // игры — администратору.
+  function toolbar(s, games) {
+    var box = document.createElement('div');
+    box.className = 'toolbar';
+    if (games.length) {
+      box.appendChild(button('Добавить человека', 'ghost', function () {
+        openModal('Добавить человека', inviteForm(games));
+      }));
+    }
+    if (s.admin) {
+      box.appendChild(button('Создать игру', '', function () {
+        openModal('Создать игру', createForm(s));
+      }));
+    }
+    return box;
+  }
+
   function render(s) {
     document.getElementById('chatTitle').textContent = s.chat ? s.chat.title : 'мини-приложение';
     if (s.me && s.me.name) {
@@ -261,13 +402,13 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
       if (!s.notice) {
         screen.appendChild(card('notice', 'Открытых игр пока нет. Как только администратор объявит игру, она появится здесь.'));
       }
+      if (s.admin) {
+        screen.appendChild(toolbar(s, []));
+      }
       return;
     }
     games.forEach(function (g) { screen.appendChild(gameCard(g, s.admin)); });
-    screen.appendChild(inviteCard(games));
-    if (s.admin) {
-      screen.appendChild(createCard(s));
-    }
+    screen.appendChild(toolbar(s, games));
   }
 
   function renderError(err) {
@@ -414,7 +555,8 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
   }
 
   // removeButton снимает человека с игры: строка в чат и правка анонса — дело
-  // адаптера, приложение только просит.
+  // адаптера, приложение только просит. Подтверждение — модальным окном, без
+  // системного window.confirm.
   function removeButton(person, eventID) {
     var btn = document.createElement('button');
     btn.type = 'button';
@@ -422,10 +564,11 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
     btn.title = 'Снять с игры';
     btn.textContent = '✕';
     btn.addEventListener('click', function () {
-      if (!window.confirm('Снять «' + person.name + '» с игры?')) {
-        return;
-      }
-      post('remove', { event_id: eventID, booking_id: person.booking_id }, btn, 'Снято с игры');
+      openModal('Снять с игры?', confirmModal(
+        'Снять «' + person.name + '» с игры?',
+        'Снять',
+        function () { post('remove', { event_id: eventID, booking_id: person.booking_id }, null, 'Снято с игры'); }
+      ));
     });
     return btn;
   }
@@ -465,17 +608,19 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
 
   // --- админские формы ---
 
-  // post отправляет действие администратора и перерисовывает экран: состояние
-  // приложения живёт на сервере, поэтому после успеха просто перечитываем его.
+  // post отправляет действие и перерисовывает экран: состояние приложения живёт
+  // на сервере, поэтому после успеха просто перечитываем его. Открытое окно
+  // формы закрывается — результат виден уже на карточке игры.
   function post(path, body, btn, okText) {
-    if (busy) { return; }
+    if (busy) { return Promise.resolve(); }
     busy = true;
     if (btn) { btn.disabled = true; }
-    api(path, {
+    return api(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }).then(function (out) {
+      closeModal();
       toast(resultMessage(out, okText));
       return load();
     }).catch(function (err) {
@@ -554,26 +699,22 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
     post(path, body, btn, okText);
   }
 
-  // inviteCard — «добавить человека», которого в чате нет: имя и, если знаете,
-  // место. Игра выбирается, если их несколько. Профиля у гостя не будет, поэтому
-  // аватарка ему не достаётся, а уведомления адресованы пригласившему. Делать это
-  // может любой участник, а не только администратор.
-  function inviteCard(games) {
-    var box = document.createElement('section');
-    box.className = 'card';
+  // inviteForm — «Добавить человека», которого в чате нет: игра, имя и, если
+  // знаете, место. Профиля у гостя не будет, поэтому аватарка ему не достаётся,
+  // а уведомления адресованы пригласившему. Делать это может любой участник, а
+  // не только администратор.
+  function inviteForm(games, eventID) {
+    var box = document.createElement('div');
 
-    var head = document.createElement('h2');
-    head.textContent = 'Добавить человека';
-    box.appendChild(head);
-
-    var hint = document.createElement('div');
-    hint.className = 'g-when';
+    var hint = document.createElement('p');
+    hint.className = 'modal-text';
     hint.textContent = 'Кого нет в чате — например, Сергей Иванов. Поставим на указанное место или на свободное.';
     box.appendChild(hint);
 
     var game = select(games.map(function (g) {
       return { value: String(g.id), label: g.when + ' · ' + g.title };
     }));
+    if (eventID) { game.value = String(eventID); }
     var name = input('text', '', 'имя и фамилия');
     var seat = input('number', '', 'место, если знаете');
 
@@ -615,15 +756,11 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
     return el;
   }
 
-  // createCard — форма «Создать игру»: дата, время, место, название и число
+  // createForm — форма «Создать игру»: дата, время, место, название и число
   // мест. Предзаполнение приходит с сервера: ближайший слот расписания чата.
-  function createCard(s) {
-    var box = document.createElement('section');
-    box.className = 'card';
-
-    var head = document.createElement('h2');
-    head.textContent = 'Создать игру';
-    box.appendChild(head);
+  // Форма открывается модальным окном и закрывается после успеха.
+  function createForm(s) {
+    var box = document.createElement('div');
 
     var next = s.next_game || {};
     var f = formFields({
@@ -663,35 +800,19 @@ input:focus, select:focus { border-color: var(--accent); outline: none; }
 
   // adminGameControls — «Изменить» и «Отменить игру» на карточке игры.
   function adminGameControls(g) {
-    var wrap = document.createElement('div');
-    var holder = document.createElement('div');
-    holder.className = 'edit-holder';
-
-    var edit = button('Изменить', 'ghost', function () {
-      if (holder.firstChild) {
-        holder.innerHTML = '';
-        edit.textContent = 'Изменить';
-        return;
-      }
-      holder.appendChild(editForm(g));
-      edit.textContent = 'Свернуть';
-    });
-
-    var cancel = button('Отменить игру', 'bad', function () {
-      if (!window.confirm('Отменить игру и снять все записи?')) {
-        return;
-      }
-      post('game/cancel', { event_id: g.id }, cancel, 'Игра отменена');
-    });
-
     var row = document.createElement('div');
     row.className = 'actions';
-    row.appendChild(edit);
-    row.appendChild(cancel);
-
-    wrap.appendChild(row);
-    wrap.appendChild(holder);
-    return wrap;
+    row.appendChild(button('Изменить', 'ghost', function () {
+      openModal('Изменить игру', editForm(g));
+    }));
+    row.appendChild(button('Отменить игру', 'bad', function () {
+      openModal('Отменить игру?', confirmModal(
+        g.title + ' — ' + g.when_full + '. Записи снимутся, анонс в беседе станет отменённым.',
+        'Отменить игру',
+        function () { post('game/cancel', { event_id: g.id }, null, 'Игра отменена'); }
+      ));
+    }));
+    return row;
   }
 
   // editForm меняет время, место, название и число мест: анонс в беседе

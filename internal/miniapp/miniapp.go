@@ -78,6 +78,10 @@ type ChatStore interface {
 	// The app shows the admin controls from this answer, and the VK adapter
 	// checks it again for every change — the flag in the browser is not a right.
 	IsChatAdmin(ctx context.Context, chatID, userID int64) (bool, error)
+	// SingleChatPeer names the only conversation connected to the platform: the
+	// app opened in the community context (not from a chat) has no chat id, and
+	// while the community has one connected chat its screen still works.
+	SingleChatPeer(ctx context.Context, platform string) (string, bool, error)
 }
 
 // UserStore resolves the VK id of the person who opened the app to an internal
@@ -287,6 +291,10 @@ func (h *handler) serveStatic(w http.ResponseWriter, r *http.Request) {
 type launchParams struct {
 	userID int64
 	chatID int64
+	// groupID is vk_group_id: VK names the community when the app is opened in
+	// its context (the community's app block, «Избранное», a direct link) even
+	// though it does not name the conversation there.
+	groupID int64
 	// hash is the launch hash. Our own «Открыть приложение» button carries the
 	// conversation in it, because VK does not pass vk_chat_id for a launch from
 	// the bot keyboard.
@@ -295,16 +303,24 @@ type launchParams struct {
 	// that the check was possible at all (the protected key is configured).
 	signed  bool
 	checked bool
+	// fallbackPeer is the conversation resolved without launch context: a launch
+	// in the community's own context lands in the community's only connected
+	// chat, so participants can use the app wherever they opened it from.
+	fallbackPeer int64
 }
 
 // peerID is the conversation the app was opened from: vk_chat_id numbers a chat,
-// and the «peer» in the launch hash names it directly — the app asks the bot's
-// own chat_channels about either. Zero means the app does not know the chat.
+// the «peer» in the launch hash names it directly, and fallbackPeer covers a
+// launch in the community context (the app asks the bot's own chat_channels
+// about any of them). Zero means the app does not know the chat.
 func (lp launchParams) peerID() int64 {
 	if lp.chatID != 0 {
 		return conversationPeerIDMin + lp.chatID
 	}
-	return peerFromHash(lp.hash)
+	if peer := peerFromHash(lp.hash); peer != 0 {
+		return peer
+	}
+	return lp.fallbackPeer
 }
 
 // peerFromHash reads what the app button put into the launch hash: «peer=<id>».
@@ -331,9 +347,10 @@ func peerFromHash(hash string) int64 {
 func (h *handler) launchParams(w http.ResponseWriter, r *http.Request) (launchParams, bool) {
 	q := r.URL.Query()
 	lp := launchParams{
-		userID: atoi64(q.Get("vk_user_id")),
-		chatID: atoi64(q.Get("vk_chat_id")),
-		hash:   q.Get("hash"),
+		userID:  atoi64(q.Get("vk_user_id")),
+		chatID:  atoi64(q.Get("vk_chat_id")),
+		groupID: atoi64(q.Get("vk_group_id")),
+		hash:    q.Get("hash"),
 	}
 	if h.appSecret != "" {
 		lp.checked = true
@@ -344,7 +361,42 @@ func (h *handler) launchParams(w http.ResponseWriter, r *http.Request) (launchPa
 			return launchParams{}, false
 		}
 	}
+	if lp.peerID() == 0 {
+		lp.fallbackPeer = h.fallbackPeer(r.Context(), lp)
+	}
 	return lp, true
+}
+
+// fallbackPeer resolves the conversation when VK named none. The app opened in
+// the community's own context (its app block, «Избранное», a direct link)
+// carries vk_group_id but no chat id; while the community has exactly one
+// connected chat the app knows where it is. Any other case returns 0, and the
+// screen honestly asks to open the app from the conversation. The group must be
+// the community this bot serves: a foreign vk_group_id would otherwise land in
+// someone else's chat.
+func (h *handler) fallbackPeer(ctx context.Context, lp launchParams) int64 {
+	if lp.groupID == 0 {
+		return 0
+	}
+	if h.groupID != "" {
+		if want := atoi64(h.groupID); want != 0 && want != lp.groupID {
+			return 0
+		}
+	}
+	peer, ok, err := h.deps.Chats.SingleChatPeer(ctx, chat.PlatformVK)
+	if err != nil {
+		h.log.Printf("miniapp: resolve chat without launch context: %v", err)
+		return 0
+	}
+	if !ok {
+		return 0
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(peer), 10, 64)
+	if err != nil || id < conversationPeerIDMin {
+		return 0
+	}
+	h.log.Printf("miniapp: launch without chat context resolved to peer %d", id)
+	return id
 }
 
 // signMatches reproduces the VK algorithm: only the launch parameters with the
@@ -771,6 +823,12 @@ func (h *handler) gameView(g event.EventSummary, booked []booking.Booking, meID 
 			}
 		}
 	}
+
+	// Состав всегда по возрастанию номера: место закреплено за человеком и не
+	// сдвигается, поэтому список не должен зависеть от того, кто записался
+	// раньше. Освободившийся номер просто исчезает из строя (1, 2, 4), а не
+	// уезжает в конец. Резерв остаётся в порядке очереди.
+	sort.Slice(v.Lineup, func(i, j int) bool { return v.Lineup[i].Seat < v.Lineup[j].Seat })
 	return v
 }
 

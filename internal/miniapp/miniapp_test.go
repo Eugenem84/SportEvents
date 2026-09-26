@@ -31,6 +31,9 @@ type fakeChats struct {
 	chat *chat.Chat
 	// admin is what IsChatAdmin answers: the admin tests flip it.
 	admin bool
+	// singlePeer is what SingleChatPeer answers: the launch-language tests set
+	// it to show that an app opened in the community context is resolved.
+	singlePeer string
 }
 
 func (f *fakeChats) FindByChannel(_ context.Context, platform, externalChatID string) (*chat.Chat, error) {
@@ -42,6 +45,13 @@ func (f *fakeChats) FindByChannel(_ context.Context, platform, externalChatID st
 
 func (f *fakeChats) IsChatAdmin(_ context.Context, chatID, userID int64) (bool, error) {
 	return f.admin, nil
+}
+
+func (f *fakeChats) SingleChatPeer(_ context.Context, platform string) (string, bool, error) {
+	if f.singlePeer == "" {
+		return "", false, nil
+	}
+	return f.singlePeer, true, nil
 }
 
 func (f *fakeChats) FindOrCreateUserByExternalID(_ context.Context, platform, externalUserID, displayName string) (chat.User, error) {
@@ -532,6 +542,43 @@ func TestStateShowsLineupWithSeatsAndAvatars(t *testing.T) {
 	// Аватарки спрашивают одним запросом на весь экран, а не по одной на игру.
 	if h.photos.calls != 1 {
 		t.Errorf("users.get calls: %d, want 1", h.photos.calls)
+	}
+}
+
+// Состав идёт по возрастанию номера, а не в порядке записи: место закреплено
+// за человеком, и когда освободившийся номер занимает новый участник (его
+// запись создана последней), строй не должен превращаться в «4, 1, 2, 3».
+func TestLineupIsOrderedBySeat(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	seat := func(n int) *int { return &n }
+	user := func(id int64) *int64 { return &id }
+	h.bookings.byEvent[7] = []booking.Booking{
+		{ID: 100, EventID: 7, PlayerName: "Дима", UserID: user(4), SeatNo: seat(4), Status: booking.StatusConfirmed},
+		{ID: 101, EventID: 7, PlayerName: "Евгений Мёдов", UserID: user(7), SeatNo: seat(1), Status: booking.StatusConfirmed},
+		{ID: 102, EventID: 7, PlayerName: "Пётр", SeatNo: seat(3), Status: booking.StatusConfirmed},
+		{ID: 103, EventID: 7, PlayerName: "Иван", SeatNo: seat(2), Status: booking.StatusConfirmed},
+	}
+
+	code, body := do(t, h.app, http.MethodGet,
+		"/app/api/state?vk_user_id=42&vk_chat_id=47", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+
+	got := decodeState(t, body)
+	if len(got.Games) != 1 {
+		t.Fatalf("games: %+v", got.Games)
+	}
+	want := []int{1, 2, 3, 4}
+	lineup := got.Games[0].Lineup
+	if len(lineup) != len(want) {
+		t.Fatalf("lineup: %+v", lineup)
+	}
+	for i, seat := range want {
+		if lineup[i].Seat != seat {
+			t.Errorf("lineup[%d].seat = %d, want %d (%+v)", i, lineup[i].Seat, seat, lineup)
+		}
 	}
 }
 
@@ -1105,6 +1152,58 @@ func TestParticipantInvitesGuestFromTheApp(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("answer %s does not contain %s", body, want)
 		}
+	}
+}
+
+// Приложение, открытое в контексте сообщества (без номера беседы), находит
+// единственную подключённую беседу: участники могут пользоваться им, даже если
+// открыли не из чата. Заведомо чужое сообщество (другой vk_group_id) не
+// подставляется.
+func TestStateResolvesSingleChatFromCommunityContext(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.chats.singlePeer = "2000000047"
+
+	code, body := do(t, h.app, http.MethodGet,
+		"/app/api/state?vk_user_id=42&vk_group_id=241346632", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	got := decodeState(t, body)
+	if got.Chat == nil || got.Chat.Title != "Волейбол Иваново" {
+		t.Fatalf("chat must be resolved from the community context: %+v (notice %q)", got.Chat, got.Notice)
+	}
+
+	// Чужой vk_group_id не должен раскрывать беседу другого сообщества.
+	code, body = do(t, h.app, http.MethodGet,
+		"/app/api/state?vk_user_id=42&vk_group_id=999", "")
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if foreign := decodeState(t, body); foreign.Chat != nil {
+		t.Fatalf("a foreign community must not resolve the chat: %+v", foreign.Chat)
+	}
+}
+
+// Тот же запуск в контексте сообщества доводит гостя до беседы: любой участник
+// может пригласить человека, даже если открыл приложение не из чата.
+func TestGuestInviteFromCommunityContext(t *testing.T) {
+	h := newHarness(t, true)
+	seedGame(h)
+	h.chats.admin = false
+	h.chats.singlePeer = "2000000047"
+	h.sync.bookRes = booking.Booking{
+		ID: 300, EventID: 7, PlayerName: "Сергей Иванов",
+		Status: booking.StatusConfirmed, SeatNo: intPtr(11),
+	}
+
+	code, body := do(t, h.app, http.MethodPost, "/app/api/guest?vk_user_id=42&vk_group_id=241346632",
+		`{"event_id":7,"name":"Сергей Иванов","seat_no":11}`)
+	if code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", code, body)
+	}
+	if h.sync.peerID != 2000000047 {
+		t.Fatalf("the booking must go to the resolved conversation: peer %d", h.sync.peerID)
 	}
 }
 

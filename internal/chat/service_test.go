@@ -328,6 +328,37 @@ func TestIsChatAdminFalse(t *testing.T) {
 	}
 }
 
+// SingleChatPeer узнаёт беседу, когда приложение открыто в контексте сообщества:
+// одна подключённая беседа даёт однозначный ответ, две и больше — нет, и тогда
+// приложение не угадывает, а честно просит открыть его из чата.
+func TestSingleChatPeer(t *testing.T) {
+	ctx, svc, pool := setup(t)
+
+	// Свой platform на каждый прогон: таблица общая, а метод спрашивает по
+	// платформе, поэтому чужие подключения других тестов ответ не портят.
+	platform := uniqueExt(t, "platform")
+	chatA := insertChat(t, ctx, pool, "Волейбол")
+	insertChannel(t, ctx, pool, chatA, platform, "2000000101")
+
+	peer, ok, err := svc.SingleChatPeer(ctx, platform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || peer != "2000000101" {
+		t.Fatalf("single chat: peer %q ok %v, want 2000000101/true", peer, ok)
+	}
+
+	// Вторая беседа делает ответ неоднозначным.
+	chatB := insertChat(t, ctx, pool, "Волейбол-2")
+	insertChannel(t, ctx, pool, chatB, platform, "2000000102")
+
+	if peer, ok, err = svc.SingleChatPeer(ctx, platform); err != nil {
+		t.Fatal(err)
+	} else if ok || peer != "" {
+		t.Fatalf("two chats must not resolve: peer %q ok %v", peer, ok)
+	}
+}
+
 func setup(t *testing.T) (context.Context, *chat.Service, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()

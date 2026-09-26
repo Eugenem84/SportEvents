@@ -44,6 +44,44 @@ func (s *Service) FindByChannel(ctx context.Context, platform, externalChatID st
 	return &c, nil
 }
 
+// SingleChatPeer returns the external id of the only conversation connected to
+// the platform. A launch without any chat context — the app opened from the
+// community's app block, from «Избранное» or by a direct link, where VK passes
+// vk_group_id but no vk_chat_id — is resolved through it: while the community
+// has exactly one connected chat there is nothing to confuse it with. ok is
+// false when the platform has zero or several connected chats, and then the app
+// honestly asks to open it from the conversation.
+func (s *Service) SingleChatPeer(ctx context.Context, platform string) (string, bool, error) {
+	// Two rows are enough to tell «one» from «several»: the limit keeps the
+	// query from reading the whole table just to count it.
+	rows, err := s.pool.Query(ctx, `
+		SELECT external_chat_id
+		FROM chat_channels
+		WHERE platform = $1
+		ORDER BY id
+		LIMIT 2`, platform)
+	if err != nil {
+		return "", false, fmt.Errorf("list connected chats: %w", err)
+	}
+	defer rows.Close()
+
+	peers := make([]string, 0, 2)
+	for rows.Next() {
+		var peer string
+		if err := rows.Scan(&peer); err != nil {
+			return "", false, fmt.Errorf("scan connected chat: %w", err)
+		}
+		peers = append(peers, peer)
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("list connected chats: %w", err)
+	}
+	if len(peers) != 1 {
+		return "", false, nil
+	}
+	return peers[0], true, nil
+}
+
 // FindOrCreateUserByExternalID returns the internal User for the external
 // identity, creating both rows on first contact. Repeated calls with the
 // same ids return the same User: the (platform, external_user_id) unique
